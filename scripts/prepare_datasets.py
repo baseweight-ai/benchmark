@@ -20,6 +20,9 @@ REPO_ROOT = Path(__file__).parent.parent
 SEED = 42
 ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa", "mbpp"]
 
+SMOKE_TRAIN_N = 20
+SMOKE_TEST_N = 10
+
 
 # ── Config models ──────────────────────────────────────────────────────────
 
@@ -120,24 +123,6 @@ def stratified_sample(rows: list[dict], label_key: str, n: int, seed: int = 42) 
     return result[:n]
 
 
-def nested_samples(rows: list[dict], sizes: list[int], label_key: Optional[str], seed: int = 42) -> dict[int, list[dict]]:
-    """Return nested samples: 50 ⊂ 200 ⊂ 500 ⊂ ... Each is a superset of the previous."""
-    if not sizes:
-        return {}
-    result = {}
-    rng = random.Random(seed)
-    # Start with largest sample
-    max_size = min(max(sizes), len(rows))
-    if label_key:
-        base = stratified_sample(rows, label_key, max_size, seed)
-    else:
-        base = rng.sample(rows, max_size)
-    for n in sorted(sizes):
-        if n > len(rows):
-            continue
-        result[n] = base[:n]
-    return result
-
 
 # ── Context truncation ─────────────────────────────────────────────────────
 
@@ -160,9 +145,9 @@ def write_jsonl(rows: list[dict], path: Path) -> None:
 
 # ── Per-task preprocessing ─────────────────────────────────────────────────
 
-def process_task(cfg: TaskConfig, dry_run: bool, tiny: bool = False) -> None:
+def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> None:
     from datasets import load_from_disk, Dataset  # lazy
-    label = " (tiny)" if tiny else ""
+    label = " (smoke)" if smoke_test else ""
     click.echo(f"\n[{cfg.task_id}] Processing {cfg.task_name}{label}...")
 
     raw_dir = REPO_ROOT / "data" / "raw" / cfg.task_id
@@ -247,16 +232,6 @@ def process_task(cfg: TaskConfig, dry_run: bool, tiny: bool = False) -> None:
         train_rows = stratified_sample(train_rows, label_key, cfg.training_cap, SEED)
         click.echo(f"  Training set capped at {len(train_rows)}")
 
-    # ── Stratified training subsets ────────────────────────────────────────
-    train_500 = stratified_sample(train_rows, label_key, min(500, len(train_rows)), SEED) if cfg.task_type == "classification" else random.Random(SEED).sample(train_rows, min(500, len(train_rows)))
-    train_full = train_rows
-
-    # ── Efficiency curve nested samples ───────────────────────────────────
-    eff_samples = nested_samples(train_rows, cfg.efficiency_curve_sizes, label_key if cfg.task_type == "classification" else None, SEED)
-
-    # ── 5 few-shot examples ───────────────────────────────────────────────
-    few_shot_5 = stratified_sample(train_rows, label_key, min(5, len(train_rows)), SEED) if cfg.task_type == "classification" else train_rows[:5]
-
     # ── Format to chat JSONL ───────────────────────────────────────────────
     def fmt_rows(rows: list[dict], include_assistant: bool = True) -> list[dict]:
         out = []
@@ -284,19 +259,18 @@ def process_task(cfg: TaskConfig, dry_run: bool, tiny: bool = False) -> None:
         return out
 
     # Write files
-    write_jsonl(fmt_rows(train_500), out_dir / "train_500.jsonl")
-    write_jsonl(fmt_rows(train_full), out_dir / "train_full.jsonl")
-    write_jsonl(fmt_test_prompts(test_rows), out_dir / "test.jsonl")
-    write_jsonl(fmt_labels(test_rows), out_dir / "test_labels.jsonl")
-    write_jsonl(fmt_rows(few_shot_5), out_dir / "few_shot_5.jsonl")
-
-    for n, sample in eff_samples.items():
-        write_jsonl(fmt_rows(sample), out_dir / f"train_{n}.jsonl")
-
-    # OpenAI SFT format (same structure, already chat)
-    write_jsonl(fmt_rows(train_500), out_dir / "openai_sft_500.jsonl")
-
-    click.echo(f"  [{cfg.task_id}] Done — {len(test_rows)} test, {len(train_500)} train_500, {len(train_full)} train_full")
+    if smoke_test:
+        smoke_train = train_rows[:SMOKE_TRAIN_N]
+        smoke_test_rows = test_rows[:SMOKE_TEST_N]
+        write_jsonl(fmt_rows(smoke_train), out_dir / "smoke_train.jsonl")
+        write_jsonl(fmt_test_prompts(smoke_test_rows), out_dir / "smoke_test.jsonl")
+        write_jsonl(fmt_labels(smoke_test_rows), out_dir / "smoke_test_labels.jsonl")
+        click.echo(f"  [{cfg.task_id}] Done — {len(smoke_test_rows)} smoke_test, {len(smoke_train)} smoke_train")
+    else:
+        write_jsonl(fmt_rows(train_rows), out_dir / "train.jsonl")
+        write_jsonl(fmt_test_prompts(test_rows), out_dir / "test.jsonl")
+        write_jsonl(fmt_labels(test_rows), out_dir / "test_labels.jsonl")
+        click.echo(f"  [{cfg.task_id}] Done — {len(test_rows)} test, {len(train_rows)} train")
 
     if os.environ.get("NETWORK_VOLUME"):
         nv_dir = nv_prepared_dir(cfg.task_id)
@@ -307,8 +281,8 @@ def process_task(cfg: TaskConfig, dry_run: bool, tiny: bool = False) -> None:
 @click.command()
 @click.option("--task", default=None, help="Task ID to prepare (required; use 'all' to prepare every task)")
 @click.option("--dry-run", is_flag=True, help="Validate without processing")
-@click.option("--tiny", is_flag=True, help="Signal that raw data was downloaded in tiny mode (no effect on processing)")
-def main(task: str, dry_run: bool, tiny: bool) -> None:
+@click.option("--smoke-test", is_flag=True, help="Write small smoke_train/smoke_test files instead of full train/test")
+def main(task: str, dry_run: bool, smoke_test: bool) -> None:
     """Prepare datasets: split, sample, and format into chat JSONL.
 
     You must specify --task <id> or --task all. No default — raw data must
@@ -321,7 +295,7 @@ def main(task: str, dry_run: bool, tiny: bool) -> None:
     for tid in task_ids:
         try:
             cfg = load_task_config(tid)
-            process_task(cfg, dry_run, tiny=tiny)
+            process_task(cfg, dry_run, smoke_test=smoke_test)
         except Exception as exc:
             click.echo(f"  ERROR [{tid}]: {exc}", err=True)
             import traceback; traceback.print_exc()

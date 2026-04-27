@@ -6,6 +6,7 @@ import faulthandler
 import gc
 import json
 import os
+import random
 import shutil
 import sys
 import time
@@ -66,11 +67,13 @@ from checkpoint_utils import (
     save_train_state,
     training_log,
 )
+from utils import write_jsonl
 
 REPO_ROOT = Path(__file__).parent.parent
 ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa", "mbpp"]
 ALL_MODELS = ["qwen3-8b"]
 GPU_HOURLY = 0.49  # Default GPU hourly rate — override via pricing.yaml
+CONDITION = "lora"
 
 try:
     _libc = ctypes.CDLL("libc.so.6")
@@ -132,6 +135,29 @@ def count_jsonl(path: Path) -> int:
         return 0
     with open(path) as f:
         return sum(1 for _ in f)
+
+
+def _resolve_prepared(task_id: str, filename: str) -> Optional[Path]:
+    """Return path to a prepared data file, falling back to the network volume."""
+    p = REPO_ROOT / "data" / "prepared" / task_id / filename
+    if p.exists():
+        return p
+    nv = nv_prepared_dir(task_id) / filename
+    return nv if nv.exists() else None
+
+
+def get_or_create_cap(data_dir: Path, n: int) -> Path:
+    """Return path to a fixed random-sample of n rows from train.jsonl, creating it if needed."""
+    cap_path = data_dir / f"train_cap{n}.jsonl"
+    if cap_path.exists():
+        return cap_path
+    src = data_dir / "train.jsonl"
+    with open(src) as f:
+        rows = [json.loads(line) for line in f]
+    sample = random.Random(42).sample(rows, min(n, len(rows)))
+    write_jsonl(sample, cap_path)
+    click.echo(f"  Cap: wrote {len(sample)} rows to {cap_path.name}")
+    return cap_path
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +229,6 @@ class ConfigFactory:
 def run_training_task(
     model_cfg: ModelConfig,
     task_cfg: TaskConfig,
-    condition: str,
     data_path: Path,
     hw_cfg: HardwareConfig,
     n_train: int,
@@ -288,7 +313,7 @@ def run_training_task(
                 click.echo("  " + " | ".join(parts))
 
         def on_save(self, args, state, control, **kwargs):
-            save_train_state(model_cfg.model_short, task_id, condition, {
+            save_train_state(model_cfg.model_short, task_id, CONDITION, {
                 "status": "in_progress",
                 "epoch": state.epoch,
                 "global_step": state.global_step,
@@ -381,7 +406,8 @@ def run_training_task(
     meta = {
         "model_id": model_cfg.model_short,
         "task_id": task_id,
-        "condition": condition,
+        "condition": CONDITION,
+        "train_data_path": str(data_path),
         "n_train": n_train,
         "epochs": epochs,
         "seq_len": hw_cfg.seq_len,
@@ -394,7 +420,7 @@ def run_training_task(
     }
     atomic_write_json(meta, log_dir / "metadata.json")
     atomic_write_json(meta, ckpt_dir / "metadata.json")
-    save_train_state(model_cfg.model_short, task_id, condition, {
+    save_train_state(model_cfg.model_short, task_id, CONDITION, {
         "status": "complete",
         "eval_loss": eval_loss,
         "train_loss": train_loss,
@@ -416,7 +442,7 @@ def run_training_task(
     if _libc:
         _libc.malloc_trim(0)
     rss_after = _rss_mb()
-    click.echo(f"  Memory released after {task_id}/{condition}: {rss_before - rss_after} MB freed (RSS {rss_before}→{rss_after} MB).")
+    click.echo(f"  Memory released after {task_id}/{CONDITION}: {rss_before - rss_after} MB freed (RSS {rss_before}→{rss_after} MB).")
 
     return meta
 
@@ -428,30 +454,29 @@ def run_training_task(
 def train_one(
     model_cfg: ModelConfig,
     task_cfg: TaskConfig,
-    condition: str,
     data_path: Path,
     dry_run: bool,
     auto_upload: bool = False,
     smoke_test: bool = False,
 ) -> dict:
-    """Orchestrate a single model/task/condition run. Returns metadata dict."""
+    """Orchestrate a single model/task run. Returns metadata dict."""
     task_id = task_cfg.task_id
     n_train = count_jsonl(data_path)
     hw_cfg = ConfigFactory.build(model_cfg, task_cfg, smoke_test)
 
-    adapter_dir = REPO_ROOT / "results" / "adapters" / model_cfg.model_short / task_id / condition
-    log_dir = REPO_ROOT / "results" / "training" / model_cfg.model_short / task_id / condition
-    ckpt_dir = checkpoint_dir(model_cfg.model_short, task_id, condition)
+    adapter_dir = REPO_ROOT / "results" / "adapters" / model_cfg.model_short / task_id / CONDITION
+    log_dir = REPO_ROOT / "results" / "training" / model_cfg.model_short / task_id / CONDITION
+    ckpt_dir = checkpoint_dir(model_cfg.model_short, task_id, CONDITION)
     adapter_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     epochs = 1 if smoke_test else get_epochs(n_train)
-    click.echo(f"  [{model_cfg.model_short}/{task_id}/{condition}] n={n_train}, epochs={epochs}, seq_len={hw_cfg.seq_len}")
+    click.echo(f"  [{model_cfg.model_short}/{task_id}/{CONDITION}] n={n_train}, epochs={epochs}, seq_len={hw_cfg.seq_len}")
 
-    prior_state = load_train_state(model_cfg.model_short, task_id, condition)
+    prior_state = load_train_state(model_cfg.model_short, task_id, CONDITION)
     if prior_state and prior_state.get("status") == "complete":
-        click.echo(f"  SKIP [{model_cfg.model_short}/{task_id}/{condition}]: already complete")
+        click.echo(f"  SKIP [{model_cfg.model_short}/{task_id}/{CONDITION}]: already complete")
         meta_path = log_dir / "metadata.json"
         if meta_path.exists():
             with open(meta_path) as f:
@@ -461,7 +486,8 @@ def train_one(
     if dry_run:
         click.echo(f"  [dry-run] Would train {model_cfg.model_id} on {data_path.name}")
         meta = {
-            "model_id": model_cfg.model_short, "task_id": task_id, "condition": condition,
+            "model_id": model_cfg.model_short, "task_id": task_id, "condition": CONDITION,
+            "train_data_path": str(data_path),
             "n_train": n_train, "epochs": epochs, "seq_len": hw_cfg.seq_len,
             "training_cost": 0, "training_time_min": 0,
             "eval_loss": None, "model_used": model_cfg.model_id, "substituted": False,
@@ -469,10 +495,10 @@ def train_one(
         atomic_write_json(meta, log_dir / "metadata.json")
         return meta
 
-    resume_ckpt = find_hf_resume_checkpoint(model_cfg.model_short, task_id, condition)
+    resume_ckpt = find_hf_resume_checkpoint(model_cfg.model_short, task_id, CONDITION)
     if resume_ckpt:
         click.echo(f"  Resuming from checkpoint: {resume_ckpt.name}")
-    save_train_state(model_cfg.model_short, task_id, condition, {
+    save_train_state(model_cfg.model_short, task_id, CONDITION, {
         "status": "in_progress",
         "epoch": 0,
         "global_step": 0,
@@ -482,7 +508,6 @@ def train_one(
         meta = run_training_task(
             model_cfg=model_cfg,
             task_cfg=task_cfg,
-            condition=condition,
             data_path=data_path,
             hw_cfg=hw_cfg,
             n_train=n_train,
@@ -495,7 +520,7 @@ def train_one(
         )
 
     if auto_upload:
-        _upload_adapter(model_cfg.model_short, task_id, condition)
+        _upload_adapter(model_cfg.model_short, task_id, CONDITION)
 
     return meta
 
@@ -515,12 +540,12 @@ def _upload_adapter(model_short: str, task_id: str, condition: str) -> None:
 @click.command()
 @click.option("--model", default=None, help="Model config ID or 'all'. Defaults to 'tiny' with --smoke-test, 'qwen3-8b' otherwise.")
 @click.option("--task", default="all", help="Task ID or 'all'")
-@click.option("--condition", default="all", help="lora-500|lora-full|all")
+@click.option("--cap", default=None, type=int, help="Cap training data to N rows (writes train_capN.jsonl for reproducibility)")
 @click.option("--auto-upload", is_flag=True, help="Upload adapter to HuggingFace after each run (persistence)")
 @click.option("--dry-run", is_flag=True, help="Validate configs without training")
 @click.option("--smoke-test", is_flag=True, help="CPU-only smoke test: reduced seq_len/rank/alpha, 4 threads.")
-def main(model: Optional[str], task: str, condition: str, auto_upload: bool, dry_run: bool, smoke_test: bool) -> None:
-    """QLoRA fine-tune one or more model/task/condition combinations."""
+def main(model: Optional[str], task: str, cap: Optional[int], auto_upload: bool, dry_run: bool, smoke_test: bool) -> None:
+    """QLoRA fine-tune one or more model/task combinations."""
     if smoke_test:
         torch.set_num_threads(4)
         click.echo("Smoke-test mode: CPU only, 4 threads, seq_len=256, r=4.")
@@ -530,32 +555,28 @@ def main(model: Optional[str], task: str, condition: str, auto_upload: bool, dry
 
     model_ids = ALL_MODELS if model == "all" else [model]
     task_ids = ALL_TASKS if task == "all" else [task]
-    conditions = ["lora-500", "lora-full"] if condition == "all" else [condition]
 
     failures = []
     for mid in model_ids:
         model_cfg = load_model_config(mid)
         for tid in task_ids:
-            task_cfg = load_task_config(tid)  # load once per task, not per condition
-            prepared_dir = REPO_ROOT / "data" / "prepared" / tid
-            for cond in conditions:
-                filename = "train_500.jsonl" if cond == "lora-500" else "train_full.jsonl"
-                data_file = prepared_dir / filename
-                if not data_file.exists():
-                    nv_file = nv_prepared_dir(tid) / filename
-                    if nv_file.exists():
-                        data_file = nv_file
-                    else:
-                        click.echo(f"  SKIP [{mid}/{tid}/{cond}]: {data_file} not found", err=True)
-                        if not dry_run:
-                            failures.append((f"{mid}/{tid}/{cond}", "data file missing"))
-                        continue
-                try:
-                    train_one(model_cfg, task_cfg, cond, data_file, dry_run, auto_upload=auto_upload, smoke_test=smoke_test)
-                except Exception as exc:
-                    click.echo(f"  ERROR [{mid}/{tid}/{cond}]: {exc}", err=True)
-                    traceback.print_exc()
-                    failures.append((f"{mid}/{tid}/{cond}", str(exc)))
+            task_cfg = load_task_config(tid)
+
+            src_name = "smoke_train.jsonl" if smoke_test else "train.jsonl"
+            src = _resolve_prepared(tid, src_name)
+            if src is None:
+                click.echo(f"  SKIP [{mid}/{tid}]: {src_name} not found", err=True)
+                if not dry_run:
+                    failures.append((f"{mid}/{tid}", "data file missing"))
+                continue
+            data_file = get_or_create_cap(src.parent, cap) if cap is not None and not smoke_test else src
+
+            try:
+                train_one(model_cfg, task_cfg, data_file, dry_run, auto_upload=auto_upload, smoke_test=smoke_test)
+            except Exception as exc:
+                click.echo(f"  ERROR [{mid}/{tid}]: {exc}", err=True)
+                traceback.print_exc()
+                failures.append((f"{mid}/{tid}", str(exc)))
 
     if failures:
         click.echo(f"\nFAILED ({len(failures)}):")

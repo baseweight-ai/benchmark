@@ -62,6 +62,37 @@ def load_model_config(model_id: str) -> ModelConfig:
     return ModelConfig(**{k: v for k, v in data.items() if k in ModelConfig.model_fields})
 
 
+def get_test_path(task_id: str, smoke_test: bool) -> Path:
+    prepared = REPO_ROOT / "data" / "prepared" / task_id
+    return prepared / ("smoke_test.jsonl" if smoke_test else "test.jsonl")
+
+
+def get_few_shot(task_id: str, model_short: str, smoke_test: bool) -> list[dict]:
+    """Return first 5 rows of the appropriate train file."""
+    prepared = REPO_ROOT / "data" / "prepared" / task_id
+    if smoke_test:
+        train_path = prepared / "smoke_train.jsonl"
+    else:
+        train_path = prepared / "train.jsonl"
+        meta_path = REPO_ROOT / "results" / "training" / model_short / task_id / "lora" / "metadata.json"
+        if meta_path.exists():
+            with open(meta_path) as f:
+                meta = json.load(f)
+            override = meta.get("train_data_path")
+            if override and Path(override).exists():
+                train_path = Path(override)
+    if not train_path.exists():
+        return []
+    rows = []
+    with open(train_path) as f:
+        for line in f:
+            if len(rows) >= 5:
+                break
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
 
 
 def start_vllm_server(
@@ -193,6 +224,7 @@ def run_eval_tiny_sync(
     condition: str,
     task_cfg: TaskConfig,
     adapter_path: Optional[Path],
+    smoke_test: bool = False,
 ) -> None:
     """CPU inference via transformers pipeline — no vLLM or GPU required."""
     import time
@@ -202,16 +234,14 @@ def run_eval_tiny_sync(
     from transformers import pipeline as hf_pipeline
     from peft import PeftModel
 
-    prepared = REPO_ROOT / "data" / "prepared" / task_id
-    test_path = prepared / "test.jsonl"
-    few_shot_path = prepared / "few_shot_5.jsonl"
+    test_path = get_test_path(task_id, smoke_test)
+    few_shot = get_few_shot(task_id, model_cfg.model_short, smoke_test)
 
     if not test_path.exists():
-        click.echo(f"  SKIP [{model_cfg.model_short}/{task_id}/{condition}]: test.jsonl not found")
+        click.echo(f"  SKIP [{model_cfg.model_short}/{task_id}/{condition}]: {test_path.name} not found")
         return
 
     test_rows = load_jsonl(test_path)
-    few_shot = load_jsonl(few_shot_path) if few_shot_path.exists() else []
 
     out_path = (
         REPO_ROOT / "results" / "predictions"
@@ -285,19 +315,18 @@ async def run_eval(
     task_cfg: TaskConfig,
     adapter_path: Optional[Path],
     dry_run: bool,
+    smoke_test: bool = False,
 ) -> None:
     import aiohttp
 
-    prepared = REPO_ROOT / "data" / "prepared" / task_id
-    test_path = prepared / "test.jsonl"
-    few_shot_path = prepared / "few_shot_5.jsonl"
+    test_path = get_test_path(task_id, smoke_test)
+    few_shot = get_few_shot(task_id, model_cfg.model_short, smoke_test)
 
     if not test_path.exists():
-        click.echo(f"  SKIP [{model_cfg.model_short}/{task_id}/{condition}]: test.jsonl not found")
+        click.echo(f"  SKIP [{model_cfg.model_short}/{task_id}/{condition}]: {test_path.name} not found")
         return
 
     test_rows = load_jsonl(test_path)
-    few_shot = load_jsonl(few_shot_path) if few_shot_path.exists() else []
 
     out_path = (
         REPO_ROOT / "results" / "predictions"
@@ -365,12 +394,12 @@ async def run_eval(
 @click.command()
 @click.option("--model", default="qwen3-8b", help="Model ID or 'all'")
 @click.option("--task", default="all", help="Task ID or 'all'")
-@click.option("--condition", default="all", help="zero-shot|5-shot|lora-500|lora-full|all")
+@click.option("--condition", default="all", help="zero-shot|5-shot|lora|all")
 @click.option("--dry-run", is_flag=True, help="Validate without running inference")
-@click.option("--tiny", is_flag=True, help="CPU test mode: Qwen2.5-0.5B via transformers, no vLLM or GPU")
-def main(model: str, task: str, condition: str, dry_run: bool, tiny: bool) -> None:
+@click.option("--smoke-test", is_flag=True, help="CPU test mode: transformers pipeline, smoke test data, no vLLM or GPU")
+def main(model: str, task: str, condition: str, dry_run: bool, smoke_test: bool) -> None:
     """Evaluate local fine-tuned models via vLLM server."""
-    if tiny and model in ALL_MODELS + ["all"]:
+    if smoke_test and model in ALL_MODELS + ["all"]:
         model = "tiny"  # use CPU-safe config automatically
     model_ids = ALL_MODELS if model == "all" else [model]
     task_ids = ALL_TASKS if task == "all" else [task]
@@ -380,15 +409,10 @@ def main(model: str, task: str, condition: str, dry_run: bool, tiny: bool) -> No
     for mid in model_ids:
         model_cfg = load_model_config(mid)
 
-        # Determine conditions: zero-shot/5-shot use base model; lora-* use adapter
-        if condition == "all":
-            conditions = ["zero-shot", "5-shot", "lora-500", "lora-full"]
-        else:
-            conditions = [condition]
+        conditions = ["zero-shot", "5-shot", "lora"] if condition == "all" else [condition]
 
-        # Group conditions by whether they need an adapter
         base_conditions = [c for c in conditions if c in ("zero-shot", "5-shot")]
-        lora_conditions = [c for c in conditions if c.startswith("lora-")]
+        lora_conditions = [c for c in conditions if c == "lora"]
 
         for tid in task_ids:
             try:
@@ -400,20 +424,20 @@ def main(model: str, task: str, condition: str, dry_run: bool, tiny: bool) -> No
 
             seq_len = task_cfg.max_seq_length or model_cfg.max_seq_length
 
-            if tiny:
+            if smoke_test:
                 # CPU path: direct transformers inference, no vLLM server.
                 for cond in conditions:
                     if dry_run:
-                        asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, None, dry_run=True))
+                        asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, None, dry_run=True, smoke_test=True))
                         continue
                     adapter_path = None
-                    if cond.startswith("lora-"):
+                    if cond == "lora":
                         adapter_path = REPO_ROOT / "results" / "adapters" / model_cfg.model_short / tid / cond
                         if not adapter_path.exists():
                             click.echo(f"  SKIP [{mid}/{tid}/{cond}]: adapter not found at {adapter_path}")
                             continue
                     try:
-                        run_eval_tiny_sync(model_cfg, tid, cond, task_cfg, adapter_path)
+                        run_eval_tiny_sync(model_cfg, tid, cond, task_cfg, adapter_path, smoke_test=True)
                     except Exception as exc:
                         click.echo(f"  ERROR [{mid}/{tid}/{cond}]: {exc}", err=True)
                         failures.append((f"{mid}/{tid}/{cond}", str(exc)))
@@ -441,7 +465,7 @@ def main(model: str, task: str, condition: str, dry_run: bool, tiny: bool) -> No
                     finally:
                         stop_vllm_server(proc)
 
-            # --- LoRA adapter conditions ---
+            # --- LoRA adapter ---
             for cond in lora_conditions:
                 adapter_path = (
                     REPO_ROOT / "results" / "adapters" / model_cfg.model_short / tid / cond
