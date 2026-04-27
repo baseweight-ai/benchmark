@@ -1,6 +1,7 @@
 """QLoRA fine-tuning for open-source models via Unsloth."""
 from __future__ import annotations
 
+import ctypes
 import faulthandler
 import gc
 import json
@@ -43,6 +44,10 @@ if hasattr(torch, "xpu") and torch.xpu.is_available():
     torch.xpu.memory.mem_get_info = _safe_xpu_mem_get_info
 
 import unsloth  # must be imported before transformers/peft
+import datasets as hf_datasets
+from transformers import TrainerCallback
+from trl import SFTTrainer, SFTConfig
+from unsloth import FastModel
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -66,6 +71,19 @@ REPO_ROOT = Path(__file__).parent.parent
 ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa", "mbpp"]
 ALL_MODELS = ["qwen3-8b"]
 GPU_HOURLY = 0.49  # Default GPU hourly rate — override via pricing.yaml
+
+try:
+    _libc = ctypes.CDLL("libc.so.6")
+except OSError:
+    _libc = None
+
+
+def _rss_mb() -> int:
+    try:
+        with open("/proc/self/statm") as f:
+            return int(f.read().split()[1]) * 4096 // (1024 * 1024)
+    except Exception:
+        return 0
 
 
 class ModelConfig(BaseModel):
@@ -201,11 +219,6 @@ def run_training_task(
     All heavy objects (model, trainer) are deleted before returning so the GC
     can reclaim memory before the next task starts.
     """
-    from unsloth import FastModel
-    from trl import SFTTrainer, SFTConfig
-    from transformers import TrainerCallback
-    import datasets as hf_datasets
-
     task_id = task_cfg.task_id
     model_id = model_cfg.model_id
     substituted = False
@@ -392,14 +405,18 @@ def run_training_task(
     loss_display = eval_loss if eval_loss is not None else train_loss
     click.echo(f"  Done: {elapsed_min:.1f} min, ${training_cost:.3f}, loss={loss_display}")
 
-    # Release memory before the next task.
-    del trainer
-    del model
+    rss_before = _rss_mb()
+    del trainer, model, tokenizer, train_ds, result
     gc.collect()
+    gc.collect()  # two passes: PyTorch cyclic refs may survive the first
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    if hasattr(torch, "xpu") and torch.xpu.is_available():
+    if hasattr(torch, "xpu"):
         torch.xpu.empty_cache()
+    if _libc:
+        _libc.malloc_trim(0)
+    rss_after = _rss_mb()
+    click.echo(f"  Memory released after {task_id}/{condition}: {rss_before - rss_after} MB freed (RSS {rss_before}→{rss_after} MB).")
 
     return meta
 
@@ -544,8 +561,9 @@ def main(model: Optional[str], task: str, condition: str, auto_upload: bool, dry
         click.echo(f"\nFAILED ({len(failures)}):")
         for key, err in failures:
             click.echo(f"  {key}: {err}")
-        sys.exit(1)
+        os._exit(1)
     click.echo("\nAll training jobs completed.")
+    os._exit(0)
 
 
 if __name__ == "__main__":
