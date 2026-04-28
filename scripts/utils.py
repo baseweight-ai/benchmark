@@ -17,6 +17,14 @@ def write_jsonl(rows: list[dict], path: Path) -> None:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
+def cuda_available() -> bool:
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except ImportError:
+        return False
+
+
 def build_messages(prompt_row: dict, few_shot: list[dict], condition: str) -> list[dict]:
     """Return message list for a test row, prepending few-shot turns when requested."""
     base = prompt_row["messages"]

@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import functools
+import importlib.metadata
 import json
 import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,7 +21,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 from checkpoint_utils import append_jsonl, finalize_partial, load_partial_ids, partial_path
-from utils import build_messages, load_jsonl
+from utils import build_messages, cuda_available, load_jsonl
 
 REPO_ROOT = Path(__file__).parent.parent
 load_dotenv(REPO_ROOT / ".env")
@@ -29,7 +32,9 @@ ALL_MODELS = ["qwen3-8b", "gemma3-4b", "phi4-mini"]
 MAX_CONCURRENCY = 4
 MAX_RETRIES = 3
 VLLM_HOST = "http://localhost:8000"
-VLLM_HEALTH_TIMEOUT = 300  # seconds to wait for vLLM to be ready
+VLLM_HEALTH_TIMEOUT_GPU = 300
+VLLM_HEALTH_TIMEOUT_CPU = 1800
+VLLM_HEALTH_TIMEOUT_SMOKE = 360  # inductor warmup on CPU adds ~3 min even for 0.5B
 VLLM_HEALTH_INTERVAL = 5
 
 
@@ -95,23 +100,63 @@ def get_few_shot(task_id: str, model_short: str, smoke_test: bool) -> list[dict]
 
 
 
+def _stream_vllm_output(proc: subprocess.Popen) -> None:
+    for line in proc.stdout:
+        click.echo(f"  [vllm] {line.decode(errors='replace').rstrip()}")
+
+
+@functools.lru_cache(maxsize=None)
+def _ensure_vllm_for_hardware() -> bool:
+    """Ensure the correct vLLM build is installed. Returns True if GPU (CUDA) available.
+
+    vllm and vllm-cpu conflict — only one can be installed at a time.
+    vllm-cpu requires torch+cpu from the PyTorch CPU wheel index, not PyPI — passing
+    --extra-index-url lets pip find torch==<ver>+cpu when resolving dependencies.
+    """
+    gpu = cuda_available()
+    package = "vllm" if gpu else "vllm-cpu"
+    try:
+        importlib.metadata.version(package)
+        return gpu
+    except importlib.metadata.PackageNotFoundError:
+        pass
+
+    click.echo(f"  Installing {package} for this hardware...")
+    cmd = [sys.executable, "-m", "pip", "install", package, "--quiet"]
+    if not gpu:
+        cmd += ["--extra-index-url", "https://download.pytorch.org/whl/cpu"]
+    subprocess.run(cmd, check=True)
+    click.echo(f"  {package} installed.")
+    return gpu
+
+
 def start_vllm_server(
     base_model: str,
     adapter_path: Optional[Path],
     max_seq_length: int,
     enable_thinking: Optional[bool] = None,
-) -> subprocess.Popen:
-    """Start vLLM server process."""
+) -> tuple[subprocess.Popen, bool]:
+    """Start vLLM server process. Returns (proc, gpu)."""
+    env = os.environ.copy()
+    env["VLLM_LOGGING_LEVEL"] = "DEBUG"
+
+    gpu = _ensure_vllm_for_hardware()
+    # Use module invocation: vllm-cpu's CLI binary crashes due to a metadata
+    # lookup bug (looks for "vllm" package when only "vllm-cpu" is registered).
     cmd = [
-        "vllm", "serve", base_model,
-        "--dtype", "bfloat16",
+        sys.executable, "-m", "vllm.entrypoints.openai.api_server",
+        "--model", base_model,
+        "--dtype", "auto",
         "--max-model-len", str(max_seq_length),
-        "--gpu-memory-utilization", "0.9",
         "--port", "8000",
     ]
+    if gpu:
+        cmd += ["--gpu-memory-utilization", "0.9"]
+    else:
+        click.echo("  No CUDA GPU — using vllm-cpu.")
     # Pass enable_thinking=False for Qwen3 to suppress chain-of-thought tokens
     if enable_thinking is False:
-        cmd += ["--chat-template-kwargs", '{"enable_thinking": false}']
+        cmd += ["--default-chat-template-kwargs", '{"enable_thinking": false}']
     if adapter_path and adapter_path.exists():
         cmd += [
             "--enable-lora",
@@ -121,11 +166,13 @@ def start_vllm_server(
     click.echo(f"  Starting vLLM: {' '.join(cmd)}")
     proc = subprocess.Popen(
         cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         preexec_fn=os.setsid,
+        env=env,
     )
-    return proc
+    threading.Thread(target=_stream_vllm_output, args=(proc,), daemon=True).start()
+    return proc, gpu
 
 
 def stop_vllm_server(proc: subprocess.Popen) -> None:
@@ -142,20 +189,29 @@ def stop_vllm_server(proc: subprocess.Popen) -> None:
     click.echo("  vLLM server stopped.")
 
 
-async def wait_for_vllm(timeout: int = VLLM_HEALTH_TIMEOUT) -> bool:
-    """Poll /health endpoint until server is ready."""
+def _vllm_health_timeout(gpu: bool, smoke_test: bool) -> int:
+    if gpu:
+        return VLLM_HEALTH_TIMEOUT_GPU
+    return VLLM_HEALTH_TIMEOUT_SMOKE if smoke_test else VLLM_HEALTH_TIMEOUT_CPU
+
+
+async def wait_for_vllm(proc: subprocess.Popen, timeout: int = VLLM_HEALTH_TIMEOUT_GPU) -> bool:
+    """Poll /health until ready, failing immediately if the process exits."""
     import aiohttp
     deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession() as session:
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                click.echo(f"  vLLM process exited (code {proc.returncode}).", err=True)
+                return False
+            try:
                 async with session.get(f"{VLLM_HOST}/health", timeout=aiohttp.ClientTimeout(total=5)) as resp:
                     if resp.status == 200:
                         click.echo("  vLLM server is ready.")
                         return True
-        except Exception:
-            pass
-        await asyncio.sleep(VLLM_HEALTH_INTERVAL)
+            except Exception:
+                pass
+            await asyncio.sleep(VLLM_HEALTH_INTERVAL)
     return False
 
 
@@ -217,95 +273,6 @@ async def call_vllm(
                 await asyncio.sleep(2 ** attempt)
     return "", 0.0, 0.0
 
-
-def run_eval_tiny_sync(
-    model_cfg: ModelConfig,
-    task_id: str,
-    condition: str,
-    task_cfg: TaskConfig,
-    adapter_path: Optional[Path],
-    smoke_test: bool = False,
-) -> None:
-    """CPU inference via transformers pipeline — no vLLM or GPU required."""
-    import time
-    import torch
-    from datetime import datetime, timezone
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    from transformers import pipeline as hf_pipeline
-    from peft import PeftModel
-
-    test_path = get_test_path(task_id, smoke_test)
-    few_shot = get_few_shot(task_id, model_cfg.model_short, smoke_test)
-
-    if not test_path.exists():
-        click.echo(f"  SKIP [{model_cfg.model_short}/{task_id}/{condition}]: {test_path.name} not found")
-        return
-
-    test_rows = load_jsonl(test_path)
-
-    out_path = (
-        REPO_ROOT / "results" / "predictions"
-        / model_cfg.model_short / task_id / f"{condition}.jsonl"
-    )
-
-    if out_path.exists():
-        click.echo(f"  SKIP [{model_cfg.model_short}/{task_id}/{condition}]: already exists")
-        return
-
-    pp = partial_path(out_path)
-    completed_ids = load_partial_ids(pp)
-    pending_rows = [r for r in test_rows if r.get("id", "") not in completed_ids]
-
-    if not pending_rows:
-        finalize_partial(pp, out_path)
-        return
-
-    click.echo(f"  [tiny] Loading {model_cfg.model_id} on CPU...")
-    base = AutoModelForCausalLM.from_pretrained(model_cfg.model_id, torch_dtype=torch.float32)
-    tok = AutoTokenizer.from_pretrained(model_cfg.model_id)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-
-    if adapter_path and adapter_path.exists():
-        click.echo(f"  [tiny] Applying LoRA adapter from {adapter_path.name}/")
-        base = PeftModel.from_pretrained(base, str(adapter_path))
-
-    pipe = hf_pipeline(
-        "text-generation",
-        model=base,
-        tokenizer=tok,
-        max_new_tokens=task_cfg.max_output_tokens,
-        do_sample=False,
-        temperature=None,
-        pad_token_id=tok.eos_token_id,
-    )
-
-    click.echo(f"  [tiny] Evaluating {len(pending_rows)} rows on CPU (no vLLM)...")
-    for row in pending_rows:
-        msgs = build_messages(row, few_shot, condition)
-        t0 = time.time()
-        result = pipe(msgs)
-        lat = (time.time() - t0) * 1000
-        generated = result[0]["generated_text"]
-        # Chat pipeline returns full conversation; last entry is the assistant turn
-        output = generated[-1]["content"] if isinstance(generated, list) else str(generated)
-        rec = {
-            "id": row.get("id", ""),
-            "model": model_cfg.model_short,
-            "condition": condition,
-            "input": msgs[-1]["content"] if msgs else "",
-            "output": output,
-            "ground_truth": row.get("label", ""),
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "latency_ms": round(lat, 1),
-            "ttft_ms": 0.0,
-            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        }
-        append_jsonl(rec, pp)
-
-    finalize_partial(pp, out_path)
-    click.echo(f"  Saved {len(test_rows)} predictions to {out_path.relative_to(REPO_ROOT)}")
 
 
 async def run_eval(
@@ -392,15 +359,15 @@ async def run_eval(
 
 
 @click.command()
-@click.option("--model", default="qwen3-8b", help="Model ID or 'all'")
+@click.option("--model", default=None, help="Model ID or 'all'. Defaults to 'tiny' with --smoke-test, 'qwen3-8b' otherwise.")
 @click.option("--task", default="all", help="Task ID or 'all'")
 @click.option("--condition", default="all", help="zero-shot|5-shot|lora|all")
 @click.option("--dry-run", is_flag=True, help="Validate without running inference")
-@click.option("--smoke-test", is_flag=True, help="CPU test mode: transformers pipeline, smoke test data, no vLLM or GPU")
-def main(model: str, task: str, condition: str, dry_run: bool, smoke_test: bool) -> None:
+@click.option("--smoke-test", is_flag=True, help="Use smoke test data and tiny model; mirrors train.py --smoke-test")
+def main(model: Optional[str], task: str, condition: str, dry_run: bool, smoke_test: bool) -> None:
     """Evaluate local fine-tuned models via vLLM server."""
-    if smoke_test and model in ALL_MODELS + ["all"]:
-        model = "tiny"  # use CPU-safe config automatically
+    if model is None:
+        model = "tiny" if smoke_test else "qwen3-8b"
     model_ids = ALL_MODELS if model == "all" else [model]
     task_ids = ALL_TASKS if task == "all" else [task]
 
@@ -422,43 +389,31 @@ def main(model: str, task: str, condition: str, dry_run: bool, smoke_test: bool)
                 failures.append((f"{mid}/{tid}", str(exc)))
                 continue
 
-            seq_len = task_cfg.max_seq_length or model_cfg.max_seq_length
-
-            if smoke_test:
-                # CPU path: direct transformers inference, no vLLM server.
-                for cond in conditions:
-                    if dry_run:
-                        asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, None, dry_run=True, smoke_test=True))
-                        continue
-                    adapter_path = None
-                    if cond == "lora":
-                        adapter_path = REPO_ROOT / "results" / "adapters" / model_cfg.model_short / tid / cond
-                        if not adapter_path.exists():
-                            click.echo(f"  SKIP [{mid}/{tid}/{cond}]: adapter not found at {adapter_path}")
-                            continue
-                    try:
-                        run_eval_tiny_sync(model_cfg, tid, cond, task_cfg, adapter_path, smoke_test=True)
-                    except Exception as exc:
-                        click.echo(f"  ERROR [{mid}/{tid}/{cond}]: {exc}", err=True)
-                        failures.append((f"{mid}/{tid}/{cond}", str(exc)))
-                continue  # skip the vLLM block below
+            # model_cfg.max_seq_length is a training cap (e.g. 256 for tiny).
+            # For eval the vLLM server needs room for both the prompt and the
+            # full output budget, so floor at max_output_tokens + 512.
+            seq_len = max(
+                task_cfg.max_seq_length or model_cfg.max_seq_length,
+                task_cfg.max_output_tokens + 512,
+            )
 
             # --- Base model (zero-shot, 5-shot) ---
             if base_conditions:
                 if dry_run:
                     for cond in base_conditions:
-                        asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, None, dry_run=True))
+                        asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, None, dry_run=True, smoke_test=smoke_test))
                 else:
-                    proc = start_vllm_server(
+                    proc, gpu = start_vllm_server(
                         model_cfg.model_id, None, seq_len, model_cfg.enable_thinking
                     )
+                    health_timeout = _vllm_health_timeout(gpu, smoke_test)
                     try:
-                        ready = asyncio.run(wait_for_vllm())
+                        ready = asyncio.run(wait_for_vllm(proc, timeout=health_timeout))
                         if not ready:
                             raise RuntimeError("vLLM server did not become ready in time")
                         for cond in base_conditions:
                             try:
-                                asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, None, dry_run=False))
+                                asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, None, dry_run=False, smoke_test=smoke_test))
                             except Exception as exc:
                                 click.echo(f"  ERROR [{mid}/{tid}/{cond}]: {exc}", err=True)
                                 failures.append((f"{mid}/{tid}/{cond}", str(exc)))
@@ -475,17 +430,18 @@ def main(model: str, task: str, condition: str, dry_run: bool, smoke_test: bool)
                     continue
 
                 if dry_run:
-                    asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, adapter_path, dry_run=True))
+                    asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, adapter_path, dry_run=True, smoke_test=smoke_test))
                     continue
 
-                proc = start_vllm_server(
+                proc, gpu = start_vllm_server(
                     model_cfg.model_id, adapter_path, seq_len, model_cfg.enable_thinking
                 )
+                health_timeout = _vllm_health_timeout(gpu, smoke_test)
                 try:
-                    ready = asyncio.run(wait_for_vllm())
+                    ready = asyncio.run(wait_for_vllm(proc, timeout=health_timeout))
                     if not ready:
                         raise RuntimeError("vLLM server did not become ready in time")
-                    asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, adapter_path, dry_run=False))
+                    asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, adapter_path, dry_run=False, smoke_test=smoke_test))
                 except Exception as exc:
                     click.echo(f"  ERROR [{mid}/{tid}/{cond}]: {exc}", err=True)
                     failures.append((f"{mid}/{tid}/{cond}", str(exc)))
