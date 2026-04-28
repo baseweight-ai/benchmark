@@ -276,11 +276,12 @@ def process_model_task_condition(
     task_cfg: TaskConfig,
     valid_labels: Optional[list[str]],
     dry_run: bool,
+    source: str = "local",
 ) -> Optional[dict]:
     """Classify one predictions file and write summary."""
-    pred_path = REPO_ROOT / "results" / "predictions" / model_short / task_id / f"{condition}.jsonl"
+    pred_path = REPO_ROOT / "results" / "predictions" / source / model_short / task_id / f"{condition}.jsonl"
     if not pred_path.exists():
-        click.echo(f"  SKIP [{model_short}/{task_id}/{condition}]: predictions not found")
+        click.echo(f"  SKIP [{source}/{model_short}/{task_id}/{condition}]: predictions not found")
         return None
 
     predictions = load_jsonl(pred_path)
@@ -295,7 +296,7 @@ def process_model_task_condition(
     classified, counts = classify_predictions(predictions, task_cfg, valid_labels)
 
     # Write classified predictions
-    classified_path = REPO_ROOT / "results" / "classified" / model_short / task_id / f"{condition}.jsonl"
+    classified_path = REPO_ROOT / "results" / "classified" / source / model_short / task_id / f"{condition}.jsonl"
     _write_jsonl(classified, classified_path)
 
     # Compute metric
@@ -327,7 +328,7 @@ def process_model_task_condition(
         "total_output_tokens": total_output_tokens,
     }
 
-    summary_path = REPO_ROOT / "results" / "summaries" / model_short / task_id / f"{condition}.json"
+    summary_path = REPO_ROOT / "results" / "summaries" / source / model_short / task_id / f"{condition}.json"
     write_json(summary, summary_path)
     metric_str = f"{metric_value:.4f}" if metric_value is not None else "N/A"
     click.echo(
@@ -354,19 +355,12 @@ def get_valid_labels(task_id: str) -> Optional[list[str]]:
 @click.option("--model", default="all", help="Model short name or 'all'")
 @click.option("--task", default="all", help="Task ID or 'all'")
 @click.option("--condition", default="all", help="Condition or 'all'")
+@click.option("--source", default="all", help="Prediction source: local|api|all")
 @click.option("--dry-run", is_flag=True)
-def main(model: str, task: str, condition: str, dry_run: bool) -> None:
+def main(model: str, task: str, condition: str, source: str, dry_run: bool) -> None:
     """Classify prediction errors and compute primary metrics."""
-    # Discover all models from predictions directory
     pred_root = REPO_ROOT / "results" / "predictions"
-
-    if model == "all":
-        if pred_root.exists():
-            model_shorts = [d.name for d in pred_root.iterdir() if d.is_dir()]
-        else:
-            model_shorts = []
-    else:
-        model_shorts = [model]
+    sources = ["local", "api"] if source == "all" else [source]
 
     task_ids = ALL_TASKS if task == "all" else [task]
 
@@ -376,25 +370,32 @@ def main(model: str, task: str, condition: str, dry_run: bool) -> None:
         conditions = [condition]
 
     failures = []
-    for model_short in sorted(model_shorts):
-        for tid in task_ids:
-            try:
-                task_cfg = load_task_config(tid)
-                valid_labels = get_valid_labels(tid)
-            except Exception as exc:
-                click.echo(f"  ERROR: could not load task config {tid}: {exc}", err=True)
-                failures.append((f"{model_short}/{tid}", str(exc)))
-                continue
+    for src in sources:
+        src_root = pred_root / src
+        if model == "all":
+            model_shorts = sorted(d.name for d in src_root.iterdir() if d.is_dir()) if src_root.exists() else []
+        else:
+            model_shorts = [model]
 
-            for cond in conditions:
+        for model_short in model_shorts:
+            for tid in task_ids:
                 try:
-                    process_model_task_condition(
-                        model_short, tid, cond, task_cfg, valid_labels, dry_run
-                    )
+                    task_cfg = load_task_config(tid)
+                    valid_labels = get_valid_labels(tid)
                 except Exception as exc:
-                    click.echo(f"  ERROR [{model_short}/{tid}/{cond}]: {exc}", err=True)
-                    import traceback; traceback.print_exc()
-                    failures.append((f"{model_short}/{tid}/{cond}", str(exc)))
+                    click.echo(f"  ERROR: could not load task config {tid}: {exc}", err=True)
+                    failures.append((f"{src}/{model_short}/{tid}", str(exc)))
+                    continue
+
+                for cond in conditions:
+                    try:
+                        process_model_task_condition(
+                            model_short, tid, cond, task_cfg, valid_labels, dry_run, source=src
+                        )
+                    except Exception as exc:
+                        click.echo(f"  ERROR [{src}/{model_short}/{tid}/{cond}]: {exc}", err=True)
+                        import traceback; traceback.print_exc()
+                        failures.append((f"{src}/{model_short}/{tid}/{cond}", str(exc)))
 
     if failures:
         click.echo(f"\nFAILED ({len(failures)}):")

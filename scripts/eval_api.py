@@ -172,7 +172,7 @@ async def run_eval(model_id: str, task_id: str, condition: str, task_cfg: TaskCo
         click.echo(f"  [dry-run] Would eval {model_id} on {task_id}/{condition} ({len(test_rows)} examples)")
         return
 
-    out_path = REPO_ROOT / "results" / "predictions" / model_id / task_id / f"{condition}.jsonl"
+    out_path = REPO_ROOT / "results" / "predictions" / "api" / model_id / task_id / f"{condition}.jsonl"
     if out_path.exists():
         click.echo(f"  SKIP [{model_id}/{task_id}/{condition}]: already exists")
         return

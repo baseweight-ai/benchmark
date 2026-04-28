@@ -11,7 +11,7 @@ import shutil
 import sys
 import time
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dc_replace
 from pathlib import Path
 from typing import Any, Optional
 
@@ -19,39 +19,18 @@ faulthandler.enable()
 
 import torch
 
-_SMOKE_TEST_EARLY = "--smoke-test" in sys.argv
-
-# Smoke-test forces these; otherwise allow the environment to override.
-if _SMOKE_TEST_EARLY:
-    os.environ["TORCHDYNAMO_DISABLE"] = "1"
-    os.environ["UNSLOTH_DISABLE_AUTO_PADDING_FREE"] = "1"
-else:
-    os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
-    os.environ.setdefault("UNSLOTH_DISABLE_AUTO_PADDING_FREE", "1")
-
-# unsloth_zoo calls mem_get_info at import time; crashes on XPU devices that
-# don't support free-memory queries. Patch before importing unsloth.
-if hasattr(torch, "xpu") and torch.xpu.is_available():
-    _orig_info = torch.xpu.mem_get_info
-
-    def _safe_xpu_mem_get_info(device=None):
-        try:
-            return _orig_info(device)
-        except Exception:
-            total = torch.xpu.get_device_properties(0).total_memory
-            return (total, total)
-
-    torch.xpu.mem_get_info = _safe_xpu_mem_get_info
-    torch.xpu.memory.mem_get_info = _safe_xpu_mem_get_info
-
-import unsloth  # must be imported before transformers/peft
-import datasets as hf_datasets
-from transformers import TrainerCallback
-from trl import SFTTrainer, SFTConfig
-from unsloth import FastModel
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+os.environ.setdefault("UNSLOTH_DISABLE_AUTO_PADDING_FREE", "1")
 
 from dotenv import load_dotenv
 load_dotenv()
+
+import unsloth  # must be imported before transformers/peft
+from unsloth import FastModel
+
+import datasets as hf_datasets
+from transformers import AutoTokenizer, TrainerCallback
+from trl import SFTTrainer, SFTConfig
 
 import click
 import yaml
@@ -185,41 +164,19 @@ class ConfigFactory:
     @staticmethod
     def build(model_cfg: ModelConfig, task_cfg: TaskConfig, smoke_test: bool) -> HardwareConfig:
         base_seq = task_cfg.max_seq_length or model_cfg.max_seq_length
-
-        if smoke_test:
-            return HardwareConfig(
-                device="cpu",
-                load_dtype=torch.float32,
-                load_in_4bit=False,
-                use_grad_ckpt=True,
-                lora_rank=4,
-                lora_alpha=8,
-                seq_len=256,
-                sft_extra={"use_cpu": True, "bf16": False, "optim": "adamw_8bit"},
-            )
-
-        if torch.cuda.is_available():
-            return HardwareConfig(
-                device="cuda",
-                load_dtype=torch.bfloat16,
-                load_in_4bit=model_cfg.load_in_4bit,
-                use_grad_ckpt="unsloth",
-                lora_rank=model_cfg.lora.get("rank", 16),
-                lora_alpha=model_cfg.lora.get("alpha", 32),
-                seq_len=base_seq,
-                sft_extra={},
-            )
-
-        return HardwareConfig(
-            device="cpu",
-            load_dtype=None,
-            load_in_4bit=False,
-            use_grad_ckpt=True,
+        cfg = HardwareConfig(
+            device="cuda",
+            load_dtype=torch.bfloat16,
+            load_in_4bit=model_cfg.load_in_4bit,
+            use_grad_ckpt="unsloth",
             lora_rank=model_cfg.lora.get("rank", 16),
             lora_alpha=model_cfg.lora.get("alpha", 32),
             seq_len=base_seq,
-            sft_extra={"use_cpu": True, "bf16": False, "optim": "adamw_torch"},
+            sft_extra={},
         )
+        if smoke_test:
+            cfg = dc_replace(cfg, lora_rank=4, lora_alpha=8, seq_len=256, load_in_4bit=False)
+        return cfg
 
 
 # ---------------------------------------------------------------------------
@@ -252,26 +209,23 @@ def run_training_task(
     click.echo(f"  Config: load_in_4bit={hw_cfg.load_in_4bit} dtype={hw_cfg.load_dtype} grad_ckpt={hw_cfg.use_grad_ckpt}")
     click.echo(f"  SFT overrides: {hw_cfg.sft_extra or '(none)'}")
 
-    try:
-        model, tokenizer = FastModel.from_pretrained(
-            model_name=model_id,
+    def _load_model(mid: str):
+        return FastModel.from_pretrained(
+            model_name=mid,
             max_seq_length=hw_cfg.seq_len,
             load_in_4bit=hw_cfg.load_in_4bit,
             dtype=hw_cfg.load_dtype,
             device_map=hw_cfg.device,
         )
+
+    try:
+        model, tokenizer = _load_model(model_id)
     except Exception as exc:
         if model_cfg.fallback_model_id:
             click.echo(f"  WARNING: {model_id} failed ({exc}). Falling back to {model_cfg.fallback_model_id}")
             model_id = model_cfg.fallback_model_id
             substituted = True
-            model, tokenizer = FastModel.from_pretrained(
-                model_name=model_id,
-                max_seq_length=hw_cfg.seq_len,
-                load_in_4bit=hw_cfg.load_in_4bit,
-                dtype=hw_cfg.load_dtype,
-                device_map=hw_cfg.device,
-            )
+            model, tokenizer = _load_model(model_id)
         else:
             raise
 

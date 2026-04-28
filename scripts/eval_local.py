@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import functools
 import importlib.metadata
 import json
 import os
@@ -21,7 +20,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 from checkpoint_utils import append_jsonl, finalize_partial, load_partial_ids, partial_path
-from utils import build_messages, cuda_available, load_jsonl
+from utils import build_messages, load_jsonl
 
 REPO_ROOT = Path(__file__).parent.parent
 load_dotenv(REPO_ROOT / ".env")
@@ -33,8 +32,7 @@ MAX_CONCURRENCY = 4
 MAX_RETRIES = 3
 VLLM_HOST = "http://localhost:8000"
 VLLM_HEALTH_TIMEOUT_GPU = 300
-VLLM_HEALTH_TIMEOUT_CPU = 1800
-VLLM_HEALTH_TIMEOUT_SMOKE = 360  # inductor warmup on CPU adds ~3 min even for 0.5B
+VLLM_HEALTH_TIMEOUT_SMOKE = 120
 VLLM_HEALTH_INTERVAL = 5
 
 
@@ -105,29 +103,12 @@ def _stream_vllm_output(proc: subprocess.Popen) -> None:
         click.echo(f"  [vllm] {line.decode(errors='replace').rstrip()}")
 
 
-@functools.lru_cache(maxsize=None)
-def _ensure_vllm_for_hardware() -> bool:
-    """Ensure the correct vLLM build is installed. Returns True if GPU (CUDA) available.
-
-    vllm and vllm-cpu conflict — only one can be installed at a time.
-    vllm-cpu requires torch+cpu from the PyTorch CPU wheel index, not PyPI — passing
-    --extra-index-url lets pip find torch==<ver>+cpu when resolving dependencies.
-    """
-    gpu = cuda_available()
-    package = "vllm" if gpu else "vllm-cpu"
+def _check_vllm_package() -> None:
+    """Verify vllm is installed. Raises RuntimeError if setup.sh has not been run."""
     try:
-        importlib.metadata.version(package)
-        return gpu
+        importlib.metadata.version("vllm")
     except importlib.metadata.PackageNotFoundError:
-        pass
-
-    click.echo(f"  Installing {package} for this hardware...")
-    cmd = [sys.executable, "-m", "pip", "install", package, "--quiet"]
-    if not gpu:
-        cmd += ["--extra-index-url", "https://download.pytorch.org/whl/cpu"]
-    subprocess.run(cmd, check=True)
-    click.echo(f"  {package} installed.")
-    return gpu
+        raise RuntimeError("vllm is not installed. Run scripts/setup.sh.")
 
 
 def start_vllm_server(
@@ -135,26 +116,20 @@ def start_vllm_server(
     adapter_path: Optional[Path],
     max_seq_length: int,
     enable_thinking: Optional[bool] = None,
-) -> tuple[subprocess.Popen, bool]:
-    """Start vLLM server process. Returns (proc, gpu)."""
+) -> subprocess.Popen:
+    """Start vLLM server process. Returns proc."""
     env = os.environ.copy()
     env["VLLM_LOGGING_LEVEL"] = "DEBUG"
 
-    gpu = _ensure_vllm_for_hardware()
-    # Use module invocation: vllm-cpu's CLI binary crashes due to a metadata
-    # lookup bug (looks for "vllm" package when only "vllm-cpu" is registered).
+    _check_vllm_package()
     cmd = [
         sys.executable, "-m", "vllm.entrypoints.openai.api_server",
         "--model", base_model,
         "--dtype", "auto",
         "--max-model-len", str(max_seq_length),
         "--port", "8000",
+        "--gpu-memory-utilization", "0.9",
     ]
-    if gpu:
-        cmd += ["--gpu-memory-utilization", "0.9"]
-    else:
-        click.echo("  No CUDA GPU — using vllm-cpu.")
-    # Pass enable_thinking=False for Qwen3 to suppress chain-of-thought tokens
     if enable_thinking is False:
         cmd += ["--default-chat-template-kwargs", '{"enable_thinking": false}']
     if adapter_path and adapter_path.exists():
@@ -172,7 +147,7 @@ def start_vllm_server(
         env=env,
     )
     threading.Thread(target=_stream_vllm_output, args=(proc,), daemon=True).start()
-    return proc, gpu
+    return proc
 
 
 def stop_vllm_server(proc: subprocess.Popen) -> None:
@@ -189,10 +164,8 @@ def stop_vllm_server(proc: subprocess.Popen) -> None:
     click.echo("  vLLM server stopped.")
 
 
-def _vllm_health_timeout(gpu: bool, smoke_test: bool) -> int:
-    if gpu:
-        return VLLM_HEALTH_TIMEOUT_GPU
-    return VLLM_HEALTH_TIMEOUT_SMOKE if smoke_test else VLLM_HEALTH_TIMEOUT_CPU
+def _vllm_health_timeout(smoke_test: bool) -> int:
+    return VLLM_HEALTH_TIMEOUT_SMOKE if smoke_test else VLLM_HEALTH_TIMEOUT_GPU
 
 
 async def wait_for_vllm(proc: subprocess.Popen, timeout: int = VLLM_HEALTH_TIMEOUT_GPU) -> bool:
@@ -296,7 +269,7 @@ async def run_eval(
     test_rows = load_jsonl(test_path)
 
     out_path = (
-        REPO_ROOT / "results" / "predictions"
+        REPO_ROOT / "results" / "predictions" / "local"
         / model_cfg.model_short / task_id / f"{condition}.jsonl"
     )
 
@@ -403,10 +376,10 @@ def main(model: Optional[str], task: str, condition: str, dry_run: bool, smoke_t
                     for cond in base_conditions:
                         asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, None, dry_run=True, smoke_test=smoke_test))
                 else:
-                    proc, gpu = start_vllm_server(
+                    proc = start_vllm_server(
                         model_cfg.model_id, None, seq_len, model_cfg.enable_thinking
                     )
-                    health_timeout = _vllm_health_timeout(gpu, smoke_test)
+                    health_timeout = _vllm_health_timeout(smoke_test)
                     try:
                         ready = asyncio.run(wait_for_vllm(proc, timeout=health_timeout))
                         if not ready:
@@ -433,10 +406,10 @@ def main(model: Optional[str], task: str, condition: str, dry_run: bool, smoke_t
                     asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, adapter_path, dry_run=True, smoke_test=smoke_test))
                     continue
 
-                proc, gpu = start_vllm_server(
+                proc = start_vllm_server(
                     model_cfg.model_id, adapter_path, seq_len, model_cfg.enable_thinking
                 )
-                health_timeout = _vllm_health_timeout(gpu, smoke_test)
+                health_timeout = _vllm_health_timeout(smoke_test)
                 try:
                     ready = asyncio.run(wait_for_vllm(proc, timeout=health_timeout))
                     if not ready:

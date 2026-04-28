@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+
 
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -15,14 +17,6 @@ def write_jsonl(rows: list[dict], path: Path) -> None:
     with open(path, "w") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-
-def cuda_available() -> bool:
-    try:
-        import torch
-        return torch.cuda.is_available()
-    except ImportError:
-        return False
 
 
 def build_messages(prompt_row: dict, few_shot: list[dict], condition: str) -> list[dict]:

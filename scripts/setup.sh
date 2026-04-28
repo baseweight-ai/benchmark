@@ -1,35 +1,66 @@
 #!/usr/bin/env bash
+# Environment setup — safe to re-run at any time.
+# Assumes NVIDIA GPU with CUDA. No hardware detection is performed.
 set -euo pipefail
 
+CONDA_ENV="baseweight-benchmark"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_FILE="${REPO_ROOT}/.env"
+
 echo "=== Baseweight Benchmark Setup ==="
+echo "Repo: ${REPO_ROOT}"
 
-# Create conda environment
-if conda env list | grep -q "baseweight-bench"; then
-    echo "Environment baseweight-bench already exists. Activating..."
-else
-    echo "Creating conda environment baseweight-bench (Python 3.11)..."
-    conda create -n baseweight-bench python=3.11 -y
-fi
-
-# Activate
+# ---------------------------------------------------------------------------
+# Conda environment
+# ---------------------------------------------------------------------------
 eval "$(conda shell.bash hook)"
-conda activate baseweight-bench
+if conda env list | grep -qE "^${CONDA_ENV}[[:space:]]"; then
+    echo "Updating conda env ${CONDA_ENV}..."
+    conda env update -n "$CONDA_ENV" -f "${REPO_ROOT}/environment.yml" --prune -q
+else
+    echo "Creating conda env ${CONDA_ENV}..."
+    conda env create -n "$CONDA_ENV" -f "${REPO_ROOT}/environment.yml" -q
+fi
+conda activate "$CONDA_ENV"
 
-echo "Installing requirements..."
-pip install -r requirements.txt
+# ---------------------------------------------------------------------------
+# Verification
+# ---------------------------------------------------------------------------
+echo "Verifying install..."
+python - <<'PYEOF'
+import importlib.metadata, sys, torch
 
-echo "Installing Unsloth..."
-pip install "unsloth[cu124]"
+errors = []
 
-echo "Installing vLLM..."
-pip install vllm
+try:
+    vllm_ver = importlib.metadata.version("vllm")
+except importlib.metadata.PackageNotFoundError:
+    errors.append("vllm not installed")
+    vllm_ver = "missing"
 
-echo "Verifying CUDA..."
-python -c "import torch; assert torch.cuda.is_available(), 'CUDA not available — check your GPU and CUDA installation'; print('CUDA OK:', torch.version.cuda)"
+if "+cpu" in torch.__version__:
+    errors.append(f"CPU torch installed — expected CUDA build: {torch.__version__}")
 
-echo "GPU info:"
-python -c "import torch; print(torch.cuda.get_device_name(0)); print('VRAM:', round(torch.cuda.get_device_properties(0).total_memory / 1e9, 1), 'GB')"
+try:
+    unsloth_ver = importlib.metadata.version("unsloth")
+except importlib.metadata.PackageNotFoundError:
+    errors.append("unsloth not installed")
+    unsloth_ver = "missing"
+
+if errors:
+    print("SETUP ERRORS:")
+    for e in errors:
+        print(f"  - {e}")
+    sys.exit(1)
+
+print(f"  torch=={torch.__version__}  vllm=={vllm_ver}  unsloth=={unsloth_ver}")
+
+if torch.cuda.is_available():
+    p = torch.cuda.get_device_properties(0)
+    print(f"  GPU: {p.name}  VRAM: {p.total_memory // 1024**3} GB")
+else:
+    print("  WARNING: CUDA not available to torch — verify this is an NVIDIA GPU pod")
+PYEOF
 
 echo ""
 echo "=== Setup complete ==="
-echo "Next: cp .env.example .env  # then add your API keys"

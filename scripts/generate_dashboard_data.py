@@ -118,11 +118,12 @@ def compute_tco_12mo(
 
 
 def load_summary(model_short: str, task_id: str, condition: str) -> Optional[dict]:
-    path = REPO_ROOT / "results" / "summaries" / model_short / task_id / f"{condition}.json"
-    if not path.exists():
-        return None
-    with open(path) as f:
-        return json.load(f)
+    for source in ("local", "api"):
+        path = REPO_ROOT / "results" / "summaries" / source / model_short / task_id / f"{condition}.json"
+        if path.exists():
+            with open(path) as f:
+                return json.load(f)
+    return None
 
 
 def load_training_meta(model_short: str, task_id: str, condition: str) -> Optional[dict]:

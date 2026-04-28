@@ -25,5 +25,4 @@ dependencies:
     - huggingface-hub>=0.28.0
     - safetensors>=0.5.0
     - pyyaml
-    # vllm is intentionally absent: eval_local.py installs vllm or vllm-cpu
-    # automatically based on whether CUDA is available.
+    - vllm

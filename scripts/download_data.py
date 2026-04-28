@@ -1,13 +1,17 @@
 """Download raw datasets from HuggingFace for all benchmark tasks."""
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Optional
 
 import click
+from dotenv import load_dotenv
 from pydantic import BaseModel
 import yaml
+
+load_dotenv(Path(__file__).parent.parent / ".env", override=True)
 
 # Expected minimum row counts for sanity checks (split: min_count)
 EXPECTED_COUNTS: dict[str, dict[str, int]] = {
@@ -46,17 +50,44 @@ TINY_TRAIN = 12
 TINY_TEST = 5
 
 
+def _hub_load(path: str, **kwargs):
+    """Load from HuggingFace Hub; raise immediately if Hub is unreachable.
+
+    The datasets library silently falls back to local cache when the Hub is
+    unreachable, emitting a log message instead of raising.  We pre-check Hub
+    reachability via HfApi so any failure is explicit before load_dataset runs.
+    """
+    from datasets import load_dataset
+    from huggingface_hub import HfApi
+
+    token = kwargs.get("token")
+    try:
+        HfApi(token=token).dataset_info(path)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Hugging Face Hub is unreachable for '{path}'. "
+            f"Cannot proceed — load_dataset would silently fall back to local cache.\n"
+            f"Check network connection and HF_TOKEN.\nDetail: {exc}"
+        ) from exc
+
+    return load_dataset(path, **kwargs)
+
+
 def download_task(cfg: TaskConfig, dry_run: bool, tiny: bool = False) -> None:
     click.echo(f"\n[{cfg.task_id}] Downloading {cfg.task_name}...")
     if dry_run:
         click.echo(f"  [dry-run] Would download {cfg.dataset_path} (config={cfg.dataset_config})")
         return
 
-    from datasets import load_dataset, DatasetDict  # lazy import
+    from datasets import DatasetDict, DownloadMode  # lazy import
     out_dir = REPO_ROOT / "data" / "raw" / cfg.task_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    load_kwargs: dict = {}
+    hf_token = os.environ.get("HF_TOKEN") or None
+    load_kwargs: dict = {
+        "token": hf_token,
+        "download_mode": DownloadMode.FORCE_REDOWNLOAD,
+    }
     if cfg.dataset_config:
         load_kwargs["name"] = cfg.dataset_config
 
@@ -66,7 +97,7 @@ def download_task(cfg: TaskConfig, dry_run: bool, tiny: bool = False) -> None:
         for split in ("train", "test", "validation"):
             limit = TINY_TRAIN if split == "train" else TINY_TEST
             try:
-                ds_split = load_dataset(cfg.dataset_path, split=f"{split}[:{limit}]", **load_kwargs)
+                ds_split = _hub_load(cfg.dataset_path, split=f"{split}[:{limit}]", **load_kwargs)
                 loaded[split] = ds_split
                 click.echo(f"  {split}: {len(ds_split)} rows (tiny)")
             except Exception as e:
@@ -74,10 +105,13 @@ def download_task(cfg: TaskConfig, dry_run: bool, tiny: bool = False) -> None:
         if not loaded:
             for err in split_errors:
                 click.echo(f"  {err}", err=True)
-            raise RuntimeError(f"No valid splits found for {cfg.dataset_path}")
+            raise RuntimeError(
+                f"Could not download any splits for {cfg.dataset_path} from the Hugging Face Hub. "
+                "Check your HF_TOKEN and network connection."
+            )
         ds = DatasetDict(loaded)
     else:
-        ds = load_dataset(cfg.dataset_path, **load_kwargs)
+        ds = _hub_load(cfg.dataset_path, **load_kwargs)
         for split, dataset in ds.items():
             count = len(dataset)
             expected = EXPECTED_COUNTS.get(cfg.task_id, {}).get(split, 0)
@@ -91,7 +125,7 @@ def download_task(cfg: TaskConfig, dry_run: bool, tiny: bool = False) -> None:
 @click.command()
 @click.option("--task", default=None, help="Task ID to download (required; use 'all' to download every task)")
 @click.option("--dry-run", is_flag=True, help="Validate config without downloading")
-@click.option("--tiny", is_flag=True, help=f"Download only {TINY_TRAIN} train + {TINY_TEST} test rows for local CPU testing")
+@click.option("--smoke-test", "tiny", is_flag=True, help=f"Download only {TINY_TRAIN} train + {TINY_TEST} test rows for smoke testing")
 def main(task: str, dry_run: bool, tiny: bool) -> None:
     """Download benchmark datasets from HuggingFace.
 
