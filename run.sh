@@ -27,7 +27,7 @@ set -euo pipefail
 source "$HOME/miniconda3/etc/profile.d/conda.sh" 2>/dev/null || \
     source "$HOME/anaconda3/etc/profile.d/conda.sh" 2>/dev/null || \
     { echo "ERROR: conda not found — run: source /workspace/config/start.sh"; exit 1; }
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)"
 SCRIPTS="${REPO_ROOT}/scripts"
 
 # ---------------------------------------------------------------------------
@@ -196,13 +196,13 @@ if [[ "$CLEAN" == true ]]; then
     if [[ "$DO_EVAL_LOCAL" == true ]]; then
         clean_paths \
             "${REPO_ROOT}/results/predictions/local/${MODEL_G}/${TASK_G}" \
-            "${REPO_ROOT}/results/predictions/local/${MODEL_G}/${TASK_G}.partial"
+            "${REPO_ROOT}/results/predictions/local/${MODEL_G}/${TASK_G}/*.partial"
     fi
 
     if [[ "$DO_EVAL_API" == true ]]; then
         clean_paths \
             "${REPO_ROOT}/results/predictions/api/${MODEL_G}/${TASK_G}" \
-            "${REPO_ROOT}/results/predictions/api/${MODEL_G}/${TASK_G}.partial"
+            "${REPO_ROOT}/results/predictions/api/${MODEL_G}/${TASK_G}/*.partial"
     fi
 
     if [[ "$DO_DASHBOARD" == true ]]; then
@@ -254,10 +254,12 @@ if [[ "$DO_EVAL_LOCAL" == true ]]; then
 fi
 
 if [[ "$DO_EVAL_API" == true ]]; then
-    step "Eval API  (model=${MODEL}, task=${TASK})"
+    API_MODEL="${MODEL_OVERRIDE:-all}"
+    step "Eval API  (model=${API_MODEL}, task=${TASK})"
     $PYTHON "${SCRIPTS}/eval_api.py" \
         --task "$TASK" \
-        --model "$MODEL" \
+        --model "$API_MODEL" \
+        $SMOKE_FLAG \
         $DRY_FLAG
 fi
 

@@ -6,7 +6,8 @@ Network volume layout (under NETWORK_VOLUME/checkpoints/<model>/<task>/<conditio
   adapter/           Final adapter copy (written atomically on job completion)
 
 Partial eval layout:
-  results/predictions/<model>/<task>/<condition>.jsonl.partial
+  results/predictions/local/<model>/<task>/<condition>.jsonl.partial
+  results/predictions/api/<model>/<task>/<condition>.jsonl.partial
     Written row-by-row as inference completes; renamed to .jsonl on completion.
 """
 from __future__ import annotations

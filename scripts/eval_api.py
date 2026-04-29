@@ -23,12 +23,8 @@ load_dotenv(REPO_ROOT / ".env")
 
 ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa", "mbpp"]
 
-# OpenAI models — gpt-5.4 and gpt-4.1-sft cannot be mutually fine-tuned
 OPENAI_MODELS: dict[str, Optional[str]] = {
-    "gpt-5.4":      "gpt-5",      # update if OpenAI API model string differs
-    "gpt-4.1":      "gpt-4.1",
     "gpt-4.1-mini": "gpt-4.1-mini",
-    "gpt-4.1-nano": "gpt-4.1-nano",
     "gpt-4.1-sft":  None,          # set at runtime after fine-tuning job completes
 }
 
@@ -43,17 +39,14 @@ GOOGLE_MODELS: dict[str, str] = {
 }
 
 MODEL_CONDITIONS: dict[str, list[str]] = {
-    "gpt-5.4":          ["zero-shot", "5-shot"],
-    "gpt-4.1":          ["zero-shot", "5-shot"],
     "gpt-4.1-mini":     ["zero-shot", "5-shot"],
-    "gpt-4.1-nano":     ["zero-shot", "5-shot"],
     "gpt-4.1-sft":      ["api-sft-500"],
     "claude-sonnet-4":  ["zero-shot", "5-shot"],
     "gemini-2.5-flash": ["zero-shot", "5-shot"],
 }
 
 ALL_API_MODELS = [
-    "gpt-5.4", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4.1-sft",
+    "gpt-4.1-mini", "gpt-4.1-sft",
     "claude-sonnet-4", "gemini-2.5-flash",
 ]
 
@@ -72,6 +65,16 @@ def load_task_config(task_id: str) -> TaskConfig:
     with open(path) as f:
         data = yaml.safe_load(f)
     return TaskConfig(**{k: v for k, v in data.items() if k in TaskConfig.model_fields})
+
+
+def load_claude_auth_token() -> Optional[str]:
+    """Read the Claude Code OAuth access token from ~/.claude/.credentials.json."""
+    creds_path = Path.home() / ".claude" / ".credentials.json"
+    if not creds_path.exists():
+        return None
+    with open(creds_path) as f:
+        data = json.load(f)
+    return data.get("claudeAiOauth", {}).get("accessToken")
 
 
 
@@ -156,14 +159,13 @@ async def call_gemini(
     return "", 0, 0, 0
 
 
-async def run_eval(model_id: str, task_id: str, condition: str, task_cfg: TaskConfig, dry_run: bool) -> None:
+async def run_eval(model_id: str, task_id: str, condition: str, task_cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> None:
     prepared = REPO_ROOT / "data" / "prepared" / task_id
-    test_path = prepared / "test.jsonl"
-    few_shot_path = prepared / "few_shot_5.jsonl"
+    test_path = prepared / ("smoke_test.jsonl" if smoke_test else "test.jsonl")
+    few_shot_path = prepared / ("smoke_train.jsonl" if smoke_test else "few_shot_5.jsonl")
 
     if not test_path.exists():
-        click.echo(f"  SKIP [{model_id}/{task_id}/{condition}]: test.jsonl not found")
-        return
+        raise FileNotFoundError(f"test data not found: {test_path}")
 
     test_rows = load_jsonl(test_path)
     few_shot = load_jsonl(few_shot_path) if few_shot_path.exists() else []
@@ -192,7 +194,9 @@ async def run_eval(model_id: str, task_id: str, condition: str, task_cfg: TaskCo
     if model_id in ANTHROPIC_MODELS:
         model_str = ANTHROPIC_MODELS[model_id]
         from anthropic import AsyncAnthropic
-        client = AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        auth_token = None if api_key else load_claude_auth_token()
+        client = AsyncAnthropic(api_key=api_key, auth_token=auth_token)
         call_fn = call_anthropic
     elif model_id in GOOGLE_MODELS:
         model_str = GOOGLE_MODELS[model_id]
@@ -243,14 +247,13 @@ async def run_eval(model_id: str, task_id: str, condition: str, task_cfg: TaskCo
     click.echo(f"  Saved {len(test_rows)} predictions to {out_path.relative_to(REPO_ROOT)}")
 
 
-async def run_sft(task_id: str, task_cfg: TaskConfig, dry_run: bool) -> None:
+async def run_sft(task_id: str, task_cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> None:
     """Upload training data, create GPT-4.1 fine-tuning job, then evaluate."""
     prepared = REPO_ROOT / "data" / "prepared" / task_id
     sft_path = prepared / "openai_sft_500.jsonl"
 
     if not sft_path.exists():
-        click.echo(f"  SKIP [gpt-4.1-sft/{task_id}]: {sft_path} not found")
-        return
+        raise FileNotFoundError(f"SFT training data not found: {sft_path}")
 
     if dry_run:
         click.echo(f"  [dry-run] Would upload {sft_path} and create GPT-4.1 fine-tuning job")
@@ -299,7 +302,7 @@ async def run_sft(task_id: str, task_cfg: TaskConfig, dry_run: bool) -> None:
         click.echo(f"  Fine-tuned model: {ft_model}, cost: ${training_cost:.3f}")
 
     OPENAI_MODELS["gpt-4.1-sft"] = ft_model
-    await run_eval("gpt-4.1-sft", task_id, "api-sft-500", task_cfg, dry_run)
+    await run_eval("gpt-4.1-sft", task_id, "api-sft-500", task_cfg, dry_run, smoke_test)
 
 
 @click.command()
@@ -307,7 +310,8 @@ async def run_sft(task_id: str, task_cfg: TaskConfig, dry_run: bool) -> None:
 @click.option("--task", default="all", help="Task ID or 'all'")
 @click.option("--condition", default="all", help="zero-shot|5-shot|api-sft-500|all")
 @click.option("--dry-run", is_flag=True)
-def main(model: str, task: str, condition: str, dry_run: bool) -> None:
+@click.option("--smoke-test", is_flag=True)
+def main(model: str, task: str, condition: str, dry_run: bool, smoke_test: bool) -> None:
     """Evaluate frontier API models (OpenAI, Anthropic, Google) on benchmark tasks."""
     model_ids = ALL_API_MODELS if model == "all" else [model]
 
@@ -318,7 +322,10 @@ def main(model: str, task: str, condition: str, dry_run: bool) -> None:
         if needs_openai and not os.environ.get("OPENAI_API_KEY"):
             click.echo("  WARNING: OPENAI_API_KEY not set", err=True)
         if needs_anthropic and not os.environ.get("ANTHROPIC_API_KEY"):
-            click.echo("  WARNING: ANTHROPIC_API_KEY not set", err=True)
+            if load_claude_auth_token():
+                click.echo("  INFO: ANTHROPIC_API_KEY not set, falling back to Claude Code auth token")
+            else:
+                click.echo("  WARNING: ANTHROPIC_API_KEY not set and no Claude Code credentials found", err=True)
         if needs_google and not os.environ.get("GOOGLE_API_KEY"):
             click.echo("  WARNING: GOOGLE_API_KEY not set", err=True)
     task_ids = ALL_TASKS if task == "all" else [task]
@@ -330,7 +337,7 @@ def main(model: str, task: str, condition: str, dry_run: bool) -> None:
                 try:
                     task_cfg = load_task_config(tid)
                     if mid == "gpt-4.1-sft":
-                        await run_sft(tid, task_cfg, dry_run)
+                        await run_sft(tid, task_cfg, dry_run, smoke_test)
                     else:
                         supported = MODEL_CONDITIONS.get(mid, ["zero-shot", "5-shot"])
                         conditions_to_run = (
@@ -342,7 +349,7 @@ def main(model: str, task: str, condition: str, dry_run: bool) -> None:
                             click.echo(f"  SKIP [{mid}/{tid}/{condition}]: not supported for {mid}")
                             continue
                         for cond in conditions_to_run:
-                            await run_eval(mid, tid, cond, task_cfg, dry_run)
+                            await run_eval(mid, tid, cond, task_cfg, dry_run, smoke_test)
                 except Exception as exc:
                     click.echo(f"  ERROR [{mid}/{tid}]: {exc}", err=True)
                     import traceback; traceback.print_exc()

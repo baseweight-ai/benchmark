@@ -274,8 +274,7 @@ async def run_eval(
     few_shot = get_few_shot(task_id, model_cfg.model_short, smoke_test)
 
     if not test_path.exists():
-        click.echo(f"  SKIP [{model_cfg.model_short}/{task_id}/{condition}]: {test_path.name} not found")
-        return
+        raise FileNotFoundError(f"test data not found: {test_path}")
 
     test_rows = load_jsonl(test_path)
 
