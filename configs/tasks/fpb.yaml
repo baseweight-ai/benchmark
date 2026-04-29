@@ -1,7 +1,7 @@
 task_id: fpb
 task_name: "Financial Sentiment"
-dataset_path: "takala/financial_phrasebank"
-dataset_config: "sentences_allagree"
+dataset_path: "warwickai/financial_phrasebank_mirror"
+dataset_config: null
 task_type: classification
 num_classes: 3
 metric_id: weighted_f1

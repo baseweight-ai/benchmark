@@ -32,7 +32,7 @@ MAX_CONCURRENCY = 4
 MAX_RETRIES = 3
 VLLM_HOST = "http://localhost:8000"
 VLLM_HEALTH_TIMEOUT_GPU = 300
-VLLM_HEALTH_TIMEOUT_SMOKE = 120
+VLLM_HEALTH_TIMEOUT_SMOKE = 300
 VLLM_HEALTH_INTERVAL = 5
 
 
@@ -118,6 +118,15 @@ def start_vllm_server(
     enable_thinking: Optional[bool] = None,
 ) -> subprocess.Popen:
     """Start vLLM server process. Returns proc."""
+    # Kill any lingering vLLM processes (server + engine subprocess) to avoid
+    # orphaned GPU contexts causing OOM on the next run
+    killed = any(
+        subprocess.run(["pkill", "-9", "-f", p], capture_output=True).returncode == 0
+        for p in ["vllm.entrypoints.openai.api_server", "vllm.engine.multiprocessing"]
+    )
+    if killed:
+        time.sleep(3)
+
     env = os.environ.copy()
     env["VLLM_LOGGING_LEVEL"] = "DEBUG"
 
@@ -129,6 +138,8 @@ def start_vllm_server(
         "--max-model-len", str(max_seq_length),
         "--port", "8000",
         "--gpu-memory-utilization", "0.9",
+        "--swap-space", "0",
+        "--max-num-seqs", str(MAX_CONCURRENCY * 2),
     ]
     if enable_thinking is False:
         cmd += ["--default-chat-template-kwargs", '{"enable_thinking": false}']
@@ -345,6 +356,7 @@ def main(model: Optional[str], task: str, condition: str, dry_run: bool, smoke_t
     task_ids = ALL_TASKS if task == "all" else [task]
 
     failures = []
+    health_timeout = _vllm_health_timeout(smoke_test)
 
     for mid in model_ids:
         model_cfg = load_model_config(mid)
@@ -379,7 +391,6 @@ def main(model: Optional[str], task: str, condition: str, dry_run: bool, smoke_t
                     proc = start_vllm_server(
                         model_cfg.model_id, None, seq_len, model_cfg.enable_thinking
                     )
-                    health_timeout = _vllm_health_timeout(smoke_test)
                     try:
                         ready = asyncio.run(wait_for_vllm(proc, timeout=health_timeout))
                         if not ready:

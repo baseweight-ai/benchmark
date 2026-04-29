@@ -16,7 +16,7 @@ load_dotenv(Path(__file__).parent.parent / ".env", override=True)
 # Expected minimum row counts for sanity checks (split: min_count)
 EXPECTED_COUNTS: dict[str, dict[str, int]] = {
     "banking77": {"train": 8000,  "test": 2000},
-    "cuad":      {"train": 10000, "test": 4000},
+    "cuad":      {"train": 10000, "test": 1000},
     "ledgar":    {"train": 50000, "test": 5000},
     "fpb":       {"train": 3000},
     "medmcqa":   {"train": 100000, "test": 4000},

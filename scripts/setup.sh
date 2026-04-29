@@ -23,6 +23,9 @@ else
 fi
 conda activate "$CONDA_ENV"
 
+# torchao conflicts with torch==2.5.1 (torch.int1 missing); unsloth doesn't need it
+pip uninstall -y torchao 2>/dev/null || true
+
 # ---------------------------------------------------------------------------
 # Verification
 # ---------------------------------------------------------------------------

@@ -24,6 +24,9 @@
 #   -h, --help       Show this message
 
 set -euo pipefail
+source "$HOME/miniconda3/etc/profile.d/conda.sh" 2>/dev/null || \
+    source "$HOME/anaconda3/etc/profile.d/conda.sh" 2>/dev/null || \
+    { echo "ERROR: conda not found — run: source /workspace/config/start.sh"; exit 1; }
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS="${REPO_ROOT}/scripts"
 

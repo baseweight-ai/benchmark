@@ -1,6 +1,6 @@
 task_id: cuad
 task_name: "Contract Clause Extraction"
-dataset_path: "theatticusproject/cuad-qa"
+dataset_path: "chenghao/cuad_qa"
 dataset_config: null
 task_type: extraction
 metric_id: token_f1

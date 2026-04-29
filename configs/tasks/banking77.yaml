@@ -1,6 +1,6 @@
 task_id: banking77
 task_name: "Customer Support Routing"
-dataset_path: "PolyAI/banking77"
+dataset_path: "legacy-datasets/banking77"
 dataset_config: null
 task_type: classification
 num_classes: 77
