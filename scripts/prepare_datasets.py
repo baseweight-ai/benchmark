@@ -18,7 +18,7 @@ from checkpoint_utils import nv_prepared_dir
 
 REPO_ROOT = Path(__file__).parent.parent
 SEED = 42
-ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa", "mbpp"]
+ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa"]
 
 SMOKE_TRAIN_N = 20
 SMOKE_TEST_N = 10
@@ -164,18 +164,26 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
 
     # ── Task-specific split handling ───────────────────────────────────────
     if cfg.task_id == "fpb":
-        # No predefined split — create 70/15/15
         all_rows = list(ds["train"])
         label_names = cfg.custom_label_names or ["negative", "neutral", "positive"]
         rng = random.Random(cfg.split_seed or 42)
         rng.shuffle(all_rows)
-        n = len(all_rows)
-        n_train = int(n * 0.70)
-        n_val = int(n * 0.15)
-        train_rows = all_rows[:n_train]
-        val_rows = all_rows[n_train:n_train + n_val]
-        test_rows = all_rows[n_train + n_val:]
-        click.echo(f"  FPB split: train={len(train_rows)}, val={len(val_rows)}, test={len(test_rows)}")
+        if smoke_test:
+            # Download provided 2x rows; split evenly into 12 train / 12 test
+            half = len(all_rows) // 2
+            train_rows = all_rows[:half]
+            test_rows = all_rows[half:]
+            val_rows = []
+            click.echo(f"  FPB smoke split: train={len(train_rows)}, test={len(test_rows)}")
+        else:
+            # Prod: 70/15/15
+            n = len(all_rows)
+            n_train = int(n * 0.70)
+            n_val = int(n * 0.15)
+            train_rows = all_rows[:n_train]
+            val_rows = all_rows[n_train:n_train + n_val]
+            test_rows = all_rows[n_train + n_val:]
+            click.echo(f"  FPB split: train={len(train_rows)}, val={len(val_rows)}, test={len(test_rows)}")
     else:
         label_names = None
         split_name = cfg.test_split

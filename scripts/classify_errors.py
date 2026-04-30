@@ -1,7 +1,6 @@
 """Classify prediction errors and compute primary metrics per task."""
 from __future__ import annotations
 
-import json
 import re
 import sys
 from collections import defaultdict
@@ -12,10 +11,11 @@ import click
 import yaml
 from pydantic import BaseModel, Field
 
+from checkpoint_utils import atomic_write_json
 from utils import load_jsonl, write_jsonl as _write_jsonl
 
 REPO_ROOT = Path(__file__).parent.parent
-ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa", "mbpp"]
+ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa"]
 
 
 class TaskConfig(BaseModel):
@@ -30,11 +30,6 @@ def load_task_config(task_id: str) -> TaskConfig:
         data = yaml.safe_load(f)
     return TaskConfig(**{k: v for k, v in data.items() if k in TaskConfig.model_fields})
 
-
-def write_json(data: dict, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
 
 
 # ── Metric helpers ─────────────────────────────────────────────────────────
@@ -142,56 +137,6 @@ def classify_extraction(prediction: str, ground_truth: str, f1_threshold_partial
     return "hallucinated"
 
 
-# ── Code task error classification ────────────────────────────────────────
-
-def classify_code(prediction: str, ground_truth: str, mbpp_passed: Optional[bool] = None, mbpp_error: Optional[str] = "") -> str:
-    """Priority: pass > syntax_error > runtime_error > logic_error > incomplete."""
-    if mbpp_passed is True:
-        return "pass"
-
-    if is_empty(prediction):
-        return "incomplete"
-
-    # Try to detect syntax errors
-    code = prediction.strip()
-    if "```" in code:
-        # strip fences
-        if "```python" in code:
-            start = code.find("```python") + len("```python")
-            end = code.find("```", start)
-            code = code[start:end].strip() if end != -1 else code[start:].strip()
-        else:
-            start = code.find("```") + 3
-            end = code.find("```", start)
-            code = code[start:end].strip() if end != -1 else code[start:].strip()
-
-    try:
-        import ast
-        ast.parse(code)
-        syntax_ok = True
-    except SyntaxError:
-        syntax_ok = False
-
-    if not syntax_ok:
-        return "syntax_error"
-
-    err = (mbpp_error or "").lower()
-    if err and any(kw in err for kw in ["syntaxerror", "indentation"]):
-        return "syntax_error"
-    if err and any(kw in err for kw in ["typeerror", "nameerror", "attributeerror", "valueerror",
-                                         "zerodivisionerror", "indexerror", "keyerror", "timeout"]):
-        return "runtime_error"
-
-    # If tests ran but failed (mbpp_passed is False)
-    if mbpp_passed is False:
-        return "logic_error"
-
-    # Code looks syntactically valid but incomplete (no function def)
-    if "def " not in code:
-        return "incomplete"
-
-    return "logic_error"
-
 
 # ── Primary metric computation ─────────────────────────────────────────────
 
@@ -219,10 +164,6 @@ def compute_metric(task_cfg: TaskConfig, classified_rows: list[dict]) -> Optiona
     if metric == "token_f1":
         scores = [r.get("token_f1", 0.0) for r in classified_rows]
         return sum(scores) / len(scores) if scores else 0.0
-
-    if metric == "pass_at_1":
-        passed = sum(1 for r in classified_rows if r["error_category"] == "pass")
-        return passed / len(classified_rows) if classified_rows else 0.0
 
     return None
 
@@ -252,12 +193,6 @@ def classify_predictions(
             cat = classify_extraction(pred, gt)
             enriched["error_category"] = cat
             enriched["token_f1"] = token_f1(pred, gt)
-
-        elif task_cfg.task_type == "code":
-            mbpp_passed = row.get("mbpp_passed")
-            mbpp_error = row.get("mbpp_error", "")
-            cat = classify_code(pred, gt, mbpp_passed, mbpp_error)
-            enriched["error_category"] = cat
 
         else:
             cat = "unknown"
@@ -329,7 +264,7 @@ def process_model_task_condition(
     }
 
     summary_path = REPO_ROOT / "results" / "summaries" / source / model_short / task_id / f"{condition}.json"
-    write_json(summary, summary_path)
+    atomic_write_json(summary, summary_path)
     metric_str = f"{metric_value:.4f}" if metric_value is not None else "N/A"
     click.echo(
         f"  [{model_short}/{task_id}/{condition}] "
@@ -346,7 +281,6 @@ def get_valid_labels(task_id: str) -> Optional[list[str]]:
         "ledgar":     None,  # many provision types — skip format check
         "fpb":        ["positive", "negative", "neutral"],
         "medmcqa":    ["A", "B", "C", "D"],
-        "mbpp":       None,  # code generation — no fixed label set
     }
     return label_map.get(task_id)
 

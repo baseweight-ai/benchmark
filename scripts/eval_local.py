@@ -25,7 +25,7 @@ from utils import build_messages, load_jsonl
 REPO_ROOT = Path(__file__).parent.parent
 load_dotenv(REPO_ROOT / ".env")
 
-ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa", "mbpp"]
+ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa"]
 ALL_MODELS = ["qwen3-8b", "gemma3-4b", "phi4-mini"]
 
 MAX_CONCURRENCY = 4

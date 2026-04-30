@@ -20,7 +20,6 @@ EXPECTED_COUNTS: dict[str, dict[str, int]] = {
     "ledgar":    {"train": 50000, "test": 5000},
     "fpb":       {"train": 3000},
     "medmcqa":   {"train": 100000, "test": 4000},
-    "mbpp":      {"train": 374,   "test": 500},
 }
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -44,7 +43,7 @@ def load_task_configs(task_ids: list[str]) -> list[TaskConfig]:
     return configs
 
 
-ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa", "mbpp"]
+ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa"]
 
 TINY_TRAIN = 12
 TINY_TEST = 5
@@ -92,10 +91,22 @@ def download_task(cfg: TaskConfig, dry_run: bool, tiny: bool = False) -> None:
         load_kwargs["name"] = cfg.dataset_config
 
     if tiny:
+        # Probe for a test split first so we can download 2x train rows upfront for
+        # tasks that have none, avoiding a redundant second download.
+        test_exists = False
+        for split in ("test", "validation"):
+            try:
+                probe = _hub_load(cfg.dataset_path, split=f"{split}[:1]", **load_kwargs)
+                test_exists = True
+                break
+            except Exception:
+                pass
+
+        train_limit = TINY_TRAIN if test_exists else TINY_TRAIN * 2
         loaded = {}
         split_errors: list[str] = []
         for split in ("train", "test", "validation"):
-            limit = TINY_TRAIN if split == "train" else TINY_TEST
+            limit = train_limit if split == "train" else TINY_TEST
             try:
                 ds_split = _hub_load(cfg.dataset_path, split=f"{split}[:{limit}]", **load_kwargs)
                 loaded[split] = ds_split
@@ -109,6 +120,8 @@ def download_task(cfg: TaskConfig, dry_run: bool, tiny: bool = False) -> None:
                 f"Could not download any splits for {cfg.dataset_path} from the Hugging Face Hub. "
                 "Check your HF_TOKEN and network connection."
             )
+        if not test_exists:
+            click.echo(f"  No test split — downloaded {train_limit} train rows for smoke splitting")
         ds = DatasetDict(loaded)
     else:
         ds = _hub_load(cfg.dataset_path, **load_kwargs)

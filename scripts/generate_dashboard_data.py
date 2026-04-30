@@ -11,7 +11,7 @@ import yaml
 from pydantic import BaseModel
 
 REPO_ROOT = Path(__file__).parent.parent
-ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa", "mbpp"]
+ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa"]
 
 # Model display names and families
 MODEL_META = {

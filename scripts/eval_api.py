@@ -21,34 +21,34 @@ from utils import build_messages, load_jsonl
 REPO_ROOT = Path(__file__).parent.parent
 load_dotenv(REPO_ROOT / ".env")
 
-ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa", "mbpp"]
+ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa"]
 
 OPENAI_MODELS: dict[str, Optional[str]] = {
-    "gpt-4.1-mini": "gpt-4.1-mini",
-    "gpt-4.1-sft":  None,          # set at runtime after fine-tuning job completes
+    "gpt-4.1-nano":     "gpt-4.1-nano",
+    "gpt-4.1-nano-sft": None,   # set at runtime after fine-tuning job completes
+    "gpt-5.4-mini":     "gpt-5.4-mini",
+    "gpt-5.4-mini-sft": None,   # set at runtime after fine-tuning job completes
+    "gpt-5.5":          "gpt-5.5",
 }
 
-# Anthropic models
-ANTHROPIC_MODELS: dict[str, str] = {
-    "claude-sonnet-4": "claude-sonnet-4-5",
-}
-
-# Google models
-GOOGLE_MODELS: dict[str, str] = {
-    "gemini-2.5-flash": "gemini-2.5-flash",
+SFT_BASE_MODELS: dict[str, str] = {
+    "gpt-4.1-nano-sft": "gpt-4.1-nano-2025-04-14",
+    "gpt-5.4-mini-sft": "gpt-5.4-mini-2026-03-17",
 }
 
 MODEL_CONDITIONS: dict[str, list[str]] = {
-    "gpt-4.1-mini":     ["zero-shot", "5-shot"],
-    "gpt-4.1-sft":      ["api-sft-500"],
-    "claude-sonnet-4":  ["zero-shot", "5-shot"],
-    "gemini-2.5-flash": ["zero-shot", "5-shot"],
+    "gpt-4.1-nano":     ["zero-shot", "5-shot"],
+    "gpt-4.1-nano-sft": ["api-sft-500"],
+    "gpt-5.4-mini":     ["zero-shot"],
+    "gpt-5.4-mini-sft": ["api-sft-500"],
+    "gpt-5.5":          ["5-shot"],
 }
 
-ALL_API_MODELS = [
-    "gpt-4.1-mini", "gpt-4.1-sft",
-    "claude-sonnet-4", "gemini-2.5-flash",
-]
+SMOKE_MODELS = ["gpt-4.1-nano", "gpt-4.1-nano-sft"]
+PROD_MODELS  = ["gpt-5.4-mini", "gpt-5.4-mini-sft", "gpt-5.5"]
+ALL_API_MODELS = SMOKE_MODELS + PROD_MODELS
+
+_SFT_SUFFIX_MAX_LEN = 18  # OpenAI fine-tuning suffix character limit
 
 MAX_CONCURRENCY = 5
 MAX_RETRIES = 5
@@ -65,16 +65,6 @@ def load_task_config(task_id: str) -> TaskConfig:
     with open(path) as f:
         data = yaml.safe_load(f)
     return TaskConfig(**{k: v for k, v in data.items() if k in TaskConfig.model_fields})
-
-
-def load_claude_auth_token() -> Optional[str]:
-    """Read the Claude Code OAuth access token from ~/.claude/.credentials.json."""
-    creds_path = Path.home() / ".claude" / ".credentials.json"
-    if not creds_path.exists():
-        return None
-    with open(creds_path) as f:
-        data = json.load(f)
-    return data.get("claudeAiOauth", {}).get("accessToken")
 
 
 
@@ -99,65 +89,6 @@ async def call_openai(
     return "", 0, 0, 0
 
 
-async def call_anthropic(
-    client, model_str: str, messages: list[dict], max_tokens: int, semaphore: asyncio.Semaphore
-) -> tuple[str, int, int, float]:
-    """Call Anthropic API. Strips system message and passes it via the system param."""
-    async with semaphore:
-        system_content = ""
-        chat_messages = []
-        for m in messages:
-            if m["role"] == "system":
-                system_content = m["content"]
-            else:
-                chat_messages.append(m)
-
-        for attempt in range(MAX_RETRIES):
-            try:
-                t0 = time.time()
-                kwargs: dict = dict(
-                    model=model_str,
-                    messages=chat_messages,
-                    temperature=0,
-                    max_tokens=max_tokens,
-                )
-                if system_content:
-                    kwargs["system"] = system_content
-                resp = await client.messages.create(**kwargs)
-                latency_ms = int((time.time() - t0) * 1000)
-                text = resp.content[0].text if resp.content else ""
-                in_tok = resp.usage.input_tokens
-                out_tok = resp.usage.output_tokens
-                return text, in_tok, out_tok, latency_ms
-            except Exception:
-                if attempt == MAX_RETRIES - 1:
-                    raise
-                await asyncio.sleep(2 ** attempt)
-    return "", 0, 0, 0
-
-
-async def call_gemini(
-    client, model_str: str, messages: list[dict], max_tokens: int, semaphore: asyncio.Semaphore
-) -> tuple[str, int, int, float]:
-    """Call Google Gemini API via the OpenAI-compatible client."""
-    async with semaphore:
-        for attempt in range(MAX_RETRIES):
-            try:
-                t0 = time.time()
-                resp = await client.chat.completions.create(
-                    model=model_str, messages=messages, temperature=0, max_tokens=max_tokens,
-                )
-                latency_ms = int((time.time() - t0) * 1000)
-                text = resp.choices[0].message.content or ""
-                in_tok = resp.usage.prompt_tokens if resp.usage else 0
-                out_tok = resp.usage.completion_tokens if resp.usage else 0
-                return text, in_tok, out_tok, latency_ms
-            except Exception:
-                if attempt == MAX_RETRIES - 1:
-                    raise
-                await asyncio.sleep(2 ** attempt)
-    return "", 0, 0, 0
-
 
 async def run_eval(model_id: str, task_id: str, condition: str, task_cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> None:
     prepared = REPO_ROOT / "data" / "prepared" / task_id
@@ -174,7 +105,7 @@ async def run_eval(model_id: str, task_id: str, condition: str, task_cfg: TaskCo
         click.echo(f"  [dry-run] Would eval {model_id} on {task_id}/{condition} ({len(test_rows)} examples)")
         return
 
-    out_path = REPO_ROOT / "results" / "predictions" / "api" / model_id / task_id / f"{condition}.jsonl"
+    out_path = REPO_ROOT / "results" / "predictions" / "api" / task_id / f"{condition}.jsonl"
     if out_path.exists():
         click.echo(f"  SKIP [{model_id}/{task_id}/{condition}]: already exists")
         return
@@ -191,28 +122,12 @@ async def run_eval(model_id: str, task_id: str, condition: str, task_cfg: TaskCo
         click.echo(f"  All {len(test_rows)} rows complete, finalized to {out_path.relative_to(REPO_ROOT)}")
         return
 
-    if model_id in ANTHROPIC_MODELS:
-        model_str = ANTHROPIC_MODELS[model_id]
-        from anthropic import AsyncAnthropic
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        auth_token = None if api_key else load_claude_auth_token()
-        client = AsyncAnthropic(api_key=api_key, auth_token=auth_token)
-        call_fn = call_anthropic
-    elif model_id in GOOGLE_MODELS:
-        model_str = GOOGLE_MODELS[model_id]
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(
-            api_key=os.environ.get("GOOGLE_API_KEY"),
-            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-        )
-        call_fn = call_gemini
-    else:
-        model_str = OPENAI_MODELS.get(model_id)
-        if not model_str:
-            raise ValueError(f"Model string not set for {model_id}")
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-        call_fn = call_openai
+    model_str = OPENAI_MODELS.get(model_id)
+    if not model_str:
+        raise ValueError(f"Model string not set for {model_id}")
+    from openai import AsyncOpenAI
+    client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    call_fn = call_openai
 
     semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 
@@ -247,16 +162,37 @@ async def run_eval(model_id: str, task_id: str, condition: str, task_cfg: TaskCo
     click.echo(f"  Saved {len(test_rows)} predictions to {out_path.relative_to(REPO_ROOT)}")
 
 
-async def run_sft(task_id: str, task_cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> None:
-    """Upload training data, create GPT-4.1 fine-tuning job, then evaluate."""
+def _find_existing_sft_job(client, model_id: str, task_id: str, smoke_test: bool):
+    """Search OpenAI for a completed or in-progress fine-tuning job matching this run."""
+    active = {"validating_files", "queued", "running"}
+    after = None
+    while True:
+        page = client.fine_tuning.jobs.list(limit=100, after=after).data
+        for job in page:
+            if job.status not in active and job.status != "succeeded":
+                continue
+            meta = job.metadata or {}
+            if (meta.get("model_id") == model_id
+                    and meta.get("task_id") == task_id
+                    and meta.get("smoke_test") == str(smoke_test)):
+                return job
+        if len(page) < 100:
+            break
+        after = page[-1].id
+    return None
+
+
+async def run_sft(model_id: str, task_id: str, task_cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> None:
+    """Upload training data, create fine-tuning job for the given model, then evaluate."""
     prepared = REPO_ROOT / "data" / "prepared" / task_id
-    sft_path = prepared / "openai_sft_500.jsonl"
+    sft_path = prepared / ("smoke_train.jsonl" if smoke_test else "train.jsonl")
+    base_model = SFT_BASE_MODELS[model_id]
 
     if not sft_path.exists():
         raise FileNotFoundError(f"SFT training data not found: {sft_path}")
 
     if dry_run:
-        click.echo(f"  [dry-run] Would upload {sft_path} and create GPT-4.1 fine-tuning job")
+        click.echo(f"  [dry-run] Would upload {sft_path} and create {base_model} fine-tuning job")
         return
 
     import time as _time
@@ -264,24 +200,68 @@ async def run_sft(task_id: str, task_cfg: TaskConfig, dry_run: bool, smoke_test:
 
     client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-    meta_path = REPO_ROOT / "results" / "training" / "gpt-4.1-sft" / task_id / "metadata.json"
+    meta_path = REPO_ROOT / "results" / "training" / model_id / task_id / "metadata.json"
     if meta_path.exists():
         with open(meta_path) as f:
             meta = json.load(f)
         ft_model = meta.get("ft_model_id")
         click.echo(f"  Using cached fine-tuned model: {ft_model}")
     else:
-        click.echo(f"  Uploading training file for {task_id}...")
-        with open(sft_path, "rb") as f:
-            file_obj = client.files.create(file=f, purpose="fine-tune")
+        # Check OpenAI for an existing completed or in-progress job before creating a new one
+        job = _find_existing_sft_job(client, model_id, task_id, smoke_test)
+        if job and job.status == "succeeded":
+            ft_model = job.fine_tuned_model
+            click.echo(f"  Found completed job {job.id} on OpenAI → {ft_model}")
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(meta_path, "w") as f:
+                json.dump({"ft_model_id": ft_model, "job_id": job.id, "trained_tokens": job.trained_tokens or 0}, f)
+            OPENAI_MODELS[model_id] = ft_model
+            await run_eval(model_id, task_id, "api-sft-500", task_cfg, dry_run, smoke_test)
+            return
+        elif job:
+            click.echo(f"  Found in-progress job {job.id} (status={job.status}), attaching...")
+        else:
+            click.echo(f"  Uploading training file for {task_id}...")
+            with open(sft_path, "rb") as f:
+                train_file_obj = client.files.create(file=f, purpose="fine-tune")
 
-        job = client.fine_tuning.jobs.create(training_file=file_obj.id, model="gpt-4.1")
-        click.echo(f"  Fine-tuning job created: {job.id}. Waiting for completion...")
+            n_epochs = 1 if smoke_test else 3
+            batch_size = 1 if smoke_test else 8
+            job = client.fine_tuning.jobs.create(
+                training_file=train_file_obj.id,
+                model=base_model,
+                suffix=(f"bw-{task_id}-sm" if smoke_test else f"bw-{task_id}")[:_SFT_SUFFIX_MAX_LEN],
+                metadata={
+                    "model_id": model_id,
+                    "task_id": task_id,
+                    "base_model": base_model,
+                    "n_epochs": str(n_epochs),
+                    "smoke_test": str(smoke_test),
+                },
+                hyperparameters={
+                    "n_epochs": n_epochs,
+                    "batch_size": batch_size,
+                    "learning_rate_multiplier": "auto",
+                },
+            )
+            click.echo(f"  Fine-tuning job created: {job.id} (epochs={n_epochs}). Waiting for completion...")
 
+        seen_event_ids: set[str] = set()
+        job_start = last_event_time = _time.time()
         while job.status not in ("succeeded", "failed", "cancelled"):
-            _time.sleep(60)
+            _time.sleep(15)
             job = client.fine_tuning.jobs.retrieve(job.id)
-            click.echo(f"  Status: {job.status}")
+            events = client.fine_tuning.jobs.list_events(job.id, limit=10)
+            new_events = [e for e in reversed(events.data) if e.id not in seen_event_ids]
+            for event in new_events:
+                seen_event_ids.add(event.id)
+                elapsed = int(_time.time() - job_start)
+                click.echo(f"  [{job.status}] {event.message} (+{elapsed}s)")
+                last_event_time = _time.time()
+            if not new_events:
+                since_last = int(_time.time() - last_event_time)
+                total = int(_time.time() - job_start)
+                click.echo(f"  [{job.status}] waiting... ({since_last}s since last event, {total}s total)")
 
         if job.status != "succeeded":
             raise RuntimeError(f"Fine-tuning job failed: {job.status}")
@@ -290,7 +270,7 @@ async def run_sft(task_id: str, task_cfg: TaskConfig, dry_run: bool, smoke_test:
         trained_tokens = job.trained_tokens or 0
         with open(REPO_ROOT / "configs" / "pricing.yaml") as f:
             pricing = yaml.safe_load(f)
-        training_per_m = pricing.get("apis", {}).get("gpt-4.1-sft", {}).get("training_per_m", 25.0)
+        training_per_m = pricing.get("apis", {}).get(model_id, {}).get("training_per_m", 25.0)
         training_cost = trained_tokens * training_per_m / 1_000_000
 
         meta_path.parent.mkdir(parents=True, exist_ok=True)
@@ -301,8 +281,8 @@ async def run_sft(task_id: str, task_cfg: TaskConfig, dry_run: bool, smoke_test:
             }, f)
         click.echo(f"  Fine-tuned model: {ft_model}, cost: ${training_cost:.3f}")
 
-    OPENAI_MODELS["gpt-4.1-sft"] = ft_model
-    await run_eval("gpt-4.1-sft", task_id, "api-sft-500", task_cfg, dry_run, smoke_test)
+    OPENAI_MODELS[model_id] = ft_model
+    await run_eval(model_id, task_id, "api-sft-500", task_cfg, dry_run, smoke_test)
 
 
 @click.command()
@@ -312,22 +292,13 @@ async def run_sft(task_id: str, task_cfg: TaskConfig, dry_run: bool, smoke_test:
 @click.option("--dry-run", is_flag=True)
 @click.option("--smoke-test", is_flag=True)
 def main(model: str, task: str, condition: str, dry_run: bool, smoke_test: bool) -> None:
-    """Evaluate frontier API models (OpenAI, Anthropic, Google) on benchmark tasks."""
-    model_ids = ALL_API_MODELS if model == "all" else [model]
+    """Evaluate frontier OpenAI models on benchmark tasks."""
+    default_models = SMOKE_MODELS if smoke_test else PROD_MODELS
+    model_ids = default_models if model == "all" else [model]
 
-    if not dry_run:
-        needs_openai = any(m in OPENAI_MODELS for m in model_ids)
-        needs_anthropic = any(m in ANTHROPIC_MODELS for m in model_ids)
-        needs_google = any(m in GOOGLE_MODELS for m in model_ids)
-        if needs_openai and not os.environ.get("OPENAI_API_KEY"):
+    if not dry_run and any(m in OPENAI_MODELS for m in model_ids):
+        if not os.environ.get("OPENAI_API_KEY"):
             click.echo("  WARNING: OPENAI_API_KEY not set", err=True)
-        if needs_anthropic and not os.environ.get("ANTHROPIC_API_KEY"):
-            if load_claude_auth_token():
-                click.echo("  INFO: ANTHROPIC_API_KEY not set, falling back to Claude Code auth token")
-            else:
-                click.echo("  WARNING: ANTHROPIC_API_KEY not set and no Claude Code credentials found", err=True)
-        if needs_google and not os.environ.get("GOOGLE_API_KEY"):
-            click.echo("  WARNING: GOOGLE_API_KEY not set", err=True)
     task_ids = ALL_TASKS if task == "all" else [task]
     failures = []
 
@@ -336,10 +307,10 @@ def main(model: str, task: str, condition: str, dry_run: bool, smoke_test: bool)
             for tid in task_ids:
                 try:
                     task_cfg = load_task_config(tid)
-                    if mid == "gpt-4.1-sft":
-                        await run_sft(tid, task_cfg, dry_run, smoke_test)
+                    if mid in SFT_BASE_MODELS:
+                        await run_sft(mid, tid, task_cfg, dry_run, smoke_test)
                     else:
-                        supported = MODEL_CONDITIONS.get(mid, ["zero-shot", "5-shot"])
+                        supported = MODEL_CONDITIONS.get(mid, [])
                         conditions_to_run = (
                             supported if condition == "all"
                             else [condition] if condition in supported

@@ -49,7 +49,7 @@ from checkpoint_utils import (
 from utils import write_jsonl
 
 REPO_ROOT = Path(__file__).parent.parent
-ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa", "mbpp"]
+ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa"]
 ALL_MODELS = ["qwen3-8b"]
 GPU_HOURLY = 0.49  # Default GPU hourly rate — override via pricing.yaml
 CONDITION = "lora"
