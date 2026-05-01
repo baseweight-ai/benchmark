@@ -84,7 +84,6 @@ class TaskConfig(BaseModel):
     task_id: str
     training_cap: Optional[int] = None
     max_seq_length: Optional[int] = None  # overrides model max_seq_length when set
-    efficiency_curve_sizes: list[int] = Field(default_factory=list)
 
 
 def load_model_config(model_id: str) -> ModelConfig:
@@ -418,8 +417,8 @@ def train_one(
     n_train = count_jsonl(data_path)
     hw_cfg = ConfigFactory.build(model_cfg, task_cfg, smoke_test)
 
-    adapter_dir = REPO_ROOT / "results" / "adapters" / model_cfg.model_short / task_id / CONDITION
-    log_dir = REPO_ROOT / "results" / "training" / model_cfg.model_short / task_id / CONDITION
+    adapter_dir = REPO_ROOT / "results" / "adapters" / "local" / model_cfg.model_short / task_id / CONDITION
+    log_dir = REPO_ROOT / "results" / "training" / "local" / model_cfg.model_short / task_id / CONDITION
     ckpt_dir = checkpoint_dir(model_cfg.model_short, task_id, CONDITION)
     adapter_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -492,7 +491,7 @@ def _upload_adapter(model_short: str, task_id: str, condition: str) -> None:
 
 
 @click.command()
-@click.option("--model", default=None, help="Model config ID or 'all'. Defaults to 'tiny' with --smoke-test, 'qwen3-8b' otherwise.")
+@click.option("--model", default=None, help="Model config ID or 'all'. Defaults to 'qwen2.5-0.5b' with --smoke-test, 'qwen3-8b' otherwise.")
 @click.option("--task", default="all", help="Task ID or 'all'")
 @click.option("--cap", default=None, type=int, help="Cap training data to N rows (writes train_capN.jsonl for reproducibility)")
 @click.option("--auto-upload", is_flag=True, help="Upload adapter to HuggingFace after each run (persistence)")
@@ -505,7 +504,7 @@ def main(model: Optional[str], task: str, cap: Optional[int], auto_upload: bool,
         click.echo("Smoke-test mode: CPU only, 4 threads, seq_len=256, r=4.")
 
     if model is None:
-        model = "tiny" if smoke_test else "qwen3-8b"
+        model = "qwen2.5-0.5b" if smoke_test else "qwen3-8b"
 
     model_ids = ALL_MODELS if model == "all" else [model]
     task_ids = ALL_TASKS if task == "all" else [task]

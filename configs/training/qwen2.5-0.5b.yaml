@@ -1,5 +1,5 @@
 model_id: Qwen/Qwen2.5-0.5B-Instruct
-model_short: tiny
+model_short: qwen2.5-0.5b
 max_seq_length: 256
 load_in_4bit: false
 dtype: float32

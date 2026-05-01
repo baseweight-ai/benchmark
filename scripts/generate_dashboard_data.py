@@ -13,38 +13,61 @@ from pydantic import BaseModel
 REPO_ROOT = Path(__file__).parent.parent
 ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa"]
 
-# Model display names and families
-MODEL_META = {
-    # open-source (QLoRA fine-tuned)
-    "qwen3-8b":         {"display_name": "Qwen3-8B (LoRA)",         "family": "open-source"},
-    "gemma3-4b":        {"display_name": "Gemma 3 4B (LoRA)",       "family": "open-source"},
-    "phi4-mini":        {"display_name": "Phi-4 Mini (LoRA)",        "family": "open-source"},
-    # OpenAI frontier
-    "gpt-5.4":          {"display_name": "GPT-5.4",                  "family": "frontier"},
-    "gpt-4.1":          {"display_name": "GPT-4.1",                  "family": "frontier"},
-    "gpt-4.1-mini":     {"display_name": "GPT-4.1 Mini",             "family": "frontier"},
-    "gpt-4.1-nano":     {"display_name": "GPT-4.1 Nano",             "family": "frontier"},
-    # Anthropic frontier
-    "claude-sonnet-4":  {"display_name": "Claude Sonnet 4",          "family": "frontier"},
-    # Google frontier
-    "gemini-2.5-flash": {"display_name": "Gemini 2.5 Flash",         "family": "frontier"},
-    # API fine-tuned
-    "gpt-4.1-sft":      {"display_name": "GPT-4.1 (SFT-500)",       "family": "api-finetuned"},
+# Known API vendor prefixes → canonical capitalisation.
+_VENDOR_CAPS: dict[str, str] = {
+    "gpt": "GPT",
+    "claude": "Claude",
+    "gemini": "Gemini",
+    "o1": "O1",
+    "o3": "O3",
 }
 
-# Conditions per model
-MODEL_CONDITIONS = {
-    "qwen3-8b":         ["lora-500", "lora-full"],
-    "gemma3-4b":        ["lora-500", "lora-full"],
-    "phi4-mini":        ["lora-500", "lora-full"],
-    "gpt-5.4":          ["zero-shot", "5-shot"],
-    "gpt-4.1":          ["zero-shot", "5-shot"],
-    "gpt-4.1-mini":     ["zero-shot", "5-shot"],
-    "gpt-4.1-nano":     ["zero-shot", "5-shot"],
-    "claude-sonnet-4":  ["zero-shot", "5-shot"],
-    "gemini-2.5-flash": ["zero-shot", "5-shot"],
-    "gpt-4.1-sft":      ["api-sft-500"],
+# Suffixes to strip from HF base model names (case-insensitive).
+_INSTRUCT_SUFFIXES = ("-instruct", "-it", "-chat", "-hf")
+
+# Condition display names (filesystem names → dashboard labels).
+_CONDITION_LABELS: dict[str, str] = {
+    "zero-shot": "Zero-shot",
+    "5-shot": "5-shot",
+    "lora": "LoRA",
+    "api-sft": "API SFT",
 }
+
+
+def _condition_label(condition: str) -> str:
+    return _CONDITION_LABELS.get(condition, condition)
+
+
+def _format_api_display_name(model_id: str) -> str:
+    """'gpt-4.1-nano' → 'GPT 4.1 Nano'."""
+    parts = model_id.split("-")
+    out = []
+    for p in parts:
+        out.append(_VENDOR_CAPS.get(p.lower(), p.capitalize()))
+    return " ".join(out)
+
+
+def _strip_instruct_suffix(name: str) -> str:
+    lower = name.lower()
+    for sfx in _INSTRUCT_SUFFIXES:
+        if lower.endswith(sfx):
+            return name[: -len(sfx)]
+    return name
+
+
+def _get_model_meta(model_id: str) -> dict:
+    """Return {"display_name": ..., "family": ...} for any model_id."""
+    config_path = REPO_ROOT / "configs" / "training" / f"{model_id}.yaml"
+    if config_path.exists():
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f)
+        hf_id = cfg.get("model_id", model_id)
+        # Strip org prefix ("Qwen/Qwen3-8B" → "Qwen3-8B")
+        short = hf_id.split("/")[-1]
+        display = _strip_instruct_suffix(short)
+        display = display[:1].upper() + display[1:] if display else display
+        return {"display_name": display, "family": "open-source"}
+    return {"display_name": _format_api_display_name(model_id), "family": "frontier"}
 
 # GPU cost for self-hosted models (loaded from pricing.yaml)
 GPU_HOURLY = 0.49  # Default GPU hourly rate — override via pricing.yaml
@@ -63,32 +86,65 @@ def load_pricing() -> PricingConfig:
     return PricingConfig(**data)
 
 
+def _api_cost_per_token(model_id: str) -> tuple[float, float]:
+    """Return (input_$/token, output_$/token) via litellm for any API model.
+
+    For fine-tuned models (ft:BASE:ORG::HASH), falls back to the versioned
+    base model then the unversioned base model since OpenAI charges the same
+    inference rate as the base.
+    """
+    import re
+    import litellm
+
+    candidates = [model_id]
+    if model_id.startswith("ft:"):
+        base_versioned = model_id.split(":")[1]
+        candidates.append(base_versioned)
+        base = re.sub(r"-\d{4}-\d{2}-\d{2}$", "", base_versioned)
+        if base != base_versioned:
+            candidates.append(base)
+
+    for candidate in candidates:
+        try:
+            info = litellm.get_model_info(candidate)
+            in_cost = info.get("input_cost_per_token") or 0.0
+            out_cost = info.get("output_cost_per_token") or 0.0
+            if in_cost or out_cost:
+                return in_cost, out_cost
+        except Exception:
+            continue
+    return 0.0, 0.0
+
+
 def compute_cost_per_query(
     model_id: str,
     total_input_tokens: int,
     total_output_tokens: int,
     n_predictions: int,
     pricing: PricingConfig,
+    eval_wall_time_s: Optional[float] = None,
 ) -> Optional[float]:
     """Cost per query in USD."""
     if n_predictions == 0:
         return None
 
-    # Self-hosted models
-    meta = MODEL_META.get(model_id, {})
+    meta = _get_model_meta(model_id)
     if meta.get("family") == "open-source":
-        cost_per_hour = pricing.self_hosted.get("gpu_hourly_rate", GPU_HOURLY)
+        gpu_hourly = pricing.self_hosted.get("gpu_hourly_rate", GPU_HOURLY)
+        if eval_wall_time_s:
+            # Actual throughput from the eval run: total wall time / queries.
+            # Captures real concurrency and batching behaviour of vLLM.
+            return gpu_hourly * eval_wall_time_s / n_predictions / 3600
         qph = pricing.self_hosted.get("queries_per_hour_per_gpu", QUERIES_PER_HOUR)
-        return cost_per_hour / qph
+        return gpu_hourly / qph
 
-    # API models
-    model_pricing = pricing.apis.get(model_id)
-    if not model_pricing:
+    # API models: token usage × live prices from litellm.
+    avg_input = total_input_tokens / n_predictions
+    avg_output = total_output_tokens / n_predictions
+    in_per_tok, out_per_tok = _api_cost_per_token(model_id)
+    if not in_per_tok and not out_per_tok:
         return None
-
-    input_cost = (total_input_tokens / n_predictions / 1_000_000) * model_pricing.get("input_per_m", 0)
-    output_cost = (total_output_tokens / n_predictions / 1_000_000) * model_pricing.get("output_per_m", 0)
-    return input_cost + output_cost
+    return avg_input * in_per_tok + avg_output * out_per_tok
 
 
 def compute_tco_12mo(
@@ -97,45 +153,60 @@ def compute_tco_12mo(
     cost_per_query: float,
     daily_volume: int,
     pricing: PricingConfig,
+    eval_wall_time_s: Optional[float] = None,
+    n_predictions: Optional[int] = None,
 ) -> Optional[float]:
     """12-month TCO: training + inference + (for self-hosted) GPU reservation."""
     if cost_per_query is None:
         return None
 
-    meta = MODEL_META.get(model_id, {})
+    meta = _get_model_meta(model_id)
     annual_queries = daily_volume * 365
     inference_cost = cost_per_query * annual_queries
 
     if meta.get("family") == "open-source":
-        # GPU reservation cost
-        qph = pricing.self_hosted.get("queries_per_hour_per_gpu", QUERIES_PER_HOUR)
         gpu_hourly = pricing.self_hosted.get("gpu_hourly_rate", GPU_HOURLY)
+        if eval_wall_time_s and n_predictions:
+            qph = n_predictions / (eval_wall_time_s / 3600)
+        else:
+            qph = pricing.self_hosted.get("queries_per_hour_per_gpu", QUERIES_PER_HOUR)
         gpus_needed = math.ceil(daily_volume / (qph * 24))
         gpu_annual = gpus_needed * gpu_hourly * 24 * 365
-        return training_cost + gpu_annual
+        return (training_cost or 0.0) + gpu_annual
     else:
-        return training_cost + inference_cost
+        return (training_cost or 0.0) + inference_cost
 
 
-def load_summary(model_short: str, task_id: str, condition: str) -> Optional[dict]:
-    for source in ("local", "api"):
-        path = REPO_ROOT / "results" / "summaries" / source / model_short / task_id / f"{condition}.json"
-        if path.exists():
-            with open(path) as f:
-                return json.load(f)
-    return None
-
-
-def load_training_meta(model_short: str, task_id: str, condition: str) -> Optional[dict]:
-    path = REPO_ROOT / "results" / "training" / model_short / task_id / condition / "metadata.json"
+def load_summary(source: str, model_short: str, task_id: str, condition: str) -> Optional[dict]:
+    path = REPO_ROOT / "results" / "summaries" / source / model_short / task_id / f"{condition}.json"
     if not path.exists():
         return None
     with open(path) as f:
         return json.load(f)
 
 
-def load_sft_training_meta(task_id: str) -> Optional[dict]:
-    path = REPO_ROOT / "results" / "training" / "gpt-4.1-sft" / task_id / "metadata.json"
+def discover_summaries() -> list[tuple[str, str, str, str]]:
+    """Return (source, model, task, condition) for every summary file found."""
+    summaries_root = REPO_ROOT / "results" / "summaries"
+    found = []
+    if not summaries_root.exists():
+        return found
+    for source_dir in sorted(summaries_root.iterdir()):
+        if not source_dir.is_dir():
+            continue
+        for model_dir in sorted(source_dir.iterdir()):
+            if not model_dir.is_dir():
+                continue
+            for task_dir in sorted(model_dir.iterdir()):
+                if not task_dir.is_dir():
+                    continue
+                for f in sorted(task_dir.glob("*.json")):
+                    found.append((source_dir.name, model_dir.name, task_dir.name, f.stem))
+    return found
+
+
+def load_training_meta(source: str, model_short: str, task_id: str, condition: str) -> Optional[dict]:
+    path = REPO_ROOT / "results" / "training" / source / model_short / task_id / condition / "metadata.json"
     if not path.exists():
         return None
     with open(path) as f:
@@ -152,136 +223,195 @@ def build_result(
     daily_volume: int = 10000,
 ) -> dict:
     """Build a single Result object for the dashboard schema."""
-    meta = MODEL_META.get(model_id, {"display_name": model_id, "family": "frontier"})
+    meta = _get_model_meta(model_id)
 
     metric_value = summary["metric_value"] if summary else None
     n_predictions = summary["n_predictions"] if summary else None
     total_input = summary.get("total_input_tokens", 0) if summary else 0
     total_output = summary.get("total_output_tokens", 0) if summary else 0
+    avg_latency_ms = summary.get("avg_latency_ms") if summary else None
+    eval_wall_time_s = summary.get("eval_wall_time_s") if summary else None
     ttft_p50 = summary.get("ttft_p50_ms") if summary else None
     ttft_p95 = summary.get("ttft_p95_ms") if summary else None
     error_counts = summary.get("error_counts", {}) if summary else {}
 
-    training_cost = training_meta.get("training_cost", 0.0) if training_meta else 0.0
+    training_cost = training_meta.get("training_cost") if training_meta else None
     training_time_min = training_meta.get("training_time_min") if training_meta else None
     n_train = training_meta.get("n_train") if training_meta else None
 
+    # Decomposed cost inputs — stored so the site can recalculate or display assumptions.
+    n = n_predictions or 1
+    avg_input_tokens = round(total_input / n, 1) if summary else None
+    avg_output_tokens = round(total_output / n, 1) if summary else None
+    gpu_hourly_rate = pricing.self_hosted.get("gpu_hourly_rate", GPU_HOURLY) if meta["family"] == "open-source" else None
+    in_per_tok, out_per_tok = (_api_cost_per_token(model_id) if meta["family"] == "frontier" and summary else (None, None))
+
     cost_per_query = compute_cost_per_query(
-        model_id, total_input, total_output, n_predictions or 1, pricing
+        model_id, total_input, total_output, n, pricing, eval_wall_time_s
     ) if summary else None
 
     cost_per_1k_correct: Optional[float] = None
     if cost_per_query is not None and metric_value and metric_value > 0:
         cost_per_1k_correct = (cost_per_query * 1000) / metric_value
 
-    tco_12mo = compute_tco_12mo(model_id, training_cost, cost_per_query or 0, daily_volume, pricing) if cost_per_query is not None else None
+    tco_12mo = compute_tco_12mo(model_id, training_cost, cost_per_query or 0, daily_volume, pricing, eval_wall_time_s, n_predictions) if cost_per_query is not None else None
 
     return {
+        # Identity
         "model_id": model_id,
         "display_name": meta["display_name"],
         "family": meta["family"],
         "task_id": task_id,
-        "condition": condition,
+        "condition": _condition_label(condition),
+        # Accuracy
         "metric_id": summary["metric_id"] if summary else None,
         "metric_value": metric_value,
+        "n_predictions": n_predictions,
+        # Cost (derived)
         "cost_per_query": round(cost_per_query, 8) if cost_per_query is not None else None,
         "cost_per_1k_correct": round(cost_per_1k_correct, 4) if cost_per_1k_correct is not None else None,
+        "tco_12mo": round(tco_12mo, 2) if tco_12mo is not None else None,
+        # Latency
+        "avg_latency_ms": round(avg_latency_ms, 1) if avg_latency_ms is not None else None,
         "ttft_p50_ms": ttft_p50,
         "ttft_p95_ms": ttft_p95,
-        "training_cost": round(training_cost, 4) if training_cost else None,
+        # Training
+        "training_cost": round(training_cost, 4) if training_cost is not None else None,
         "training_time_min": training_time_min,
         "n_train": n_train,
-        "tco_12mo": round(tco_12mo, 2) if tco_12mo is not None else None,
+        # Error breakdown
         "error_counts": error_counts,
+        # Cost inputs (decomposed for transparency / recalculation)
+        "total_input_tokens": total_input if summary else None,
+        "total_output_tokens": total_output if summary else None,
+        "avg_input_tokens": avg_input_tokens,
+        "avg_output_tokens": avg_output_tokens,
+        "input_cost_per_token": in_per_tok if in_per_tok else None,
+        "output_cost_per_token": out_per_tok if out_per_tok else None,
+        "gpu_hourly_rate": gpu_hourly_rate,
+        "eval_wall_time_s": eval_wall_time_s,
     }
 
 
-def build_efficiency_points(task_id: str) -> list[dict]:
-    """Build efficiency curve data for qwen3-8b (all efficiency sizes)."""
-    points = []
-    task_path = REPO_ROOT / "configs" / "tasks" / f"{task_id}.yaml"
-    with open(task_path) as f:
-        task_data = yaml.safe_load(f)
-    sizes = task_data.get("efficiency_curve_sizes", [])
 
-    for n in sizes:
-        cond = f"lora-{n}"
-        summary = load_summary("qwen3-8b", task_id, cond)
-        training_meta = load_training_meta("qwen3-8b", task_id, cond)
-        n_train_actual = training_meta.get("n_train", n) if training_meta else n
-        metric_value = summary["metric_value"] if summary else None
-        training_cost = training_meta.get("training_cost", 0.0) if training_meta else 0.0
-        points.append({
-            "n_train": n_train_actual,
-            "condition": cond,
-            "metric_value": metric_value,
-            "training_cost": round(training_cost, 4),
-        })
-
-    return points
-
-
-def compute_stats(results: list[dict]) -> tuple[dict, int, float]:
-    """Compute headline_stats, tasks_won_by_oss, and total_cost from a results list."""
-    best_oss_per_task: dict[str, float] = {}
-    best_frontier_per_task: dict[str, float] = {}
-
-    best_oss: Optional[dict] = None
-    best_frontier: Optional[dict] = None
-    best_sft: Optional[dict] = None
-
-    seen_training: set[tuple] = set()
-    total_cost = 0.0
+def _comparison(results: list[dict], fine_family: str, fine_cond: str, base_family: str, base_cond: str) -> dict:
+    """Compute tasks_won, cost_per_correct_ratio, accuracy gain for one comparison pair."""
+    best_fine: dict[str, float] = {}
+    best_base: dict[str, float] = {}
+    fine_cp1k: dict[str, list[float]] = {}
+    base_cp1k: dict[str, list[float]] = {}
 
     for r in results:
-        key = (r["model_id"], r["condition"])
-        if key not in seen_training:
-            seen_training.add(key)
-            total_cost += r["training_cost"] or 0
-
         if r["metric_value"] is None:
             continue
-        mv = r["metric_value"]
         tid = r["task_id"]
-        if r["family"] == "open-source" and r["condition"] == "lora-500":
-            if best_oss is None or mv > best_oss["metric_value"]:
-                best_oss = r
-            if mv > best_oss_per_task.get(tid, -1):
-                best_oss_per_task[tid] = mv
-        if r["family"] == "frontier" and r["condition"] == "5-shot":
-            if best_frontier is None or mv > best_frontier["metric_value"]:
-                best_frontier = r
-            if mv > best_frontier_per_task.get(tid, -1):
-                best_frontier_per_task[tid] = mv
-        if r["family"] == "api-finetuned":
-            if best_sft is None or mv > best_sft["metric_value"]:
-                best_sft = r
+        mv = r["metric_value"]
+        if r["family"] == fine_family and r["condition"] == fine_cond:
+            if mv > best_fine.get(tid, -1):
+                best_fine[tid] = mv
+            if r["cost_per_1k_correct"] is not None:
+                fine_cp1k.setdefault(tid, []).append(r["cost_per_1k_correct"])
+        if r["family"] == base_family and r["condition"] == base_cond:
+            if mv > best_base.get(tid, -1):
+                best_base[tid] = mv
+            if r["cost_per_1k_correct"] is not None:
+                base_cp1k.setdefault(tid, []).append(r["cost_per_1k_correct"])
 
-    tasks_won = sum(
-        1 for tid in best_oss_per_task
-        if best_oss_per_task[tid] > best_frontier_per_task.get(tid, -1)
-    )
+    shared_tasks = sorted(set(best_fine) & set(best_base))
+    tasks_won = sum(1 for t in shared_tasks if best_fine[t] > best_base[t])
 
-    headline_stats = {
-        "best_oss_lora500_vs_frontier": {
-            "oss_model": best_oss["display_name"] if best_oss else None,
-            "oss_metric": best_oss["metric_value"] if best_oss else None,
-            "frontier_model": best_frontier["display_name"] if best_frontier else None,
-            "frontier_metric": best_frontier["metric_value"] if best_frontier else None,
-            "delta": round(best_oss["metric_value"] - best_frontier["metric_value"], 4) if best_oss and best_frontier else None,
-        },
-        "oss_cost_reduction": {
-            "oss_cost_per_query": best_oss["cost_per_query"] if best_oss else None,
-            "frontier_cost_per_query": best_frontier["cost_per_query"] if best_frontier else None,
-            "reduction_factor": round((best_frontier["cost_per_query"] or 1) / (best_oss["cost_per_query"] or 1), 1) if best_oss and best_frontier and best_oss["cost_per_query"] else None,
-        },
-        "sft_vs_base": {
-            "sft_model": best_sft["display_name"] if best_sft else None,
-            "sft_metric": best_sft["metric_value"] if best_sft else None,
+    cp1k_ratios = []
+    for tid in set(fine_cp1k) & set(base_cp1k):
+        fine_avg = sum(fine_cp1k[tid]) / len(fine_cp1k[tid])
+        base_avg = sum(base_cp1k[tid]) / len(base_cp1k[tid])
+        if fine_avg > 0:
+            cp1k_ratios.append(base_avg / fine_avg)
+
+    acc_deltas = [best_fine[t] - best_base[t] for t in shared_tasks]
+
+    def _mean(xs): return sum(xs) / len(xs) if xs else None
+    def _median(xs):
+        if not xs: return None
+        s = sorted(xs)
+        m = len(s) // 2
+        return s[m] if len(s) % 2 else (s[m - 1] + s[m]) / 2
+
+    return {
+        "tasks_won": tasks_won,
+        "tasks_total": len(shared_tasks),
+        "cost_per_correct_ratio": round(_mean(cp1k_ratios), 1) if cp1k_ratios else None,
+        "avg_accuracy_gain_pp": round(_mean(acc_deltas) * 100, 1) if acc_deltas else None,
+        "median_accuracy_gain_pp": round(_median(acc_deltas) * 100, 1) if acc_deltas else None,
+        "per_task": {
+            t: {
+                "fine_metric": round(best_fine[t], 4),
+                "base_metric": round(best_base[t], 4),
+                "accuracy_gain_pp": round((best_fine[t] - best_base[t]) * 100, 1),
+            }
+            for t in shared_tasks
         },
     }
 
-    return headline_stats, tasks_won, round(total_cost, 2)
+
+def compute_stats(results: list[dict]) -> dict:
+    """Compute all headline stats and comparison breakdowns."""
+    # Scope
+    task_ids = sorted({r["task_id"] for r in results})
+    model_ids = sorted({r["model_id"] for r in results})
+    conditions = sorted({r["condition"] for r in results})
+
+    # Cost summary
+    training_costs = [r["training_cost"] for r in results if r.get("training_cost") is not None]
+    training_times = [r["training_time_min"] for r in results if r.get("training_time_min") is not None]
+    n_trains = [r["n_train"] for r in results if r.get("n_train") is not None]
+
+    # All four comparison pairs
+    lora_vs_5shot      = _comparison(results, "open-source", "LoRA",    "frontier", "5-shot")
+    lora_vs_zero_shot  = _comparison(results, "open-source", "LoRA",    "frontier", "Zero-shot")
+    api_sft_vs_5shot   = _comparison(results, "frontier",    "API SFT", "frontier", "5-shot")
+    api_sft_vs_zero    = _comparison(results, "frontier",    "API SFT", "frontier", "Zero-shot")
+
+    # Average cost_per_query by condition (across all tasks/models with data)
+    cpq_by_cond: dict[str, list[float]] = {}
+    for r in results:
+        if r.get("cost_per_query") is not None:
+            cpq_by_cond.setdefault(r["condition"], []).append(r["cost_per_query"])
+    avg_cost_per_query_by_condition = {
+        cond: round(sum(v) / len(v), 8) for cond, v in cpq_by_cond.items()
+    }
+
+    headline = lora_vs_5shot  # the primary comparison
+
+    return {
+        # Headline stats (flat, for dashboard backward-compat)
+        "tasks_won_by_oss": headline["tasks_won"],
+        "cost_per_correct_ratio": headline["cost_per_correct_ratio"],
+        "avg_accuracy_gain_pp": headline["avg_accuracy_gain_pp"],
+        # Scope
+        "scope": {
+            "n_tasks": len(task_ids),
+            "n_models": len(model_ids),
+            "n_conditions": len(conditions),
+            "task_ids": task_ids,
+            "model_ids": model_ids,
+            "conditions": conditions,
+        },
+        # All comparisons
+        "comparisons": {
+            "lora_vs_5shot": lora_vs_5shot,
+            "lora_vs_zero_shot": lora_vs_zero_shot,
+            "api_sft_vs_5shot": api_sft_vs_5shot,
+            "api_sft_vs_zero_shot": api_sft_vs_zero,
+        },
+        # Cost summary
+        "cost_summary": {
+            "total_training_cost": round(sum(training_costs), 4) if training_costs else None,
+            "avg_training_cost": round(sum(training_costs) / len(training_costs), 4) if training_costs else None,
+            "avg_training_time_min": round(sum(training_times) / len(training_times), 1) if training_times else None,
+            "avg_n_train": round(sum(n_trains) / len(n_trains)) if n_trains else None,
+            "avg_cost_per_query_by_condition": avg_cost_per_query_by_condition,
+        },
+    }
 
 
 def merge_results(fresh: list[dict], existing_path: Path) -> list[dict]:
@@ -316,35 +446,20 @@ def build_dashboard_data(daily_volume: int = 10000) -> dict:
     pricing = load_pricing()
 
     results = []
-    efficiency_data: dict[str, list] = {}
+    for source, model_id, task_id, condition in discover_summaries():
+        summary = load_summary(source, model_id, task_id, condition)
+        training_meta = None
+        if condition in ("lora", "api-sft"):
+            training_meta = load_training_meta(source, model_id, task_id, condition)
+        result = build_result(model_id, task_id, condition, summary, training_meta, pricing, daily_volume)
+        results.append(result)
 
-    for task_id in ALL_TASKS:
-        for model_id, conditions in MODEL_CONDITIONS.items():
-            for condition in conditions:
-                training_meta = None
-                if condition.startswith("lora-"):
-                    training_meta = load_training_meta(model_id, task_id, condition)
-                elif condition == "api-sft-500":
-                    training_meta = load_sft_training_meta(task_id)
-                summary = load_summary(model_id, task_id, condition)
-                result = build_result(model_id, task_id, condition, summary, training_meta, pricing, daily_volume)
-                results.append(result)
-
-        try:
-            efficiency_data[task_id] = build_efficiency_points(task_id)
-        except Exception:
-            efficiency_data[task_id] = []
-
-    headline_stats, tasks_won_by_oss, total_cost = compute_stats(results)
+    stats = compute_stats(results)
 
     return {
         "generated_at": None,  # filled at write time
-        "daily_volume_assumption": daily_volume,
-        "total_cost": total_cost,
-        "tasks_won_by_oss": tasks_won_by_oss,
-        "headline_stats": headline_stats,
+        **stats,
         "results": results,
-        "efficiency_data": efficiency_data,
     }
 
 
@@ -371,11 +486,8 @@ def main(daily_volume: int, out: Optional[str], also_benchmark_repo: bool, merge
         n_preserved = sum(1 for r in merged if fresh_map.get((r["model_id"], r["task_id"], r["condition"])) is not r)
         if n_preserved:
             click.echo(f"  Merge: preserved {n_preserved} existing result(s) with no new data")
-        headline_stats, tasks_won_by_oss, total_cost = compute_stats(merged)
         data["results"] = merged
-        data["headline_stats"] = headline_stats
-        data["tasks_won_by_oss"] = tasks_won_by_oss
-        data["total_cost"] = total_cost
+        data.update(compute_stats(merged))
 
     data["generated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -389,6 +501,12 @@ def main(daily_volume: int, out: Optional[str], also_benchmark_repo: bool, merge
     with open(out_path, "w") as f:
         json.dump(data, f, indent=2)
     click.echo(f"  Written to {out_path}")
+
+    # Always attempt to write to the site repo; skip silently if it doesn't exist.
+    if out_path != default_out and default_out.parent.exists():
+        with open(default_out, "w") as f:
+            json.dump(data, f, indent=2)
+        click.echo(f"  Also written to {default_out}")
 
     if also_benchmark_repo:
         repo_out = REPO_ROOT / "dashboard-data" / "results.json"

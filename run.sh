@@ -11,6 +11,7 @@
 #   --train          Run train.py
 #   --eval-local     Run eval_local.py  (vLLM, fine-tuned models)
 #   --eval-api       Run eval_api.py    (frontier API models)
+#   --classify       Run classify_errors.py (error classification + summaries)
 #   --upload         Run upload_artifacts.py
 #   --dashboard      Run generate_dashboard_data.py
 #   --all            All of the above
@@ -18,7 +19,7 @@
 # Options:
 #   --smoke-test     Tiny datasets/model; exercises the same code paths as prod
 #   --task TASK      Task ID or 'all' (default: all)
-#   --model MODEL    Model ID or 'all' (default: qwen3-8b; tiny with --smoke-test)
+#   --model MODEL    Model ID or 'all' (default: qwen3-8b; qwen2.5-0.5b with --smoke-test)
 #   --clean          Delete prior outputs for selected steps/model/task, then run
 #   --dry-run        Pass --dry-run to all supporting scripts
 #   -h, --help       Show this message
@@ -39,6 +40,7 @@ DO_PREPARE=false
 DO_TRAIN=false
 DO_EVAL_LOCAL=false
 DO_EVAL_API=false
+DO_CLASSIFY=false
 DO_UPLOAD=false
 DO_DASHBOARD=false
 ANY_STEP=false
@@ -65,11 +67,12 @@ while [[ $# -gt 0 ]]; do
         --train)       DO_TRAIN=true;      ANY_STEP=true; shift ;;
         --eval-local)  DO_EVAL_LOCAL=true; ANY_STEP=true; shift ;;
         --eval-api)    DO_EVAL_API=true;   ANY_STEP=true; shift ;;
+        --classify)    DO_CLASSIFY=true;   ANY_STEP=true; shift ;;
         --upload)      DO_UPLOAD=true;     ANY_STEP=true; shift ;;
         --dashboard)   DO_DASHBOARD=true;  ANY_STEP=true; shift ;;
         --all)
             DO_SETUP=true; DO_DOWNLOAD=true; DO_PREPARE=true; DO_TRAIN=true
-            DO_EVAL_LOCAL=true; DO_EVAL_API=true; DO_UPLOAD=true; DO_DASHBOARD=true
+            DO_EVAL_LOCAL=true; DO_EVAL_API=true; DO_CLASSIFY=true; DO_UPLOAD=true; DO_DASHBOARD=true
             ANY_STEP=true; shift ;;
         --smoke-test)  SMOKE_TEST=true;        shift ;;
         --task)        TASK="$2";              shift 2 ;;
@@ -92,7 +95,7 @@ fi
 if [[ -n "$MODEL_OVERRIDE" ]]; then
     MODEL="$MODEL_OVERRIDE"
 elif [[ "$SMOKE_TEST" == true ]]; then
-    MODEL="tiny"
+    MODEL="qwen2.5-0.5b"
 else
     MODEL="qwen3-8b"
 fi
@@ -200,9 +203,18 @@ if [[ "$CLEAN" == true ]]; then
     fi
 
     if [[ "$DO_EVAL_API" == true ]]; then
+        API_MODEL_G=$(glob "${MODEL_OVERRIDE:-all}")
         clean_paths \
-            "${REPO_ROOT}/results/predictions/api/${MODEL_G}/${TASK_G}" \
-            "${REPO_ROOT}/results/predictions/api/${MODEL_G}/${TASK_G}/*.partial"
+            "${REPO_ROOT}/results/predictions/api/${API_MODEL_G}/${TASK_G}" \
+            "${REPO_ROOT}/results/predictions/api/${API_MODEL_G}/${TASK_G}/*.partial"
+    fi
+
+    if [[ "$DO_CLASSIFY" == true ]]; then
+        clean_paths \
+            "${REPO_ROOT}/results/classified/local/${MODEL_G}/${TASK_G}" \
+            "${REPO_ROOT}/results/classified/api/${MODEL_G}/${TASK_G}" \
+            "${REPO_ROOT}/results/summaries/local/${MODEL_G}/${TASK_G}" \
+            "${REPO_ROOT}/results/summaries/api/${MODEL_G}/${TASK_G}"
     fi
 
     if [[ "$DO_DASHBOARD" == true ]]; then
@@ -263,6 +275,13 @@ if [[ "$DO_EVAL_API" == true ]]; then
         $DRY_FLAG
 fi
 
+if [[ "$DO_CLASSIFY" == true ]]; then
+    step "Classify errors  (task=${TASK})"
+    $PYTHON "${SCRIPTS}/classify_errors.py" \
+        --task "$TASK" \
+        $DRY_FLAG
+fi
+
 if [[ "$DO_UPLOAD" == true ]]; then
     step "Upload artifacts  (model=${MODEL}, task=${TASK})"
     $PYTHON "${SCRIPTS}/upload_artifacts.py" \
@@ -274,6 +293,7 @@ fi
 if [[ "$DO_DASHBOARD" == true ]]; then
     step "Generate dashboard data"
     $PYTHON "${SCRIPTS}/generate_dashboard_data.py" \
+        --out "${REPO_ROOT}/results/final/results.json" \
         $DRY_FLAG
 fi
 

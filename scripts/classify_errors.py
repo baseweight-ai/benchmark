@@ -149,7 +149,7 @@ def compute_metric(task_cfg: TaskConfig, classified_rows: list[dict]) -> Optiona
         average = "weighted" if metric == "weighted_f1" else "macro"
         y_true, y_pred = [], []
         for r in classified_rows:
-            y_true.append(r["ground_truth"])
+            y_true.append(normalize_text(r["ground_truth"]))
             y_pred.append(r["predicted_clean"])
         try:
             score = f1_score(y_true, y_pred, average=average, zero_division=0)
@@ -204,6 +204,10 @@ def classify_predictions(
     return classified, dict(counts)
 
 
+def _result_path(base: str, source: str, model_short: str, task_id: str, filename: str) -> Path:
+    return REPO_ROOT / "results" / base / source / model_short / task_id / filename
+
+
 def process_model_task_condition(
     model_short: str,
     task_id: str,
@@ -214,39 +218,47 @@ def process_model_task_condition(
     source: str = "local",
 ) -> Optional[dict]:
     """Classify one predictions file and write summary."""
-    pred_path = REPO_ROOT / "results" / "predictions" / source / model_short / task_id / f"{condition}.jsonl"
+    pred_path = _result_path("predictions", source, model_short, task_id, f"{condition}.jsonl")
+    label = f"{source}/{model_short}/{task_id}/{condition}"
     if not pred_path.exists():
-        click.echo(f"  SKIP [{source}/{model_short}/{task_id}/{condition}]: predictions not found")
         return None
 
     predictions = load_jsonl(pred_path)
     if not predictions:
-        click.echo(f"  SKIP [{model_short}/{task_id}/{condition}]: empty predictions file")
+        click.echo(f"  SKIP [{label}]: empty predictions file")
         return None
 
     if dry_run:
-        click.echo(f"  [dry-run] Would classify {len(predictions)} predictions for {model_short}/{task_id}/{condition}")
-        return None
+        click.echo(f"  [dry-run] Would classify {len(predictions)} predictions for {label}")
+        return {}
 
     classified, counts = classify_predictions(predictions, task_cfg, valid_labels)
 
-    # Write classified predictions
-    classified_path = REPO_ROOT / "results" / "classified" / source / model_short / task_id / f"{condition}.jsonl"
+    classified_path = _result_path("classified", source, model_short, task_id, f"{condition}.jsonl")
     _write_jsonl(classified, classified_path)
 
-    # Compute metric
     metric_value = compute_metric(task_cfg, classified)
 
-    # Compute average latency and TTFT
     latencies = [r["latency_ms"] for r in predictions if r.get("latency_ms", 0) > 0]
     ttfts = [r["ttft_ms"] for r in predictions if r.get("ttft_ms", 0) > 0]
     avg_latency = sum(latencies) / len(latencies) if latencies else None
     ttft_p50 = sorted(ttfts)[len(ttfts) // 2] if ttfts else None
     ttft_p95 = sorted(ttfts)[int(len(ttfts) * 0.95)] if ttfts else None
 
-    # Token counts for cost estimation
     total_input_tokens = sum(r.get("input_tokens", 0) for r in predictions)
     total_output_tokens = sum(r.get("output_tokens", 0) for r in predictions)
+
+    # Actual eval throughput: derived from the timestamp span across all predictions.
+    # With concurrent requests, max-min timestamps ≈ total wall time for the run.
+    from datetime import datetime, timezone as tz
+    timestamps = [r["timestamp"] for r in predictions if r.get("timestamp")]
+    eval_wall_time_s = None
+    if len(timestamps) >= 2:
+        def _parse(ts: str) -> datetime:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        elapsed = (_parse(max(timestamps)) - _parse(min(timestamps))).total_seconds()
+        rounded = round(elapsed, 1)
+        eval_wall_time_s = rounded if rounded > 0 else None
 
     summary = {
         "model": model_short,
@@ -261,15 +273,13 @@ def process_model_task_condition(
         "ttft_p95_ms": round(ttft_p95, 1) if ttft_p95 is not None else None,
         "total_input_tokens": total_input_tokens,
         "total_output_tokens": total_output_tokens,
+        "eval_wall_time_s": eval_wall_time_s,
     }
 
-    summary_path = REPO_ROOT / "results" / "summaries" / source / model_short / task_id / f"{condition}.json"
+    summary_path = _result_path("summaries", source, model_short, task_id, f"{condition}.json")
     atomic_write_json(summary, summary_path)
     metric_str = f"{metric_value:.4f}" if metric_value is not None else "N/A"
-    click.echo(
-        f"  [{model_short}/{task_id}/{condition}] "
-        f"{task_cfg.metric_id}={metric_str} counts={counts}"
-    )
+    click.echo(f"  [{label}] {task_cfg.metric_id}={metric_str} counts={counts}")
     return summary
 
 
@@ -286,7 +296,7 @@ def get_valid_labels(task_id: str) -> Optional[list[str]]:
 
 
 @click.command()
-@click.option("--model", default="all", help="Model short name or 'all'")
+@click.option("--model", default="all", help="Model short name or 'all' (ignored for api source)")
 @click.option("--task", default="all", help="Task ID or 'all'")
 @click.option("--condition", default="all", help="Condition or 'all'")
 @click.option("--source", default="all", help="Prediction source: local|api|all")
@@ -299,44 +309,52 @@ def main(model: str, task: str, condition: str, source: str, dry_run: bool) -> N
     task_ids = ALL_TASKS if task == "all" else [task]
 
     if condition == "all":
-        conditions = ["zero-shot", "5-shot", "lora-500", "lora-full", "api-sft-500"]
+        conditions = ["zero-shot", "5-shot", "lora", "api-sft"]
     else:
         conditions = [condition]
 
     failures = []
+    processed = 0
+
     for src in sources:
         src_root = pred_root / src
+
         if model == "all":
             model_shorts = sorted(d.name for d in src_root.iterdir() if d.is_dir()) if src_root.exists() else []
         else:
             model_shorts = [model]
 
-        for model_short in model_shorts:
+        for ms in model_shorts:
             for tid in task_ids:
                 try:
                     task_cfg = load_task_config(tid)
                     valid_labels = get_valid_labels(tid)
                 except Exception as exc:
                     click.echo(f"  ERROR: could not load task config {tid}: {exc}", err=True)
-                    failures.append((f"{src}/{model_short}/{tid}", str(exc)))
+                    failures.append((f"{src}/{ms}/{tid}", str(exc)))
                     continue
 
                 for cond in conditions:
                     try:
-                        process_model_task_condition(
-                            model_short, tid, cond, task_cfg, valid_labels, dry_run, source=src
+                        result = process_model_task_condition(
+                            ms, tid, cond, task_cfg, valid_labels, dry_run, source=src
                         )
+                        if result is not None:
+                            processed += 1
                     except Exception as exc:
-                        click.echo(f"  ERROR [{src}/{model_short}/{tid}/{cond}]: {exc}", err=True)
+                        click.echo(f"  ERROR [{src}/{ms}/{tid}/{cond}]: {exc}", err=True)
                         import traceback; traceback.print_exc()
-                        failures.append((f"{src}/{model_short}/{tid}/{cond}", str(exc)))
+                        failures.append((f"{src}/{ms}/{tid}/{cond}", str(exc)))
 
     if failures:
         click.echo(f"\nFAILED ({len(failures)}):")
         for key, err in failures:
             click.echo(f"  {key}: {err}")
         sys.exit(1)
-    click.echo("\nAll error classification completed.")
+    if processed == 0:
+        click.echo("ERROR: no prediction files found — nothing was classified.", err=True)
+        sys.exit(1)
+    click.echo(f"\nClassified {processed} prediction file(s).")
 
 
 if __name__ == "__main__":

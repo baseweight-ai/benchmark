@@ -82,8 +82,8 @@ def upload_adapter(
     hf_org: str,
 ) -> Optional[str]:
     """Upload LoRA adapter to HuggingFace. Returns repo URL or None."""
-    adapter_path = REPO_ROOT / "results" / "adapters" / model_cfg.model_short / task_id / condition
-    meta_path = REPO_ROOT / "results" / "training" / model_cfg.model_short / task_id / condition / "metadata.json"
+    adapter_path = REPO_ROOT / "results" / "adapters" / "local" / model_cfg.model_short / task_id / condition
+    meta_path = REPO_ROOT / "results" / "training" / "local" / model_cfg.model_short / task_id / condition / "metadata.json"
 
     if not adapter_path.exists():
         click.echo(f"  SKIP [{model_cfg.model_short}/{task_id}/{condition}]: adapter not found")
@@ -156,7 +156,7 @@ def upload_adapter(
 
 def upload_predictions(model_short: str, task_id: str, dry_run: bool, hf_org: str) -> Optional[str]:
     """Upload prediction log JSONL files to HuggingFace dataset repo."""
-    pred_dir = REPO_ROOT / "results" / "predictions" / model_short / task_id
+    pred_dir = REPO_ROOT / "results" / "predictions" / "local" / model_short / task_id
     if not pred_dir.exists():
         click.echo(f"  SKIP [{model_short}/{task_id}]: no predictions directory")
         return None
@@ -231,7 +231,7 @@ def ensure_collection(dry_run: bool, hf_org: str) -> Optional[str]:
 @click.command()
 @click.option("--model", default="all", help="Model ID (qwen3-8b|gemma3-4b|phi4-mini|all)")
 @click.option("--task", default="all", help="Task ID or 'all'")
-@click.option("--condition", default="all", help="lora-500|lora-full|all")
+@click.option("--condition", default="all", help="lora|all")
 @click.option("--upload-predictions", "do_predictions", is_flag=True, help="Also upload prediction logs")
 @click.option("--hf-org", default=HF_ORG, help="HuggingFace org or username")
 @click.option("--dry-run", is_flag=True)
@@ -250,7 +250,7 @@ def main(
 
     model_ids = ALL_MODELS if model == "all" else [model]
     task_ids = ALL_TASKS if task == "all" else [task]
-    conditions = ["lora-500", "lora-full"] if condition == "all" else [condition]
+    conditions = ["lora"] if condition == "all" else [condition]
 
     # Ensure collection exists
     ensure_collection(dry_run, hf_org)

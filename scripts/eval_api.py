@@ -24,28 +24,25 @@ load_dotenv(REPO_ROOT / ".env")
 ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa"]
 
 OPENAI_MODELS: dict[str, Optional[str]] = {
-    "gpt-4.1-nano":     "gpt-4.1-nano",
-    "gpt-4.1-nano-sft": None,   # set at runtime after fine-tuning job completes
-    "gpt-5.4-mini":     "gpt-5.4-mini",
-    "gpt-5.4-mini-sft": None,   # set at runtime after fine-tuning job completes
-    "gpt-5.5":          "gpt-5.5",
+    "gpt-4.1-nano": "gpt-4.1-nano-2025-04-14",
+    "gpt-5.4-mini": "gpt-5.4-mini",
+    "gpt-5.5":      "gpt-5.5",
 }
 
+# Models that support SFT — maps model_id to the versioned base model required by OpenAI
 SFT_BASE_MODELS: dict[str, str] = {
-    "gpt-4.1-nano-sft": "gpt-4.1-nano-2025-04-14",
-    "gpt-5.4-mini-sft": "gpt-5.4-mini-2026-03-17",
+    "gpt-4.1-nano": "gpt-4.1-nano-2025-04-14",
+    "gpt-5.4-mini": "gpt-5.4-mini-2026-03-17",
 }
 
 MODEL_CONDITIONS: dict[str, list[str]] = {
-    "gpt-4.1-nano":     ["zero-shot", "5-shot"],
-    "gpt-4.1-nano-sft": ["api-sft-500"],
-    "gpt-5.4-mini":     ["zero-shot"],
-    "gpt-5.4-mini-sft": ["api-sft-500"],
-    "gpt-5.5":          ["5-shot"],
+    "gpt-4.1-nano": ["zero-shot", "5-shot", "api-sft"],
+    "gpt-5.4-mini": ["zero-shot", "api-sft"],
+    "gpt-5.5":      ["5-shot"],
 }
 
-SMOKE_MODELS = ["gpt-4.1-nano", "gpt-4.1-nano-sft"]
-PROD_MODELS  = ["gpt-5.4-mini", "gpt-5.4-mini-sft", "gpt-5.5"]
+SMOKE_MODELS = ["gpt-4.1-nano"]
+PROD_MODELS  = ["gpt-5.4-mini", "gpt-5.5"]
 ALL_API_MODELS = SMOKE_MODELS + PROD_MODELS
 
 _SFT_SUFFIX_MAX_LEN = 18  # OpenAI fine-tuning suffix character limit
@@ -71,41 +68,66 @@ def load_task_config(task_id: str) -> TaskConfig:
 
 async def call_openai(
     client, model_str: str, messages: list[dict], max_tokens: int, semaphore: asyncio.Semaphore
-) -> tuple[str, int, int, float]:
+) -> tuple[str, int, int, float, float]:
+    """Stream one request. Returns (text, in_tokens, out_tokens, latency_ms, ttft_ms)."""
     async with semaphore:
         for attempt in range(MAX_RETRIES):
             try:
                 t0 = time.time()
-                resp = await client.chat.completions.create(
+                ttft_ms = 0.0
+                first_token = True
+                chunks: list[str] = []
+                in_tok = out_tok = 0
+
+                stream = await client.chat.completions.create(
                     model=model_str, messages=messages, temperature=0, max_tokens=max_tokens,
+                    stream=True, stream_options={"include_usage": True},
                 )
-                latency_ms = int((time.time() - t0) * 1000)
-                text = resp.choices[0].message.content or ""
-                return text, resp.usage.prompt_tokens, resp.usage.completion_tokens, latency_ms
+                async for chunk in stream:
+                    if chunk.usage:
+                        in_tok = chunk.usage.prompt_tokens
+                        out_tok = chunk.usage.completion_tokens
+                    if not chunk.choices:
+                        continue
+                    content = chunk.choices[0].delta.content or ""
+                    if content:
+                        if first_token:
+                            ttft_ms = (time.time() - t0) * 1000
+                            first_token = False
+                        chunks.append(content)
+
+                return "".join(chunks), in_tok, out_tok, (time.time() - t0) * 1000, ttft_ms
+
             except Exception:
                 if attempt == MAX_RETRIES - 1:
                     raise
                 await asyncio.sleep(2 ** attempt)
-    return "", 0, 0, 0
+    return "", 0, 0, 0, 0.0
 
 
 
 async def run_eval(model_id: str, task_id: str, condition: str, task_cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> None:
     prepared = REPO_ROOT / "data" / "prepared" / task_id
-    test_path = prepared / ("smoke_test.jsonl" if smoke_test else "test.jsonl")
-    few_shot_path = prepared / ("smoke_train.jsonl" if smoke_test else "few_shot_5.jsonl")
+    suffix = "smoke_" if smoke_test else ""
+    test_path = prepared / f"{suffix}test.jsonl"
+    few_shot_path = prepared / ("smoke_train.jsonl" if smoke_test else "train.jsonl")
 
     if not test_path.exists():
         raise FileNotFoundError(f"test data not found: {test_path}")
 
     test_rows = load_jsonl(test_path)
-    few_shot = load_jsonl(few_shot_path) if few_shot_path.exists() else []
+    labels_path = prepared / f"{suffix}test_labels.jsonl"
+    if labels_path.exists():
+        label_map = {r["id"]: r["label"] for r in load_jsonl(labels_path)}
+        for row in test_rows:
+            row["label"] = label_map.get(row["id"], "")
+    few_shot = load_jsonl(few_shot_path)[:5] if few_shot_path.exists() else []
 
     if dry_run:
         click.echo(f"  [dry-run] Would eval {model_id} on {task_id}/{condition} ({len(test_rows)} examples)")
         return
 
-    out_path = REPO_ROOT / "results" / "predictions" / "api" / task_id / f"{condition}.jsonl"
+    out_path = REPO_ROOT / "results" / "predictions" / "api" / model_id / task_id / f"{condition}.jsonl"
     if out_path.exists():
         click.echo(f"  SKIP [{model_id}/{task_id}/{condition}]: already exists")
         return
@@ -127,19 +149,17 @@ async def run_eval(model_id: str, task_id: str, condition: str, task_cfg: TaskCo
         raise ValueError(f"Model string not set for {model_id}")
     from openai import AsyncOpenAI
     client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-    call_fn = call_openai
-
     semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 
     async def process_row(row: dict) -> None:
         msgs = build_messages(row, few_shot, condition)
         ground_truth = row.get("label", "")
         try:
-            text, in_tok, out_tok, lat = await call_fn(
+            text, in_tok, out_tok, lat, ttft = await call_openai(
                 client, model_str, msgs, task_cfg.max_output_tokens, semaphore
             )
         except Exception as exc:
-            text, in_tok, out_tok, lat = f"ERROR: {exc}", 0, 0, 0
+            text, in_tok, out_tok, lat, ttft = f"ERROR: {exc}", 0, 0, 0, 0.0
         result = {
             "id": row.get("id", ""),
             "model": model_id,
@@ -150,6 +170,7 @@ async def run_eval(model_id: str, task_id: str, condition: str, task_cfg: TaskCo
             "input_tokens": in_tok,
             "output_tokens": out_tok,
             "latency_ms": lat,
+            "ttft_ms": ttft,
             "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
         append_jsonl(result, pp)
@@ -200,7 +221,7 @@ async def run_sft(model_id: str, task_id: str, task_cfg: TaskConfig, dry_run: bo
 
     client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-    meta_path = REPO_ROOT / "results" / "training" / model_id / task_id / "metadata.json"
+    meta_path = REPO_ROOT / "results" / "training" / "api" / model_id / task_id / "api-sft" / "metadata.json"
     if meta_path.exists():
         with open(meta_path) as f:
             meta = json.load(f)
@@ -212,11 +233,14 @@ async def run_sft(model_id: str, task_id: str, task_cfg: TaskConfig, dry_run: bo
         if job and job.status == "succeeded":
             ft_model = job.fine_tuned_model
             click.echo(f"  Found completed job {job.id} on OpenAI → {ft_model}")
+            _tt = round((job.finished_at - job.created_at) / 60, 1) if job.finished_at and job.created_at else None
+            _n = sum(1 for line in open(sft_path) if line.strip())
             meta_path.parent.mkdir(parents=True, exist_ok=True)
             with open(meta_path, "w") as f:
-                json.dump({"ft_model_id": ft_model, "job_id": job.id, "trained_tokens": job.trained_tokens or 0}, f)
+                json.dump({"ft_model_id": ft_model, "job_id": job.id, "trained_tokens": job.trained_tokens or 0,
+                           "training_time_min": _tt, "n_train": _n}, f)
             OPENAI_MODELS[model_id] = ft_model
-            await run_eval(model_id, task_id, "api-sft-500", task_cfg, dry_run, smoke_test)
+            await run_eval(model_id, task_id, "api-sft", task_cfg, dry_run, smoke_test)
             return
         elif job:
             click.echo(f"  Found in-progress job {job.id} (status={job.status}), attaching...")
@@ -273,22 +297,29 @@ async def run_sft(model_id: str, task_id: str, task_cfg: TaskConfig, dry_run: bo
         training_per_m = pricing.get("apis", {}).get(model_id, {}).get("training_per_m", 25.0)
         training_cost = trained_tokens * training_per_m / 1_000_000
 
+        training_time_min = None
+        if job.finished_at and job.created_at:
+            training_time_min = round((job.finished_at - job.created_at) / 60, 1)
+
+        n_train = sum(1 for line in open(sft_path) if line.strip())
+
         meta_path.parent.mkdir(parents=True, exist_ok=True)
         with open(meta_path, "w") as f:
             json.dump({
                 "ft_model_id": ft_model, "job_id": job.id,
                 "trained_tokens": trained_tokens, "training_cost": training_cost,
+                "training_time_min": training_time_min, "n_train": n_train,
             }, f)
         click.echo(f"  Fine-tuned model: {ft_model}, cost: ${training_cost:.3f}")
 
     OPENAI_MODELS[model_id] = ft_model
-    await run_eval(model_id, task_id, "api-sft-500", task_cfg, dry_run, smoke_test)
+    await run_eval(model_id, task_id, "api-sft", task_cfg, dry_run, smoke_test)
 
 
 @click.command()
 @click.option("--model", default="all", help=f"Model ID or 'all'. Choices: {', '.join(ALL_API_MODELS)}")
 @click.option("--task", default="all", help="Task ID or 'all'")
-@click.option("--condition", default="all", help="zero-shot|5-shot|api-sft-500|all")
+@click.option("--condition", default="all", help="zero-shot|5-shot|api-sft|all")
 @click.option("--dry-run", is_flag=True)
 @click.option("--smoke-test", is_flag=True)
 def main(model: str, task: str, condition: str, dry_run: bool, smoke_test: bool) -> None:
@@ -307,19 +338,19 @@ def main(model: str, task: str, condition: str, dry_run: bool, smoke_test: bool)
             for tid in task_ids:
                 try:
                     task_cfg = load_task_config(tid)
-                    if mid in SFT_BASE_MODELS:
-                        await run_sft(mid, tid, task_cfg, dry_run, smoke_test)
-                    else:
-                        supported = MODEL_CONDITIONS.get(mid, [])
-                        conditions_to_run = (
-                            supported if condition == "all"
-                            else [condition] if condition in supported
-                            else []
-                        )
-                        if not conditions_to_run:
-                            click.echo(f"  SKIP [{mid}/{tid}/{condition}]: not supported for {mid}")
-                            continue
-                        for cond in conditions_to_run:
+                    supported = MODEL_CONDITIONS.get(mid, [])
+                    conditions_to_run = (
+                        supported if condition == "all"
+                        else [condition] if condition in supported
+                        else []
+                    )
+                    if not conditions_to_run:
+                        click.echo(f"  SKIP [{mid}/{tid}/{condition}]: not supported for {mid}")
+                        continue
+                    for cond in conditions_to_run:
+                        if cond == "api-sft":
+                            await run_sft(mid, tid, task_cfg, dry_run, smoke_test)
+                        else:
                             await run_eval(mid, tid, cond, task_cfg, dry_run, smoke_test)
                 except Exception as exc:
                     click.echo(f"  ERROR [{mid}/{tid}]: {exc}", err=True)

@@ -15,4 +15,3 @@ epochs_by_size:
   medium: 5
   large: 3
 max_seq_length: 2048
-efficiency_curve_sizes: []

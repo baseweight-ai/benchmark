@@ -220,19 +220,19 @@ def main():
         import checkpoint_utils
         checkpoint_utils.NETWORK_VOLUME = Path(tmpdir)
 
-        save_train_state("test-model", "fpb", "lora-500", {"status": "complete", "eval_loss": losses_p2[-1]})
-        state = load_train_state("test-model", "fpb", "lora-500")
+        save_train_state("test-model", "fpb", "lora", {"status": "complete", "eval_loss": losses_p2[-1]})
+        state = load_train_state("test-model", "fpb", "lora")
         assert state is not None
         assert state["status"] == "complete"
         assert math.isfinite(state["eval_loss"])
         print(f"  train_state.json: status={state['status']}, eval_loss={state['eval_loss']:.4f} ✓")
 
         # Place a checkpoint dir where checkpoint_utils expects it
-        nv_ckpt_dir = checkpoint_utils.NETWORK_VOLUME / "checkpoints" / "test-model" / "fpb" / "lora-500"
+        nv_ckpt_dir = checkpoint_utils.NETWORK_VOLUME / "checkpoints" / "test-model" / "fpb" / "lora"
         nv_ckpt_dir.mkdir(parents=True)
         (nv_ckpt_dir / "checkpoint-3").mkdir()
         (nv_ckpt_dir / "checkpoint-7").mkdir()
-        found = find_hf_resume_checkpoint("test-model", "fpb", "lora-500")
+        found = find_hf_resume_checkpoint("test-model", "fpb", "lora")
         assert found is not None
         assert found.name == "checkpoint-7"
         print(f"  find_hf_resume_checkpoint: {found.name} ✓")

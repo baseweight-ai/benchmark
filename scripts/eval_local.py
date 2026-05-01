@@ -70,6 +70,19 @@ def get_test_path(task_id: str, smoke_test: bool) -> Path:
     return prepared / ("smoke_test.jsonl" if smoke_test else "test.jsonl")
 
 
+def load_test_rows(task_id: str, smoke_test: bool) -> list[dict]:
+    """Load test prompts joined with their labels by id."""
+    prepared = REPO_ROOT / "data" / "prepared" / task_id
+    suffix = "smoke_" if smoke_test else ""
+    prompts = load_jsonl(prepared / f"{suffix}test.jsonl")
+    labels_path = prepared / f"{suffix}test_labels.jsonl"
+    if labels_path.exists():
+        label_map = {r["id"]: r["label"] for r in load_jsonl(labels_path)}
+        for row in prompts:
+            row["label"] = label_map.get(row["id"], "")
+    return prompts
+
+
 def get_few_shot(task_id: str, model_short: str, smoke_test: bool) -> list[dict]:
     """Return first 5 rows of the appropriate train file."""
     prepared = REPO_ROOT / "data" / "prepared" / task_id
@@ -77,7 +90,7 @@ def get_few_shot(task_id: str, model_short: str, smoke_test: bool) -> list[dict]
         train_path = prepared / "smoke_train.jsonl"
     else:
         train_path = prepared / "train.jsonl"
-        meta_path = REPO_ROOT / "results" / "training" / model_short / task_id / "lora" / "metadata.json"
+        meta_path = REPO_ROOT / "results" / "training" / "local" / model_short / task_id / "lora" / "metadata.json"
         if meta_path.exists():
             with open(meta_path) as f:
                 meta = json.load(f)
@@ -205,8 +218,8 @@ async def call_vllm(
     messages: list[dict],
     max_tokens: int,
     semaphore: asyncio.Semaphore,
-) -> tuple[str, float, float]:
-    """Stream one request. Returns (text, latency_ms, ttft_ms)."""
+) -> tuple[str, int, int, float, float]:
+    """Stream one request. Returns (text, in_tokens, out_tokens, latency_ms, ttft_ms)."""
     import aiohttp
 
     payload = {
@@ -215,6 +228,7 @@ async def call_vllm(
         "temperature": 0,
         "max_tokens": max_tokens,
         "stream": True,
+        "stream_options": {"include_usage": True},
     }
 
     async with semaphore:
@@ -224,6 +238,7 @@ async def call_vllm(
                 ttft_ms = 0.0
                 chunks: list[str] = []
                 first_token = True
+                in_tok = out_tok = 0
 
                 async with session.post(
                     f"{VLLM_HOST}/v1/chat/completions",
@@ -242,6 +257,11 @@ async def call_vllm(
                             data = json.loads(data_str)
                         except json.JSONDecodeError:
                             continue
+                        usage = data.get("usage") or {}
+                        if usage.get("prompt_tokens"):
+                            in_tok = usage["prompt_tokens"]
+                        if usage.get("completion_tokens"):
+                            out_tok = usage["completion_tokens"]
                         content = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
                         if content:
                             if first_token:
@@ -249,13 +269,13 @@ async def call_vllm(
                                 first_token = False
                             chunks.append(content)
 
-                return "".join(chunks), (time.time() - t0) * 1000, ttft_ms
+                return "".join(chunks), in_tok, out_tok, (time.time() - t0) * 1000, ttft_ms
 
             except Exception:
                 if attempt == MAX_RETRIES - 1:
                     raise
                 await asyncio.sleep(2 ** attempt)
-    return "", 0.0, 0.0
+    return "", 0, 0, 0.0, 0.0
 
 
 
@@ -276,7 +296,7 @@ async def run_eval(
     if not test_path.exists():
         raise FileNotFoundError(f"test data not found: {test_path}")
 
-    test_rows = load_jsonl(test_path)
+    test_rows = load_test_rows(task_id, smoke_test)
 
     out_path = (
         REPO_ROOT / "results" / "predictions" / "local"
@@ -309,11 +329,11 @@ async def run_eval(
     async def process_row(row: dict, session: "aiohttp.ClientSession") -> None:
         msgs = build_messages(row, few_shot, condition)
         try:
-            text, lat, ttft = await call_vllm(
+            text, in_tok, out_tok, lat, ttft = await call_vllm(
                 session, model_name, msgs, task_cfg.max_output_tokens, semaphore
             )
         except Exception as exc:
-            text, lat, ttft = f"ERROR: {exc}", 0.0, 0.0
+            text, in_tok, out_tok, lat, ttft = f"ERROR: {exc}", 0, 0, 0.0, 0.0
         result = {
             "id": row.get("id", ""),
             "model": model_cfg.model_short,
@@ -321,8 +341,8 @@ async def run_eval(
             "input": msgs[-1]["content"] if msgs else "",
             "output": text,
             "ground_truth": row.get("label", ""),
-            "input_tokens": 0,
-            "output_tokens": 0,
+            "input_tokens": in_tok,
+            "output_tokens": out_tok,
             "latency_ms": lat,
             "ttft_ms": ttft,
             "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -342,7 +362,7 @@ async def run_eval(
 
 
 @click.command()
-@click.option("--model", default=None, help="Model ID or 'all'. Defaults to 'tiny' with --smoke-test, 'qwen3-8b' otherwise.")
+@click.option("--model", default=None, help="Model ID or 'all'. Defaults to 'qwen2.5-0.5b' with --smoke-test, 'qwen3-8b' otherwise.")
 @click.option("--task", default="all", help="Task ID or 'all'")
 @click.option("--condition", default="all", help="zero-shot|5-shot|lora|all")
 @click.option("--dry-run", is_flag=True, help="Validate without running inference")
@@ -350,7 +370,7 @@ async def run_eval(
 def main(model: Optional[str], task: str, condition: str, dry_run: bool, smoke_test: bool) -> None:
     """Evaluate local fine-tuned models via vLLM server."""
     if model is None:
-        model = "tiny" if smoke_test else "qwen3-8b"
+        model = "qwen2.5-0.5b" if smoke_test else "qwen3-8b"
     model_ids = ALL_MODELS if model == "all" else [model]
     task_ids = ALL_TASKS if task == "all" else [task]
 

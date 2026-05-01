@@ -18,4 +18,3 @@ epochs_by_size:
   small: 10
   medium: 5
   large: 3
-efficiency_curve_sizes: [50, 200, 500, 1000, 5000]

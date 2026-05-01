@@ -44,7 +44,6 @@ class TaskConfig(BaseModel):
     split_seed: Optional[int] = None
     context_max_tokens: Optional[int] = None
     test_split: str = "test"
-    efficiency_curve_sizes: list[int] = Field(default_factory=list)
 
 
 def load_task_config(task_id: str) -> TaskConfig:
