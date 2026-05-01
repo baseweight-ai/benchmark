@@ -14,17 +14,30 @@ echo "Repo: ${REPO_ROOT}"
 # Conda environment
 # ---------------------------------------------------------------------------
 eval "$(conda shell.bash hook)"
-if conda env list | grep -qE "^${CONDA_ENV}[[:space:]]"; then
-    echo "Updating conda env ${CONDA_ENV}..."
-    conda env update -n "$CONDA_ENV" -f "${REPO_ROOT}/environment.yml" --prune -q
-else
-    echo "Creating conda env ${CONDA_ENV}..."
-    conda env create -n "$CONDA_ENV" -f "${REPO_ROOT}/environment.yml" -q
-fi
-conda activate "$CONDA_ENV"
 
-# torchao conflicts with torch==2.5.1 (torch.int1 missing); unsloth doesn't need it
-pip uninstall -y torchao 2>/dev/null || true
+ENV_YML="${REPO_ROOT}/environment.yml"
+STAMP_FILE="${REPO_ROOT}/.setup_stamp"
+
+_ENV_HASH=$(md5sum "$ENV_YML" | awk '{print $1}')
+_ENV_LIST=$(conda env list 2>/dev/null)
+_ENV_EXISTS=$(echo "$_ENV_LIST" | grep -qE "^${CONDA_ENV}[[:space:]]" && echo true || echo false)
+
+if [[ -f "$STAMP_FILE" ]] && [[ "$(cat "$STAMP_FILE")" == "$_ENV_HASH" ]] && [[ "$_ENV_EXISTS" == true ]]; then
+    echo "Conda env ${CONDA_ENV} is current (environment.yml unchanged) — skipping install."
+    conda activate "$CONDA_ENV"
+else
+    if [[ "$_ENV_EXISTS" == true ]]; then
+        echo "Updating conda env ${CONDA_ENV}..."
+        conda env update -n "$CONDA_ENV" -f "${ENV_YML}" --prune -q
+    else
+        echo "Creating conda env ${CONDA_ENV}..."
+        conda env create -n "$CONDA_ENV" -f "${ENV_YML}" -q
+    fi
+    conda activate "$CONDA_ENV"
+    # torchao conflicts with torch==2.5.1 (torch.int1 missing); unsloth doesn't need it
+    pip uninstall -y torchao 2>/dev/null || true
+    echo "$_ENV_HASH" > "$STAMP_FILE"
+fi
 
 # ---------------------------------------------------------------------------
 # Verification

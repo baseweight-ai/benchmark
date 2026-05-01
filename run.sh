@@ -12,7 +12,6 @@
 #   --eval-local     Run eval_local.py  (vLLM, fine-tuned models)
 #   --eval-api       Run eval_api.py    (frontier API models)
 #   --classify       Run classify_errors.py (error classification + summaries)
-#   --upload         Run upload_artifacts.py
 #   --dashboard      Run generate_dashboard_data.py
 #   --all            All of the above
 #
@@ -41,7 +40,6 @@ DO_TRAIN=false
 DO_EVAL_LOCAL=false
 DO_EVAL_API=false
 DO_CLASSIFY=false
-DO_UPLOAD=false
 DO_DASHBOARD=false
 ANY_STEP=false
 
@@ -68,11 +66,10 @@ while [[ $# -gt 0 ]]; do
         --eval-local)  DO_EVAL_LOCAL=true; ANY_STEP=true; shift ;;
         --eval-api)    DO_EVAL_API=true;   ANY_STEP=true; shift ;;
         --classify)    DO_CLASSIFY=true;   ANY_STEP=true; shift ;;
-        --upload)      DO_UPLOAD=true;     ANY_STEP=true; shift ;;
         --dashboard)   DO_DASHBOARD=true;  ANY_STEP=true; shift ;;
         --all)
             DO_SETUP=true; DO_DOWNLOAD=true; DO_PREPARE=true; DO_TRAIN=true
-            DO_EVAL_LOCAL=true; DO_EVAL_API=true; DO_CLASSIFY=true; DO_UPLOAD=true; DO_DASHBOARD=true
+            DO_EVAL_LOCAL=true; DO_EVAL_API=true; DO_CLASSIFY=true; DO_DASHBOARD=true
             ANY_STEP=true; shift ;;
         --smoke-test)  SMOKE_TEST=true;        shift ;;
         --task)        TASK="$2";              shift 2 ;;
@@ -114,20 +111,50 @@ _resolve_python() {
     PYTHON="${env_path}/bin/python"
 }
 
-# If setup will (re)create the env we don't need Python yet; resolve after setup.
-# In every other case the env must already exist.
-if [[ "$DO_SETUP" == false ]]; then
-    _resolve_python
-fi
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+step() { echo; echo "━━━ $* ━━━"; }
+
+ENV_FILE="${REPO_ROOT}/.env"
+
+# Read a key from the .env file (does not export to shell).
+_read_env_key() {
+    local key="$1"
+    if [[ -f "$ENV_FILE" ]]; then
+        grep -E "^${key}=" "$ENV_FILE" | tail -1 | cut -d= -f2- || true
+    fi
+}
+
+# Validate that OPENAI_API_KEY is present and non-placeholder before eval-api.
+_check_api_keys() {
+    local key
+    echo "Checking API keys required for eval-api..."
+    key="${OPENAI_API_KEY:-$(_read_env_key OPENAI_API_KEY)}"
+    if [[ -z "$key" ]]; then
+        echo "  FAIL  OPENAI_API_KEY  not set — add it to ${ENV_FILE} and retry" >&2
+        exit 1
+    fi
+    if [[ "$key" == "sk-..." ]] || [[ ${#key} -lt 20 ]]; then
+        echo "  FAIL  OPENAI_API_KEY  looks like a placeholder (${key:0:10}…) — set a real key in ${ENV_FILE}" >&2
+        exit 1
+    fi
+    echo "  OK    OPENAI_API_KEY  ${key:0:12}…  (${#key} chars)"
+}
 
 # ---------------------------------------------------------------------------
 # Load .env for NETWORK_VOLUME (used in train clean)
 # ---------------------------------------------------------------------------
-ENV_FILE="${REPO_ROOT}/.env"
 NETWORK_VOLUME="/workspace"   # default; overridden below if set in .env
 if [[ -f "$ENV_FILE" ]]; then
-    val=$(grep -E '^NETWORK_VOLUME=' "$ENV_FILE" | tail -1 | cut -d= -f2-)
+    val=$(_read_env_key NETWORK_VOLUME)
     [[ -n "$val" ]] && NETWORK_VOLUME="$val"
+fi
+
+# If setup will (re)create the env we don't need Python yet; resolve after setup.
+# In every other case the env must already exist.
+if [[ "$DO_SETUP" == false ]]; then
+    _resolve_python
 fi
 
 # ---------------------------------------------------------------------------
@@ -138,11 +165,6 @@ if [[ "$SMOKE_TEST" == true ]]; then SMOKE_FLAG="--smoke-test"; fi
 
 DRY_FLAG=""
 if [[ "$DRY_RUN" == true ]]; then DRY_FLAG="--dry-run"; fi
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-step() { echo; echo "━━━ $* ━━━"; }
 
 # Glob-safe delete — skips patterns that match nothing.
 clean_paths() {
@@ -188,8 +210,8 @@ if [[ "$CLEAN" == true ]]; then
     if [[ "$DO_TRAIN" == true ]]; then
         # Local results
         clean_paths \
-            "${REPO_ROOT}/results/adapters/${MODEL_G}/${TASK_G}" \
-            "${REPO_ROOT}/results/training/${MODEL_G}/${TASK_G}"
+            "${REPO_ROOT}/results/adapters/local/${MODEL_G}/${TASK_G}" \
+            "${REPO_ROOT}/results/training/local/${MODEL_G}/${TASK_G}"
         # Workspace checkpoints (remote GPU volume)
         if [[ -d "$NETWORK_VOLUME/checkpoints" ]]; then
             clean_paths "${NETWORK_VOLUME}/checkpoints/${MODEL_G}/${TASK_G}"
@@ -229,6 +251,10 @@ if [[ "$DO_SETUP" == true ]]; then
     step "Setup"
     bash "${SCRIPTS}/setup.sh"
     _resolve_python   # env now exists (created or updated by setup.sh)
+fi
+
+if [[ "$DO_EVAL_API" == true ]]; then
+    _check_api_keys
 fi
 
 if [[ "$DO_DOWNLOAD" == true ]]; then
@@ -282,13 +308,6 @@ if [[ "$DO_CLASSIFY" == true ]]; then
         $DRY_FLAG
 fi
 
-if [[ "$DO_UPLOAD" == true ]]; then
-    step "Upload artifacts  (model=${MODEL}, task=${TASK})"
-    $PYTHON "${SCRIPTS}/upload_artifacts.py" \
-        --task "$TASK" \
-        --model "$MODEL" \
-        $DRY_FLAG
-fi
 
 if [[ "$DO_DASHBOARD" == true ]]; then
     step "Generate dashboard data"

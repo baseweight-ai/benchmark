@@ -227,11 +227,11 @@ def test_merge_results_new_key_not_in_existing_kept(tmp_path):
     # New model not in prior — should be included unchanged
     fresh = [
         _make_result("gpt-4.1", "frontier", "zero-shot", None),
-        _make_result("claude-sonnet-4", "frontier", "zero-shot", 0.79),
+        _make_result("gpt-5.4", "frontier", "zero-shot", 0.79),
     ]
     merged = merge_results(fresh, out)
-    claude = next(r for r in merged if r["model_id"] == "claude-sonnet-4")
-    assert claude["metric_value"] == pytest.approx(0.79)
+    new_model = next(r for r in merged if r["model_id"] == "gpt-5.4")
+    assert new_model["metric_value"] == pytest.approx(0.79)
 
 
 def test_merge_results_handles_corrupt_existing(tmp_path):

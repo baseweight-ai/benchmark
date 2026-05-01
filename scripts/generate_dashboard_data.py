@@ -3,12 +3,18 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 from typing import Optional
 
+os.environ.setdefault("LITELLM_LOG", "ERROR")
+
 import click
+import litellm
 import yaml
 from pydantic import BaseModel
+
+litellm.suppress_debug_info = True
 
 REPO_ROOT = Path(__file__).parent.parent
 ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa"]
@@ -16,7 +22,6 @@ ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa"]
 # Known API vendor prefixes → canonical capitalisation.
 _VENDOR_CAPS: dict[str, str] = {
     "gpt": "GPT",
-    "claude": "Claude",
     "gemini": "Gemini",
     "o1": "O1",
     "o3": "O3",
@@ -94,7 +99,6 @@ def _api_cost_per_token(model_id: str) -> tuple[float, float]:
     inference rate as the base.
     """
     import re
-    import litellm
 
     candidates = [model_id]
     if model_id.startswith("ft:"):

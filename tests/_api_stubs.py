@@ -1,4 +1,4 @@
-"""Inject stub modules for openai/anthropic/aiohttp/tqdm so API tests run without those packages."""
+"""Inject stub modules for openai/aiohttp/tqdm so API tests run without those packages."""
 from __future__ import annotations
 
 import asyncio
@@ -10,7 +10,7 @@ async def _tqdm_gather(*coros, desc=None, **kwargs):
     return await asyncio.gather(*coros, **kwargs)
 
 
-for _name in ("openai", "anthropic", "aiohttp"):
+for _name in ("openai", "aiohttp"):
     if _name not in sys.modules:
         sys.modules[_name] = MagicMock()
 

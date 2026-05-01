@@ -242,9 +242,6 @@ def run_training_task(
         use_gradient_checkpointing=hw_cfg.use_grad_ckpt,
     )
 
-    if hw_cfg.device == "cpu":
-        model = model.to("cpu")
-
     class _CheckpointCallback(TrainerCallback):
         def on_train_begin(self, args, state, control, **kwargs):
             click.echo(f"  Training started: {state.max_steps} steps")
@@ -496,12 +493,12 @@ def _upload_adapter(model_short: str, task_id: str, condition: str) -> None:
 @click.option("--cap", default=None, type=int, help="Cap training data to N rows (writes train_capN.jsonl for reproducibility)")
 @click.option("--auto-upload", is_flag=True, help="Upload adapter to HuggingFace after each run (persistence)")
 @click.option("--dry-run", is_flag=True, help="Validate configs without training")
-@click.option("--smoke-test", is_flag=True, help="CPU-only smoke test: reduced seq_len/rank/alpha, 4 threads.")
+@click.option("--smoke-test", is_flag=True, help="Smoke test: reduced seq_len/rank/alpha, 4 threads.")
 def main(model: Optional[str], task: str, cap: Optional[int], auto_upload: bool, dry_run: bool, smoke_test: bool) -> None:
     """QLoRA fine-tune one or more model/task combinations."""
     if smoke_test:
         torch.set_num_threads(4)
-        click.echo("Smoke-test mode: CPU only, 4 threads, seq_len=256, r=4.")
+        click.echo("Smoke-test mode: 4 threads, seq_len=256, r=4.")
 
     if model is None:
         model = "qwen2.5-0.5b" if smoke_test else "qwen3-8b"

@@ -19,7 +19,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-import tests._api_stubs  # noqa: F401 — injects openai/anthropic/tqdm stubs
+import tests._api_stubs  # noqa: F401 — injects openai/aiohttp/tqdm stubs
 import classify_errors
 import eval_api
 import generate_dashboard_data

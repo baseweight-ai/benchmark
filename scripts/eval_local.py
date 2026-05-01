@@ -48,6 +48,7 @@ class ModelConfig(BaseModel):
     model_short: str
     max_seq_length: int = 2048
     enable_thinking: Optional[bool] = None
+    vllm_task: str = "generate"
     fallback_model_id: Optional[str] = None
 
 
@@ -81,6 +82,13 @@ def load_test_rows(task_id: str, smoke_test: bool) -> list[dict]:
         for row in prompts:
             row["label"] = label_map.get(row["id"], "")
     return prompts
+
+
+def _pred_path(model_short: str, task_id: str, condition: str) -> Path:
+    return (
+        REPO_ROOT / "results" / "predictions" / "local"
+        / model_short / task_id / f"{condition}.jsonl"
+    )
 
 
 def get_few_shot(task_id: str, model_short: str, smoke_test: bool) -> list[dict]:
@@ -129,8 +137,8 @@ def start_vllm_server(
     adapter_path: Optional[Path],
     max_seq_length: int,
     enable_thinking: Optional[bool] = None,
+    vllm_task: str = "generate",
 ) -> subprocess.Popen:
-    """Start vLLM server process. Returns proc."""
     # Kill any lingering vLLM processes (server + engine subprocess) to avoid
     # orphaned GPU contexts causing OOM on the next run
     killed = any(
@@ -147,6 +155,7 @@ def start_vllm_server(
     cmd = [
         sys.executable, "-m", "vllm.entrypoints.openai.api_server",
         "--model", base_model,
+        "--task", vllm_task,
         "--dtype", "auto",
         "--max-model-len", str(max_seq_length),
         "--port", "8000",
@@ -366,7 +375,7 @@ async def run_eval(
 @click.option("--task", default="all", help="Task ID or 'all'")
 @click.option("--condition", default="all", help="zero-shot|5-shot|lora|all")
 @click.option("--dry-run", is_flag=True, help="Validate without running inference")
-@click.option("--smoke-test", is_flag=True, help="Use smoke test data and tiny model; mirrors train.py --smoke-test")
+@click.option("--smoke-test", is_flag=True, help="Use smoke test data and model; mirrors train.py --smoke-test")
 def main(model: Optional[str], task: str, condition: str, dry_run: bool, smoke_test: bool) -> None:
     """Evaluate local fine-tuned models via vLLM server."""
     if model is None:
@@ -393,7 +402,7 @@ def main(model: Optional[str], task: str, condition: str, dry_run: bool, smoke_t
                 failures.append((f"{mid}/{tid}", str(exc)))
                 continue
 
-            # model_cfg.max_seq_length is a training cap (e.g. 256 for tiny).
+            # model_cfg.max_seq_length is a training cap (e.g. 256 for smoke test).
             # For eval the vLLM server needs room for both the prompt and the
             # full output budget, so floor at max_output_tokens + 512.
             seq_len = max(
@@ -407,29 +416,37 @@ def main(model: Optional[str], task: str, condition: str, dry_run: bool, smoke_t
                     for cond in base_conditions:
                         asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, None, dry_run=True, smoke_test=smoke_test))
                 else:
-                    proc = start_vllm_server(
-                        model_cfg.model_id, None, seq_len, model_cfg.enable_thinking
-                    )
-                    try:
-                        ready = asyncio.run(wait_for_vllm(proc, timeout=health_timeout))
-                        if not ready:
-                            raise RuntimeError("vLLM server did not become ready in time")
-                        for cond in base_conditions:
-                            try:
-                                asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, None, dry_run=False, smoke_test=smoke_test))
-                            except Exception as exc:
-                                click.echo(f"  ERROR [{mid}/{tid}/{cond}]: {exc}", err=True)
-                                failures.append((f"{mid}/{tid}/{cond}", str(exc)))
-                    finally:
-                        stop_vllm_server(proc)
+                    pending_base = [c for c in base_conditions if not _pred_path(model_cfg.model_short, tid, c).exists()]
+                    if not pending_base:
+                        click.echo(f"  SKIP [{mid}/{tid}]: all base conditions already complete")
+                    else:
+                        proc = start_vllm_server(
+                            model_cfg.model_id, None, seq_len, model_cfg.enable_thinking, model_cfg.vllm_task
+                        )
+                        try:
+                            ready = asyncio.run(wait_for_vllm(proc, timeout=health_timeout))
+                            if not ready:
+                                raise RuntimeError("vLLM server did not become ready in time")
+                            for cond in pending_base:
+                                try:
+                                    asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, None, dry_run=False, smoke_test=smoke_test))
+                                except Exception as exc:
+                                    click.echo(f"  ERROR [{mid}/{tid}/{cond}]: {exc}", err=True)
+                                    failures.append((f"{mid}/{tid}/{cond}", str(exc)))
+                        finally:
+                            stop_vllm_server(proc)
 
             # --- LoRA adapter ---
             for cond in lora_conditions:
                 adapter_path = (
-                    REPO_ROOT / "results" / "adapters" / model_cfg.model_short / tid / cond
+                    REPO_ROOT / "results" / "adapters" / "local" / model_cfg.model_short / tid / cond
                 )
                 if not adapter_path.exists():
                     click.echo(f"  SKIP [{mid}/{tid}/{cond}]: adapter not found at {adapter_path}")
+                    continue
+
+                if not dry_run and _pred_path(model_cfg.model_short, tid, cond).exists():
+                    click.echo(f"  SKIP [{mid}/{tid}/{cond}]: already complete")
                     continue
 
                 if dry_run:
@@ -437,7 +454,7 @@ def main(model: Optional[str], task: str, condition: str, dry_run: bool, smoke_t
                     continue
 
                 proc = start_vllm_server(
-                    model_cfg.model_id, adapter_path, seq_len, model_cfg.enable_thinking
+                    model_cfg.model_id, adapter_path, seq_len, model_cfg.enable_thinking, model_cfg.vllm_task
                 )
                 health_timeout = _vllm_health_timeout(smoke_test)
                 try:

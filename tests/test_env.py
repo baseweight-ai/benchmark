@@ -77,7 +77,7 @@ def test_pricing_covers_all_api_models():
     data = yaml.safe_load(path.read_text())
     api_models = list(data["apis"].keys())
     expected = ["gpt-5.4", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4.1-sft",
-                "claude-sonnet-4", "gemini-2.5-flash"]
+                "gemini-2.5-flash"]
     for model in expected:
         assert model in api_models, f"Missing pricing for {model}"
 
@@ -122,7 +122,3 @@ def test_requirements_parseable():
         assert line[0].isalpha() or line[0].isdigit(), f"Unexpected line: {line!r}"
 
 
-def test_anthropic_in_requirements():
-    req_path = REPO_ROOT / "requirements.txt"
-    content = req_path.read_text()
-    assert "anthropic" in content, "anthropic missing from requirements.txt"

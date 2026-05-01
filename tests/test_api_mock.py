@@ -1,6 +1,6 @@
-"""Layer 2 — API mocking: test eval_api.py with all providers mocked.
+"""Layer 2 — API mocking: test eval_api.py with openai mocked.
 
-openai, anthropic, and aiohttp are stub-injected into sys.modules so these
+openai and aiohttp are stub-injected into sys.modules so these
 tests run without installing those packages.
 """
 from __future__ import annotations
@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import tests._api_stubs  # noqa: F401 — injects openai/anthropic/tqdm stubs
+import tests._api_stubs  # noqa: F401 — injects openai/aiohttp/tqdm stubs
 import eval_api
 from eval_api import TaskConfig, run_eval, run_sft
 
@@ -42,7 +42,7 @@ def _setup_prepared_dir(tmp_path: Path, n: int = 5):
 # ── Mock call_* functions directly ────────────────────────────────────────────
 
 def _mock_call(response_text="positive"):
-    """Return an async mock that behaves like call_openai/call_anthropic/call_gemini."""
+    """Return an async mock that behaves like call_openai."""
     async def _fn(*args, **kwargs):
         return response_text, 100, 10, 150.0
     return _fn
@@ -66,18 +66,6 @@ def test_run_eval_openai_zero_shot(tmp_path, monkeypatch):
     assert all(r["output"] == "positive" for r in rows)
     assert all(r["model"] == "gpt-4.1" for r in rows)
 
-
-def test_run_eval_anthropic_zero_shot(tmp_path, monkeypatch):
-    monkeypatch.setattr(eval_api, "REPO_ROOT", tmp_path)
-    _setup_prepared_dir(tmp_path, n=5)
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "ant-test")
-
-    with patch("eval_api.call_anthropic", side_effect=_mock_call("neutral")):
-        with patch("anthropic.AsyncAnthropic", return_value=MagicMock()):
-            asyncio.run(run_eval("claude-sonnet-4", "fpb", "zero-shot", _task_cfg(), dry_run=False))
-
-    out = tmp_path / "results" / "predictions" / "claude-sonnet-4" / "fpb" / "zero-shot.jsonl"
-    assert out.exists()
 
 
 def test_run_eval_skips_existing(tmp_path, monkeypatch):

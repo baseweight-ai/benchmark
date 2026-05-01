@@ -3,6 +3,7 @@ model_short: "phi4-mini"
 max_seq_length: 2048
 load_in_4bit: true
 dtype: "bfloat16"
+vllm_task: generate
 fallback_model_id: "microsoft/phi-3.5-mini-instruct"
 lora:
   rank: 32

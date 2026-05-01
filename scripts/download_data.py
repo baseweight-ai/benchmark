@@ -72,7 +72,7 @@ def _hub_load(path: str, **kwargs):
     return load_dataset(path, **kwargs)
 
 
-def download_task(cfg: TaskConfig, dry_run: bool, tiny: bool = False) -> None:
+def download_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> None:
     click.echo(f"\n[{cfg.task_id}] Downloading {cfg.task_name}...")
     if dry_run:
         click.echo(f"  [dry-run] Would download {cfg.dataset_path} (config={cfg.dataset_config})")
@@ -90,7 +90,7 @@ def download_task(cfg: TaskConfig, dry_run: bool, tiny: bool = False) -> None:
     if cfg.dataset_config:
         load_kwargs["name"] = cfg.dataset_config
 
-    if tiny:
+    if smoke_test:
         # Probe for a test split first so we can download 2x train rows upfront for
         # tasks that have none, avoiding a redundant second download.
         test_exists = False
@@ -110,7 +110,7 @@ def download_task(cfg: TaskConfig, dry_run: bool, tiny: bool = False) -> None:
             try:
                 ds_split = _hub_load(cfg.dataset_path, split=f"{split}[:{limit}]", **load_kwargs)
                 loaded[split] = ds_split
-                click.echo(f"  {split}: {len(ds_split)} rows (tiny)")
+                click.echo(f"  {split}: {len(ds_split)} rows (smoke test)")
             except Exception as e:
                 split_errors.append(f"{split}: {e}")
         if not loaded:
@@ -138,8 +138,8 @@ def download_task(cfg: TaskConfig, dry_run: bool, tiny: bool = False) -> None:
 @click.command()
 @click.option("--task", default=None, help="Task ID to download (required; use 'all' to download every task)")
 @click.option("--dry-run", is_flag=True, help="Validate config without downloading")
-@click.option("--smoke-test", "tiny", is_flag=True, help=f"Download only {TINY_TRAIN} train + {TINY_TEST} test rows for smoke testing")
-def main(task: str, dry_run: bool, tiny: bool) -> None:
+@click.option("--smoke-test", is_flag=True, help=f"Download only {TINY_TRAIN} train + {TINY_TEST} test rows for smoke testing")
+def main(task: str, dry_run: bool, smoke_test: bool) -> None:
     """Download benchmark datasets from HuggingFace.
 
     You must specify --task <id> or --task all. No default — downloading all
@@ -153,7 +153,7 @@ def main(task: str, dry_run: bool, tiny: bool) -> None:
     failures = []
     for cfg in configs:
         try:
-            download_task(cfg, dry_run, tiny=tiny)
+            download_task(cfg, dry_run, smoke_test=smoke_test)
         except Exception as exc:
             click.echo(f"  ERROR: {exc}", err=True)
             failures.append((cfg.task_id, str(exc)))

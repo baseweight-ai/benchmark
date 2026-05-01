@@ -22,7 +22,6 @@ A configurable pipeline for comparing QLoRA fine-tuned open-source models agains
 | GPT-5.4 | OpenAI |
 | GPT-4.1, 4.1 Mini, 4.1 Nano | OpenAI |
 | GPT-4.1 SFT-500 | OpenAI (API fine-tuned) |
-| Claude Sonnet 4 | Anthropic |
 | Gemini 2.5 Flash | Google |
 
 **Tasks and metrics:**
@@ -63,7 +62,7 @@ site/            Static dashboard (Chart.js)
 git clone https://github.com/baseweight/baseweight-benchmark.git
 cd baseweight-benchmark
 pip install -r requirements.txt
-cp .env.example .env  # add OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY, HF_TOKEN
+cp .env.example .env  # add OPENAI_API_KEY, GOOGLE_API_KEY, HF_TOKEN
 ```
 
 ### 1. Download and prepare a task
@@ -93,7 +92,6 @@ python scripts/eval_local.py --model qwen3-8b --task banking77 --condition all
 
 # Frontier API models
 python scripts/eval_api.py --model gpt-4.1 --task banking77 --condition all
-python scripts/eval_api.py --model claude-sonnet-4 --task banking77
 python scripts/eval_api.py --model gpt-4.1-sft --task banking77  # triggers SFT job
 ```
 
