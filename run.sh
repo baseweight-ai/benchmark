@@ -113,23 +113,6 @@ fi
 
 step() { echo; echo "━━━ $* ━━━"; }
 
-# ---------------------------------------------------------------------------
-# Run manifest — experiment tracking (best-effort; errors are non-fatal)
-# ---------------------------------------------------------------------------
-RUN_ID=""
-
-_init_run_manifest() {
-    [[ -z "$PYTHON" ]] && return 0
-    RUN_ID=$("$PYTHON" "${SCRIPTS}/run_manifest_cli.py" init 2>/dev/null) || RUN_ID=""
-}
-
-_log_stage() {
-    local stage="$1"
-    [[ -z "$PYTHON" ]] && return 0
-    [[ -z "$RUN_ID" ]] && return 0
-    "$PYTHON" "${SCRIPTS}/run_manifest_cli.py" log-stage "$RUN_ID" "$stage" 2>/dev/null || true
-}
-
 # Fail fast if API steps require a key that isn't present.
 if [[ "$DO_TRAIN_API" == true ]] || [[ "$DO_EVAL_API" == true ]]; then
     step "API key check"
@@ -196,7 +179,6 @@ fi
 # In every other case the env must already exist.
 if [[ "$DO_SETUP" == false ]]; then
     _resolve_python
-    _init_run_manifest
 fi
 
 # ---------------------------------------------------------------------------
@@ -295,94 +277,35 @@ if [[ "$CLEAN" == true ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Run steps
+# Translate step flags → stages list, then delegate to Python DAG runner
 # ---------------------------------------------------------------------------
 if [[ "$DO_SETUP" == true ]]; then
     step "Setup"
     bash "${SCRIPTS}/setup.sh"
     _resolve_python   # env now exists (created or updated by setup.sh)
-    _init_run_manifest
-    _log_stage "setup"
 fi
 
+STAGES=""
+_add_stage() { STAGES="${STAGES:+${STAGES},}${1}"; }
+[[ "$DO_DOWNLOAD" == true ]]    && _add_stage "download"
+[[ "$DO_PREPARE" == true ]]     && _add_stage "prepare"
+[[ "$DO_TRAIN_LOCAL" == true ]] && _add_stage "train-local"
+[[ "$DO_TRAIN_API" == true ]]   && _add_stage "train-api"
+[[ "$DO_EVAL_LOCAL" == true ]]  && _add_stage "eval-local"
+[[ "$DO_EVAL_API" == true ]]    && _add_stage "eval-api"
+[[ "$DO_CLASSIFY" == true ]]    && _add_stage "classify"
+[[ "$DO_DASHBOARD" == true ]]   && _add_stage "dashboard"
 
-if [[ "$DO_DOWNLOAD" == true ]]; then
-    step "Download  (task=${TASK})"
-    $PYTHON "${SCRIPTS}/download_data.py" \
-        --task "$TASK" \
-        $SMOKE_FLAG \
-        $DRY_FLAG
-    _log_stage "download"
+if [[ -n "$STAGES" ]]; then
+    RUN_ARGS=(
+        "--stages" "$STAGES"
+        "--task"   "$TASK"
+        "--local-model" "$MODEL"
+    )
+    [[ -n "$MODEL_OVERRIDE" ]]  && RUN_ARGS+=("--api-model" "$MODEL_OVERRIDE")
+    [[ -n "$SMOKE_FLAG" ]]      && RUN_ARGS+=("$SMOKE_FLAG")
+    [[ -n "$DRY_FLAG" ]]        && RUN_ARGS+=("$DRY_FLAG")
+    [[ -n "$FORCE_FLAG" ]]      && RUN_ARGS+=("$FORCE_FLAG")
+
+    $PYTHON "${SCRIPTS}/run.py" "${RUN_ARGS[@]}"
 fi
-
-if [[ "$DO_PREPARE" == true ]]; then
-    step "Prepare  (task=${TASK})"
-    $PYTHON "${SCRIPTS}/prepare_datasets.py" \
-        --task "$TASK" \
-        $SMOKE_FLAG \
-        $DRY_FLAG
-    _log_stage "prepare"
-fi
-
-if [[ "$DO_TRAIN_LOCAL" == true ]]; then
-    step "Train  (model=${MODEL}, task=${TASK})"
-    $PYTHON "${SCRIPTS}/train_local.py" \
-        --task "$TASK" \
-        --model "$MODEL" \
-        $SMOKE_FLAG \
-        $DRY_FLAG
-    _log_stage "train-local"
-fi
-
-if [[ "$DO_TRAIN_API" == true ]]; then
-    API_MODEL="${MODEL_OVERRIDE:-all}"
-    step "Train API  (model=${API_MODEL}, task=${TASK})"
-    $PYTHON "${SCRIPTS}/train_api.py" \
-        --task "$TASK" \
-        --model "$API_MODEL" \
-        $SMOKE_FLAG \
-        $DRY_FLAG \
-        $FORCE_FLAG
-    _log_stage "train-api"
-fi
-
-if [[ "$DO_EVAL_LOCAL" == true ]]; then
-    step "Eval local  (model=${MODEL}, task=${TASK})"
-    $PYTHON "${SCRIPTS}/eval_local.py" \
-        --task "$TASK" \
-        --model "$MODEL" \
-        $SMOKE_FLAG \
-        $DRY_FLAG
-    _log_stage "eval-local"
-fi
-
-if [[ "$DO_EVAL_API" == true ]]; then
-    API_MODEL="${MODEL_OVERRIDE:-all}"
-    step "Eval API  (model=${API_MODEL}, task=${TASK})"
-    $PYTHON "${SCRIPTS}/eval_api.py" \
-        --task "$TASK" \
-        --model "$API_MODEL" \
-        $SMOKE_FLAG \
-        $DRY_FLAG
-    _log_stage "eval-api"
-fi
-
-if [[ "$DO_CLASSIFY" == true ]]; then
-    step "Classify errors  (task=${TASK})"
-    $PYTHON "${SCRIPTS}/classify_errors.py" \
-        --task "$TASK" \
-        $DRY_FLAG
-    _log_stage "classify"
-fi
-
-
-if [[ "$DO_DASHBOARD" == true ]]; then
-    step "Generate dashboard data"
-    $PYTHON "${SCRIPTS}/generate_dashboard_data.py" \
-        --out "${REPO_ROOT}/results/final/results.json" \
-        $DRY_FLAG
-    _log_stage "dashboard"
-fi
-
-echo
-echo "Done."

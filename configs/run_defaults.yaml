@@ -1,0 +1,27 @@
+tasks:
+  - all
+
+local_models:
+  - all
+
+api_models:
+  - all
+
+smoke_test: false
+dry_run: false
+force: false
+
+timeouts:
+  download_s: 1800
+  prepare_s: 1800
+  train_local_s: 43200   # 12 h
+  train_api_s: 43200     # 12 h
+  eval_local_s: 7200     # 2 h
+  eval_api_s: 3600       # 1 h
+  classify_s: 1800
+  dashboard_s: 300
+
+cost_caps:
+  train_api_usd: 100.0
+  eval_api_usd: 50.0
+  total_usd: 200.0
