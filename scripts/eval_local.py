@@ -21,15 +21,17 @@ from pydantic import BaseModel, Field
 
 from checkpoint_utils import append_jsonl, atomic_write_json, finalize_partial, load_partial_ids, partial_path
 from utils import build_messages, load_jsonl
+from pipeline.config import get_local_models, get_tasks
+from pipeline.paths import adapter_path, pred_path
+from pipeline.providers import call_vllm  # noqa: F401  # re-exported for test patching
 
 REPO_ROOT = Path(__file__).parent.parent
 load_dotenv(REPO_ROOT / ".env")
 
-ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa"]
-ALL_MODELS = ["qwen3-8b", "gemma3-4b", "phi4-mini"]
+ALL_TASKS: list[str] = get_tasks()
+ALL_MODELS: list[str] = [m["id"] for m in get_local_models()]
 
 MAX_CONCURRENCY = 4
-MAX_RETRIES = 3
 VLLM_HOST = "http://localhost:8000"
 VLLM_HEALTH_TIMEOUT_GPU = 300
 VLLM_HEALTH_TIMEOUT_SMOKE = 300
@@ -85,10 +87,7 @@ def load_test_rows(task_id: str, smoke_test: bool) -> list[dict]:
 
 
 def _pred_path(model_short: str, task_id: str, condition: str) -> Path:
-    return (
-        REPO_ROOT / "results" / "predictions" / "local"
-        / model_short / task_id / f"{condition}.jsonl"
-    )
+    return pred_path(REPO_ROOT, "local", model_short, task_id, condition)
 
 
 def get_few_shot(task_id: str, model_short: str, smoke_test: bool) -> list[dict]:
@@ -134,11 +133,18 @@ def _check_vllm_package() -> None:
 
 def start_vllm_server(
     base_model: str,
-    adapter_path: Optional[Path],
+    lora_modules: dict[str, Path],
     max_seq_length: int,
     enable_thinking: Optional[bool] = None,
     vllm_task: str = "auto",
+    smoke_test: bool = False,
 ) -> subprocess.Popen:
+    """Start a vLLM server.
+
+    lora_modules maps adapter name → adapter path. All adapters are loaded at
+    startup so the server handles base-model and all LoRA requests without
+    restarts. Pass an empty dict for base-model-only eval.
+    """
     # Kill any lingering vLLM processes (server + engine subprocess) to avoid
     # orphaned GPU contexts causing OOM on the next run
     killed = any(
@@ -151,25 +157,29 @@ def start_vllm_server(
     env = os.environ.copy()
     env["VLLM_LOGGING_LEVEL"] = "DEBUG"
 
+    dtype = "float32" if smoke_test else "bfloat16"
+    gpu_mem_util = "0.2" if smoke_test else "0.9"
+
     _check_vllm_package()
     cmd = [
         sys.executable, "-m", "vllm.entrypoints.openai.api_server",
         "--model", base_model,
         "--task", vllm_task,
-        "--dtype", "auto",
+        "--dtype", dtype,
         "--max-model-len", str(max_seq_length),
         "--port", "8000",
-        "--gpu-memory-utilization", "0.9",
+        "--gpu-memory-utilization", gpu_mem_util,
         "--swap-space", "0",
         "--max-num-seqs", str(MAX_CONCURRENCY * 2),
     ]
+    if smoke_test:
+        cmd += ["--enforce-eager"]
     if enable_thinking is False:
         cmd += ["--default-chat-template-kwargs", '{"enable_thinking": false}']
-    if adapter_path and adapter_path.exists():
-        cmd += [
-            "--enable-lora",
-            "--lora-modules", f"adapter={adapter_path}",
-        ]
+    if lora_modules:
+        cmd += ["--enable-lora", "--max-loras", str(len(lora_modules))]
+        for name, path in lora_modules.items():
+            cmd += ["--lora-modules", f"{name}={path}"]
 
     click.echo(f"  Starting vLLM: {' '.join(cmd)}")
     proc = subprocess.Popen(
@@ -221,82 +231,18 @@ async def wait_for_vllm(proc: subprocess.Popen, timeout: int = VLLM_HEALTH_TIMEO
     return False
 
 
-async def call_vllm(
-    session: "aiohttp.ClientSession",
-    model_name: str,
-    messages: list[dict],
-    max_tokens: int,
-    semaphore: asyncio.Semaphore,
-) -> tuple[str, int, int, float, float]:
-    """Stream one request. Returns (text, in_tokens, out_tokens, latency_ms, ttft_ms)."""
-    import aiohttp
-
-    payload = {
-        "model": model_name,
-        "messages": messages,
-        "temperature": 0,
-        "max_tokens": max_tokens,
-        "stream": True,
-        "stream_options": {"include_usage": True},
-    }
-
-    async with semaphore:
-        for attempt in range(MAX_RETRIES):
-            try:
-                t0 = time.time()
-                ttft_ms = 0.0
-                chunks: list[str] = []
-                first_token = True
-                in_tok = out_tok = 0
-
-                async with session.post(
-                    f"{VLLM_HOST}/v1/chat/completions",
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=300),
-                ) as resp:
-                    resp.raise_for_status()
-                    async for raw_line in resp.content:
-                        line = raw_line.decode("utf-8").strip()
-                        if not line.startswith("data:"):
-                            continue
-                        data_str = line[5:].strip()
-                        if data_str == "[DONE]":
-                            break
-                        try:
-                            data = json.loads(data_str)
-                        except json.JSONDecodeError:
-                            continue
-                        usage = data.get("usage") or {}
-                        if usage.get("prompt_tokens"):
-                            in_tok = usage["prompt_tokens"]
-                        if usage.get("completion_tokens"):
-                            out_tok = usage["completion_tokens"]
-                        content = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                        if content:
-                            if first_token:
-                                ttft_ms = (time.time() - t0) * 1000
-                                first_token = False
-                            chunks.append(content)
-
-                return "".join(chunks), in_tok, out_tok, (time.time() - t0) * 1000, ttft_ms
-
-            except Exception:
-                if attempt == MAX_RETRIES - 1:
-                    raise
-                await asyncio.sleep(2 ** attempt)
-    return "", 0, 0, 0.0, 0.0
-
-
-
 async def run_eval(
     model_cfg: ModelConfig,
     task_id: str,
     condition: str,
     task_cfg: TaskConfig,
-    adapter_path: Optional[Path],
+    model_name: str,
     dry_run: bool,
     smoke_test: bool = False,
 ) -> None:
+    """Run eval for one (task, condition). model_name is passed directly to vLLM:
+    use model_cfg.model_id for base conditions, 'adapter_{task_id}' for LoRA.
+    """
     import aiohttp
 
     test_path = get_test_path(task_id, smoke_test)
@@ -332,7 +278,6 @@ async def run_eval(
         click.echo(f"  All {len(test_rows)} rows complete, finalized to {out_path.relative_to(REPO_ROOT)}")
         return
 
-    model_name = "adapter" if adapter_path and adapter_path.exists() else model_cfg.model_id
     semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 
     async def process_row(row: dict, session: "aiohttp.ClientSession") -> None:
@@ -385,96 +330,99 @@ async def run_eval(
 @click.option("--dry-run", is_flag=True, help="Validate without running inference")
 @click.option("--smoke-test", is_flag=True, help="Use smoke test data and model; mirrors train_local.py --smoke-test")
 def main(model: Optional[str], task: str, condition: str, dry_run: bool, smoke_test: bool) -> None:
-    """Evaluate local fine-tuned models via vLLM server."""
+    """Evaluate local fine-tuned models via vLLM server.
+
+    Starts one vLLM server per model with all available LoRA adapters loaded
+    upfront, eliminating per-task server restarts. Zero-shot, 5-shot, and all
+    LoRA conditions are served from the same running instance.
+    """
     if model is None:
         model = "qwen2.5-0.5b" if smoke_test else "qwen3-8b"
     model_ids = ALL_MODELS if model == "all" else [model]
     task_ids = ALL_TASKS if task == "all" else [task]
+    conditions = ["zero-shot", "5-shot", "lora"] if condition == "all" else [condition]
 
     failures = []
-    health_timeout = _vllm_health_timeout(smoke_test)
 
     for mid in model_ids:
         model_cfg = load_model_config(mid)
 
-        conditions = ["zero-shot", "5-shot", "lora"] if condition == "all" else [condition]
-
-        base_conditions = [c for c in conditions if c in ("zero-shot", "5-shot")]
-        lora_conditions = [c for c in conditions if c == "lora"]
-
+        # Pre-load all task configs so we can compute seq_len and detect errors early.
+        task_cfgs: dict[str, TaskConfig] = {}
         for tid in task_ids:
             try:
-                task_cfg = load_task_config(tid)
+                task_cfgs[tid] = load_task_config(tid)
             except Exception as exc:
                 click.echo(f"  ERROR: could not load task config for {tid}: {exc}", err=True)
                 failures.append((f"{mid}/{tid}", str(exc)))
-                continue
 
-            # model_cfg.max_seq_length is a training cap (e.g. 256 for smoke test).
-            # For eval the vLLM server needs room for both the prompt and the
-            # full output budget, so floor at max_output_tokens + 512.
-            seq_len = max(
-                task_cfg.max_seq_length or model_cfg.max_seq_length,
-                task_cfg.max_output_tokens + 512,
-            )
+        if not task_cfgs:
+            continue
 
-            # --- Base model (zero-shot, 5-shot) ---
-            if base_conditions:
-                if dry_run:
-                    for cond in base_conditions:
-                        asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, None, dry_run=True, smoke_test=smoke_test))
+        # Compute max seq_len across all tasks so one server covers every prompt.
+        # model_cfg.max_seq_length is a training cap; floor at max_output_tokens+512
+        # so there's always room for both prompt and full output budget.
+        seq_len = max(
+            max(tc.max_seq_length or model_cfg.max_seq_length, tc.max_output_tokens + 512)
+            for tc in task_cfgs.values()
+        )
+
+        # Collect LoRA adapters that exist on disk.
+        lora_modules: dict[str, Path] = {}
+        if "lora" in conditions:
+            for tid in task_cfgs:
+                ap = adapter_path(REPO_ROOT, model_cfg.model_short, tid, "lora")
+                if ap.exists():
+                    lora_modules[f"adapter_{tid}"] = ap
                 else:
-                    pending_base = [c for c in base_conditions if not _pred_path(model_cfg.model_short, tid, c).exists()]
-                    if not pending_base:
-                        click.echo(f"  SKIP [{mid}/{tid}]: all base conditions already complete")
-                    else:
-                        proc = start_vllm_server(
-                            model_cfg.model_id, None, seq_len, model_cfg.enable_thinking, model_cfg.vllm_task
-                        )
-                        try:
-                            ready = asyncio.run(wait_for_vllm(proc, timeout=health_timeout))
-                            if not ready:
-                                raise RuntimeError("vLLM server did not become ready in time")
-                            for cond in pending_base:
-                                try:
-                                    asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, None, dry_run=False, smoke_test=smoke_test))
-                                except Exception as exc:
-                                    click.echo(f"  ERROR [{mid}/{tid}/{cond}]: {exc}", err=True)
-                                    failures.append((f"{mid}/{tid}/{cond}", str(exc)))
-                        finally:
-                            stop_vllm_server(proc)
+                    click.echo(f"  SKIP [{mid}/{tid}/lora]: adapter not found at {ap}")
 
-            # --- LoRA adapter ---
-            for cond in lora_conditions:
-                adapter_path = (
-                    REPO_ROOT / "results" / "adapters" / "local" / model_cfg.model_short / tid / cond
-                )
-                if not adapter_path.exists():
-                    click.echo(f"  SKIP [{mid}/{tid}/{cond}]: adapter not found at {adapter_path}")
-                    continue
-
+        # Build the full work list, checking idempotency up front.
+        pending: list[tuple[str, str, TaskConfig, str]] = []
+        for tid, task_cfg in task_cfgs.items():
+            for cond in conditions:
+                if cond == "lora" and f"adapter_{tid}" not in lora_modules:
+                    continue  # already reported above
+                model_name = f"adapter_{tid}" if cond == "lora" else model_cfg.model_id
                 if not dry_run and _pred_path(model_cfg.model_short, tid, cond).exists():
                     click.echo(f"  SKIP [{mid}/{tid}/{cond}]: already complete")
                     continue
+                pending.append((tid, cond, task_cfg, model_name))
 
-                if dry_run:
-                    asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, adapter_path, dry_run=True, smoke_test=smoke_test))
-                    continue
-
-                proc = start_vllm_server(
-                    model_cfg.model_id, adapter_path, seq_len, model_cfg.enable_thinking, model_cfg.vllm_task
-                )
-                health_timeout = _vllm_health_timeout(smoke_test)
+        if dry_run:
+            for tid, cond, task_cfg, model_name in pending:
                 try:
-                    ready = asyncio.run(wait_for_vllm(proc, timeout=health_timeout))
-                    if not ready:
-                        raise RuntimeError("vLLM server did not become ready in time")
-                    asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, adapter_path, dry_run=False, smoke_test=smoke_test))
+                    asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, model_name, dry_run=True, smoke_test=smoke_test))
                 except Exception as exc:
                     click.echo(f"  ERROR [{mid}/{tid}/{cond}]: {exc}", err=True)
                     failures.append((f"{mid}/{tid}/{cond}", str(exc)))
-                finally:
-                    stop_vllm_server(proc)
+            continue
+
+        if not pending:
+            click.echo(f"  SKIP [{mid}]: all conditions already complete")
+            continue
+
+        # Start one server for ALL tasks and conditions of this model.
+        # Base-model requests use model_cfg.model_id; LoRA requests use adapter_{tid}.
+        proc = start_vllm_server(
+            model_cfg.model_id, lora_modules, seq_len,
+            model_cfg.enable_thinking, model_cfg.vllm_task, smoke_test,
+        )
+        try:
+            ready = asyncio.run(wait_for_vllm(proc, timeout=_vllm_health_timeout(smoke_test)))
+            if not ready:
+                raise RuntimeError("vLLM server did not become ready in time")
+            for tid, cond, task_cfg, model_name in pending:
+                try:
+                    asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, model_name, dry_run=False, smoke_test=smoke_test))
+                except Exception as exc:
+                    click.echo(f"  ERROR [{mid}/{tid}/{cond}]: {exc}", err=True)
+                    failures.append((f"{mid}/{tid}/{cond}", str(exc)))
+        except Exception as exc:
+            click.echo(f"  ERROR [{mid}]: {exc}", err=True)
+            failures.append((mid, str(exc)))
+        finally:
+            stop_vllm_server(proc)
 
     if failures:
         click.echo(f"\nFAILED ({len(failures)}):")

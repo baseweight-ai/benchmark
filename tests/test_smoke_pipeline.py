@@ -33,7 +33,7 @@ REPO_ROOT = Path(__file__).parent.parent
 # ── Toy fixtures ───────────────────────────────────────────────────────────────
 
 TASK_ID = "fpb"
-MODEL_ID = "gpt-4.1"
+MODEL_ID = "gpt-4.1-nano"
 CONDITION = "zero-shot"
 N = 8  # toy dataset size
 
@@ -110,7 +110,7 @@ def _stage_eval(root: Path) -> Path:
     async def counting_call(client, model_str, messages, max_tokens, semaphore):
         label = labels[call_count[0] % 3]
         call_count[0] += 1
-        return label, 100, 10, 120.0
+        return label, 100, 10, 120.0, 50.0
 
     from eval_api import TaskConfig as TC
     cfg = TC(task_id=TASK_ID, max_output_tokens=32, task_type="classification")
@@ -119,7 +119,7 @@ def _stage_eval(root: Path) -> Path:
         with patch("openai.AsyncOpenAI", return_value=None):
             asyncio.run(run_eval_patched(MODEL_ID, TASK_ID, CONDITION, cfg, root))
 
-    out = root / "results" / "predictions" / MODEL_ID / TASK_ID / f"{CONDITION}.jsonl"
+    out = root / "results" / "predictions" / "api" / MODEL_ID / TASK_ID / f"{CONDITION}.jsonl"
     return out
 
 
@@ -142,11 +142,11 @@ def _stage_classify(root: Path) -> Path:
     try:
         cfg = ce.load_task_config(TASK_ID)
         valid_labels = ce.get_valid_labels(TASK_ID)
-        ce.process_model_task_condition(MODEL_ID, TASK_ID, CONDITION, cfg, valid_labels, dry_run=False)
+        ce.process_model_task_condition(MODEL_ID, TASK_ID, CONDITION, cfg, valid_labels, dry_run=False, source="api")
     finally:
         ce.REPO_ROOT = original
 
-    return root / "results" / "summaries" / MODEL_ID / TASK_ID / f"{CONDITION}.json"
+    return root / "results" / "summaries" / "api" / MODEL_ID / TASK_ID / f"{CONDITION}.json"
 
 
 def _stage_dashboard(root: Path) -> Path:
@@ -196,7 +196,7 @@ def test_smoke_pipeline(tmp_path, monkeypatch):
     assert 0.0 <= summary["metric_value"] <= 1.0
     assert sum(summary["error_counts"].values()) == N
 
-    classified_path = tmp_path / "results" / "classified" / MODEL_ID / TASK_ID / f"{CONDITION}.jsonl"
+    classified_path = tmp_path / "results" / "classified" / "api" / MODEL_ID / TASK_ID / f"{CONDITION}.jsonl"
     assert classified_path.exists()
     classified_rows = [json.loads(l) for l in classified_path.read_text().splitlines()]
     assert len(classified_rows) == N
@@ -208,18 +208,19 @@ def test_smoke_pipeline(tmp_path, monkeypatch):
     data = json.loads(results_path.read_text())
     assert "results" in data
     assert "generated_at" in data
-    assert "headline_stats" in data
-    assert "total_cost" in data
     assert "tasks_won_by_oss" in data
-    assert isinstance(data["total_cost"], (int, float))
+    assert "comparisons" in data
+    assert "cost_summary" in data
     assert isinstance(data["tasks_won_by_oss"], int)
+    assert isinstance(data["cost_summary"], dict)
     assert isinstance(data["results"], list)
     assert len(data["results"]) > 0
 
-    # The fpb/gpt-4.1/zero-shot result should have our metric value
+    # The fpb/gpt-4.1-nano/zero-shot result should have our metric value.
+    # results use display labels ("Zero-shot"), not raw condition slugs.
     matching = [
         r for r in data["results"]
-        if r["model_id"] == MODEL_ID and r["task_id"] == TASK_ID and r["condition"] == CONDITION
+        if r["model_id"] == MODEL_ID and r["task_id"] == TASK_ID
     ]
     assert len(matching) == 1
     assert matching[0]["metric_value"] == pytest.approx(summary["metric_value"], rel=1e-4)

@@ -1,7 +1,12 @@
-"""Inject stub modules for openai/aiohttp/tqdm so API tests run without those packages."""
+"""Inject stub modules for openai/aiohttp/tqdm so API tests run without those packages.
+
+If a package is already installed, the real module is used and these stubs are no-ops.
+Tests that need to prevent real API calls use explicit patch() context managers.
+"""
 from __future__ import annotations
 
 import asyncio
+import importlib
 import sys
 from unittest.mock import MagicMock
 
@@ -12,7 +17,10 @@ async def _tqdm_gather(*coros, desc=None, **kwargs):
 
 for _name in ("openai", "aiohttp"):
     if _name not in sys.modules:
-        sys.modules[_name] = MagicMock()
+        try:
+            importlib.import_module(_name)
+        except ImportError:
+            sys.modules[_name] = MagicMock()
 
 if "tqdm" not in sys.modules:
     _tqdm_stub = MagicMock()

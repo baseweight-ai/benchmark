@@ -14,11 +14,15 @@ import click
 import yaml
 from pydantic import BaseModel, Field
 
+import hashlib
+
 from checkpoint_utils import nv_prepared_dir
+from pipeline.config import get_tasks
+from pipeline.paths import prompt_path
 
 REPO_ROOT = Path(__file__).parent.parent
 SEED = 42
-ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa"]
+ALL_TASKS: list[str] = get_tasks()
 
 SMOKE_TRAIN_N = 20
 SMOKE_TEST_N = 10
@@ -53,10 +57,11 @@ def load_task_config(task_id: str) -> TaskConfig:
     return TaskConfig(**{k: v for k, v in data.items() if k in TaskConfig.model_fields})
 
 
-def load_prompt(task_id: str) -> dict:
-    path = REPO_ROOT / "prompts" / f"{task_id}.json"
-    with open(path) as f:
-        return json.load(f)
+def load_prompt(task_id: str) -> tuple[dict, str]:
+    """Return (prompt_dict, sha256[:16]) for reproducible prompt versioning."""
+    raw = prompt_path(REPO_ROOT, task_id).read_bytes()
+    sha = hashlib.sha256(raw).hexdigest()[:16]
+    return json.loads(raw), sha
 
 
 # ── Formatting helpers ─────────────────────────────────────────────────────
@@ -157,7 +162,7 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
         click.echo(f"  [dry-run] Would process {cfg.task_id}")
         return
 
-    prompt = load_prompt(cfg.task_id)
+    prompt, prompt_sha = load_prompt(cfg.task_id)
     system = prompt["system"]
     ds = load_from_disk(str(raw_dir))
 
@@ -278,6 +283,9 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
         write_jsonl(fmt_test_prompts(test_rows), out_dir / "test.jsonl")
         write_jsonl(fmt_labels(test_rows), out_dir / "test_labels.jsonl")
         click.echo(f"  [{cfg.task_id}] Done — {len(test_rows)} test, {len(train_rows)} train")
+
+    # Prompt versioning sidecar — records which prompt produced this prepared data.
+    (out_dir / "prompt_sha.txt").write_text(prompt_sha + "\n")
 
     if os.environ.get("NETWORK_VOLUME"):
         nv_dir = nv_prepared_dir(cfg.task_id)

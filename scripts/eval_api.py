@@ -17,30 +17,22 @@ from pydantic import BaseModel, Field
 
 from checkpoint_utils import append_jsonl, finalize_partial, load_partial_ids, partial_path
 from utils import build_messages, load_jsonl
+from pipeline.config import get_model_conditions, get_openai_models, get_tasks
+from pipeline.paths import pred_path, training_meta_path
+from pipeline.providers import call_openai  # noqa: F401  # re-exported for test patching
 
 REPO_ROOT = Path(__file__).parent.parent
 load_dotenv(REPO_ROOT / ".env")
 
-ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa"]
-
-OPENAI_MODELS: dict[str, Optional[str]] = {
-    "gpt-4.1-nano": "gpt-4.1-nano-2025-04-14",
-    "gpt-5.4-mini": "gpt-5.4-mini",
-    "gpt-5.5":      "gpt-5.5",
-}
-
-MODEL_CONDITIONS: dict[str, list[str]] = {
-    "gpt-4.1-nano": ["zero-shot", "5-shot", "api-sft"],
-    "gpt-5.4-mini": ["zero-shot", "api-sft"],
-    "gpt-5.5":      ["5-shot"],
-}
+ALL_TASKS: list[str] = get_tasks()
+OPENAI_MODELS: dict[str, Optional[str]] = get_openai_models()
+MODEL_CONDITIONS: dict[str, list[str]] = get_model_conditions()
 
 SMOKE_MODELS = ["gpt-4.1-nano"]
-PROD_MODELS  = ["gpt-5.4-mini", "gpt-5.5"]
+PROD_MODELS  = ["gpt-4.1-mini", "gpt-5.5"]
 ALL_API_MODELS = SMOKE_MODELS + PROD_MODELS
 
 MAX_CONCURRENCY = 5
-MAX_RETRIES = 5
 
 
 class TaskConfig(BaseModel):
@@ -56,52 +48,65 @@ def load_task_config(task_id: str) -> TaskConfig:
     return TaskConfig(**{k: v for k, v in data.items() if k in TaskConfig.model_fields})
 
 
-def _load_sft_model_id(model_id: str, task_id: str) -> Optional[str]:
-    """Return the fine-tuned model ID from training metadata, or None if not trained."""
-    meta_path = REPO_ROOT / "results" / "training" / "api" / model_id / task_id / "api-sft" / "metadata.json"
-    if not meta_path.exists():
+async def _load_sft_model_id(model_id: str, task_id: str) -> Optional[str]:
+    """Return the fine-tuned model ID from training metadata.
+
+    If the job is still pending (submitted via --submit-only), polls OpenAI until
+    it completes and updates metadata.json with the final ft_model_id.
+    Returns None if not trained or if the job fails.
+    """
+    mp = training_meta_path(REPO_ROOT, "api", model_id, task_id, "api-sft")
+    if not mp.exists():
         return None
-    with open(meta_path) as f:
-        return json.load(f).get("ft_model_id")
+    with open(mp) as f:
+        meta = json.load(f)
 
+    ft_model_id = meta.get("ft_model_id")
+    if ft_model_id:
+        return ft_model_id
 
-async def call_openai(
-    client, model_str: str, messages: list[dict], max_tokens: int, semaphore: asyncio.Semaphore
-) -> tuple[str, int, int, float, float]:
-    """Stream one request. Returns (text, in_tokens, out_tokens, latency_ms, ttft_ms)."""
-    async with semaphore:
-        for attempt in range(MAX_RETRIES):
-            try:
-                t0 = time.time()
-                ttft_ms = 0.0
-                first_token = True
-                chunks: list[str] = []
-                in_tok = out_tok = 0
+    job_id = meta.get("job_id")
+    if not job_id:
+        return None
 
-                stream = await client.chat.completions.create(
-                    model=model_str, messages=messages, temperature=0, max_tokens=max_tokens,
-                    stream=True, stream_options={"include_usage": True},
-                )
-                async for chunk in stream:
-                    if chunk.usage:
-                        in_tok = chunk.usage.prompt_tokens
-                        out_tok = chunk.usage.completion_tokens
-                    if not chunk.choices:
-                        continue
-                    content = chunk.choices[0].delta.content or ""
-                    if content:
-                        if first_token:
-                            ttft_ms = (time.time() - t0) * 1000
-                            first_token = False
-                        chunks.append(content)
+    from openai import OpenAI
+    from checkpoint_utils import atomic_write_json
+    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    key = f"{model_id}/{task_id}/api-sft"
+    click.echo(f"  [{key}] Training job {job_id} still pending, waiting for completion...")
 
-                return "".join(chunks), in_tok, out_tok, (time.time() - t0) * 1000, ttft_ms
+    poll_start = last_log = time.time()
+    while True:
+        job = client.fine_tuning.jobs.retrieve(job_id)
+        if job.status == "succeeded":
+            with open(REPO_ROOT / "configs" / "pricing.yaml") as f:
+                pricing = yaml.safe_load(f)
+            training_per_m = pricing.get("apis", {}).get(model_id, {}).get("training_per_m", 25.0)
+            trained_tokens = job.trained_tokens or 0
+            training_time_min = (
+                round((job.finished_at - job.created_at) / 60, 1)
+                if job.finished_at and job.created_at else None
+            )
+            updated = {
+                "ft_model_id": job.fine_tuned_model,
+                "job_id": job_id,
+                "trained_tokens": trained_tokens,
+                "training_cost": trained_tokens * training_per_m / 1_000_000,
+                "training_time_min": training_time_min,
+                "n_train": meta.get("n_train", 0),
+            }
+            atomic_write_json(updated, mp)
+            click.echo(f"  [{key}] Training complete → {job.fine_tuned_model}")
+            return job.fine_tuned_model
+        elif job.status in ("failed", "cancelled"):
+            click.echo(f"  [{key}] Training job ended with status: {job.status}", err=True)
+            return None
 
-            except Exception:
-                if attempt == MAX_RETRIES - 1:
-                    raise
-                await asyncio.sleep(2 ** attempt)
-    return "", 0, 0, 0, 0.0
+        now = time.time()
+        if now - last_log >= 60:
+            click.echo(f"  [{key}/{job.status}] waiting... ({int(now - poll_start)}s elapsed)")
+            last_log = now
+        await asyncio.sleep(15)
 
 
 async def run_eval(
@@ -133,7 +138,7 @@ async def run_eval(
     # Never mutate the module-level OPENAI_MODELS dict; keep model_str local so
     # different tasks in the same run each get the right ft model.
     if condition == "api-sft":
-        model_str = _load_sft_model_id(model_id, task_id)
+        model_str = await _load_sft_model_id(model_id, task_id)
         if not model_str:
             click.echo(f"  SKIP [{model_id}/{task_id}/api-sft]: no training metadata — run train_api.py first")
             return
@@ -146,7 +151,7 @@ async def run_eval(
         click.echo(f"  [dry-run] Would eval {model_id} on {task_id}/{condition} ({len(test_rows)} examples)")
         return
 
-    out_path = REPO_ROOT / "results" / "predictions" / "api" / model_id / task_id / f"{condition}.jsonl"
+    out_path = pred_path(REPO_ROOT, "api", model_id, task_id, condition)
     if out_path.exists():
         click.echo(f"  SKIP [{model_id}/{task_id}/{condition}]: already exists")
         return

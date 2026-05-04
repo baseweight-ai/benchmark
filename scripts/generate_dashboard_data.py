@@ -313,12 +313,12 @@ def _comparison(results: list[dict], fine_family: str, fine_cond: str, base_fami
         if r["family"] == fine_family and r["condition"] == fine_cond:
             if mv > best_fine.get(tid, -1):
                 best_fine[tid] = mv
-            if r["cost_per_1k_correct"] is not None:
+            if r.get("cost_per_1k_correct") is not None:
                 fine_cp1k.setdefault(tid, []).append(r["cost_per_1k_correct"])
         if r["family"] == base_family and r["condition"] == base_cond:
             if mv > best_base.get(tid, -1):
                 best_base[tid] = mv
-            if r["cost_per_1k_correct"] is not None:
+            if r.get("cost_per_1k_correct") is not None:
                 base_cp1k.setdefault(tid, []).append(r["cost_per_1k_correct"])
 
     shared_tasks = sorted(set(best_fine) & set(best_base))

@@ -42,10 +42,13 @@ from checkpoint_utils import (
     training_log,
 )
 from utils import write_jsonl
+from pipeline.config import get_local_models, get_tasks
+from pipeline.paths import adapter_path, training_meta_path
+from pipeline.versioning import git_sha as _git_sha
 
 REPO_ROOT = Path(__file__).parent.parent
-ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa"]
-ALL_MODELS = ["qwen3-8b"]
+ALL_TASKS: list[str] = get_tasks()
+ALL_MODELS: list[str] = [m["id"] for m in get_local_models()]
 GPU_HOURLY = 0.49  # Default GPU hourly rate — override via pricing.yaml
 CONDITION = "lora"
 
@@ -166,10 +169,19 @@ class ConfigFactory:
             lora_rank=model_cfg.lora.get("rank", 16),
             lora_alpha=model_cfg.lora.get("alpha", 32),
             seq_len=base_seq,
-            sft_extra={},
+            sft_extra={"save_strategy": "steps", "save_steps": 250, "save_total_limit": 3},
         )
         if smoke_test:
-            cfg = dc_replace(cfg, lora_rank=4, lora_alpha=8, seq_len=256, load_in_4bit=False)
+            cfg = dc_replace(
+                cfg,
+                load_dtype=torch.float32,
+                load_in_4bit=False,
+                use_grad_ckpt=False,
+                lora_rank=4,
+                lora_alpha=8,
+                seq_len=256,
+                sft_extra={"bf16": False, "save_strategy": "no"},
+            )
         return cfg
 
 
@@ -369,6 +381,7 @@ def run_training_task(
         "train_loss": train_loss,
         "model_used": model_id,
         "substituted": substituted,
+        "git_sha": _git_sha(),
     }
     atomic_write_json(meta, log_dir / "metadata.json")
     atomic_write_json(meta, ckpt_dir / "metadata.json")
@@ -416,8 +429,8 @@ def train_one(
     n_train = count_jsonl(data_path)
     hw_cfg = ConfigFactory.build(model_cfg, task_cfg, smoke_test)
 
-    adapter_dir = REPO_ROOT / "results" / "adapters" / "local" / model_cfg.model_short / task_id / CONDITION
-    log_dir = REPO_ROOT / "results" / "training" / "local" / model_cfg.model_short / task_id / CONDITION
+    adapter_dir = adapter_path(REPO_ROOT, model_cfg.model_short, task_id, CONDITION)
+    log_dir = training_meta_path(REPO_ROOT, "local", model_cfg.model_short, task_id, CONDITION).parent
     ckpt_dir = checkpoint_dir(model_cfg.model_short, task_id, CONDITION)
     adapter_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)

@@ -28,10 +28,10 @@ if [[ -f "$STAMP_FILE" ]] && [[ "$(cat "$STAMP_FILE")" == "$_ENV_HASH" ]] && [[ 
 else
     if [[ "$_ENV_EXISTS" == true ]]; then
         echo "Updating conda env ${CONDA_ENV}..."
-        conda env update -n "$CONDA_ENV" -f "${ENV_YML}" --prune -q
+        conda env update -n "$CONDA_ENV" -f "${ENV_YML}" --prune
     else
         echo "Creating conda env ${CONDA_ENV}..."
-        conda env create -n "$CONDA_ENV" -f "${ENV_YML}" -q
+        conda env create -n "$CONDA_ENV" -f "${ENV_YML}"
     fi
     conda activate "$CONDA_ENV"
     # torchao conflicts with torch==2.5.1 (torch.int1 missing); unsloth doesn't need it
@@ -40,7 +40,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Verification
+# Verification (always runs — catches broken envs even on cache-hit)
 # ---------------------------------------------------------------------------
 echo "Verifying install..."
 python - <<'PYEOF'
@@ -79,4 +79,26 @@ else:
 PYEOF
 
 echo ""
+
+# ---------------------------------------------------------------------------
+# API key check
+# ---------------------------------------------------------------------------
+_api_key="${OPENAI_API_KEY:-}"
+if [[ -z "$_api_key" ]] && [[ -f "$ENV_FILE" ]]; then
+    _api_key=$(grep -E "^OPENAI_API_KEY=" "$ENV_FILE" | tail -1 | cut -d= -f2- || true)
+fi
+if [[ -z "$_api_key" ]]; then
+    echo "  WARN  OPENAI_API_KEY not set — add it to ${ENV_FILE} before running eval-api or train-api"
+elif [[ "$_api_key" == "sk-..." ]] || [[ ${#_api_key} -lt 20 ]]; then
+    echo "  WARN  OPENAI_API_KEY looks like a placeholder — set a real key in ${ENV_FILE}"
+else
+    echo "  OK    OPENAI_API_KEY  ${_api_key:0:12}…  (${#_api_key} chars)"
+fi
+
+# ---------------------------------------------------------------------------
+# Lock file — reproducible environment snapshot
+# ---------------------------------------------------------------------------
+conda env export -n "${CONDA_ENV}" > "${REPO_ROOT}/environment.lock.yml"
+echo "  Lock file written to environment.lock.yml"
+
 echo "=== Setup complete ==="

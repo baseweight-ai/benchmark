@@ -13,9 +13,11 @@ from pydantic import BaseModel, Field
 
 from checkpoint_utils import atomic_write_json
 from utils import load_jsonl, write_jsonl as _write_jsonl
+from pipeline.config import get_tasks
+from pipeline.paths import classified_path, pred_path, summary_path
 
 REPO_ROOT = Path(__file__).parent.parent
-ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa"]
+ALL_TASKS: list[str] = get_tasks()
 
 
 class TaskConfig(BaseModel):
@@ -204,10 +206,6 @@ def classify_predictions(
     return classified, dict(counts)
 
 
-def _result_path(base: str, source: str, model_short: str, task_id: str, filename: str) -> Path:
-    return REPO_ROOT / "results" / base / source / model_short / task_id / filename
-
-
 def process_model_task_condition(
     model_short: str,
     task_id: str,
@@ -218,12 +216,12 @@ def process_model_task_condition(
     source: str = "local",
 ) -> Optional[dict]:
     """Classify one predictions file and write summary."""
-    pred_path = _result_path("predictions", source, model_short, task_id, f"{condition}.jsonl")
+    input_path = pred_path(REPO_ROOT, source, model_short, task_id, condition)
     label = f"{source}/{model_short}/{task_id}/{condition}"
-    if not pred_path.exists():
+    if not input_path.exists():
         return None
 
-    predictions = load_jsonl(pred_path)
+    predictions = load_jsonl(input_path)
     if not predictions:
         click.echo(f"  SKIP [{label}]: empty predictions file")
         return None
@@ -234,8 +232,8 @@ def process_model_task_condition(
 
     classified, counts = classify_predictions(predictions, task_cfg, valid_labels)
 
-    classified_path = _result_path("classified", source, model_short, task_id, f"{condition}.jsonl")
-    _write_jsonl(classified, classified_path)
+    classified_out = classified_path(REPO_ROOT, source, model_short, task_id, condition)
+    _write_jsonl(classified, classified_out)
 
     metric_value = compute_metric(task_cfg, classified)
 
@@ -251,7 +249,7 @@ def process_model_task_condition(
     # Wall time: prefer the sidecar written by eval_local.py (vLLM batch processing
     # collapses per-row timestamps to the same millisecond, making the span useless).
     # Fall back to timestamp-derived span for API predictions which lack a sidecar.
-    wall_sidecar = pred_path.with_suffix(".wall.json")
+    wall_sidecar = input_path.with_suffix(".wall.json")
     eval_wall_time_s = None
     try:
         with open(wall_sidecar) as _wf:
@@ -282,8 +280,8 @@ def process_model_task_condition(
         "eval_wall_time_s": eval_wall_time_s,
     }
 
-    summary_path = _result_path("summaries", source, model_short, task_id, f"{condition}.json")
-    atomic_write_json(summary, summary_path)
+    summary_out = summary_path(REPO_ROOT, source, model_short, task_id, condition)
+    atomic_write_json(summary, summary_out)
     metric_str = f"{metric_value:.4f}" if metric_value is not None else "N/A"
     click.echo(f"  [{label}] {task_cfg.metric_id}={metric_str} counts={counts}")
     return summary

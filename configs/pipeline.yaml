@@ -1,0 +1,114 @@
+tasks:
+  - banking77
+  - cuad
+  - ledgar
+  - fpb
+  - medmcqa
+
+models:
+  local:
+    - id: qwen3-8b
+      smoke_id: qwen2.5-0.5b
+      conditions: [zero-shot, 5-shot, lora]
+
+  api:
+    - id: gpt-4.1-nano
+      pinned_version: gpt-4.1-nano-2025-04-14
+      conditions: [zero-shot, 5-shot, api-sft]
+      sft_base_model: gpt-4.1-nano-2025-04-14
+    - id: gpt-4.1-mini
+      pinned_version: gpt-4.1-mini
+      conditions: [zero-shot, api-sft]
+      sft_base_model: gpt-4.1-mini-2025-04-14
+    - id: gpt-5.5
+      pinned_version: gpt-5.5
+      conditions: [5-shot]
+
+stages:
+  - id: download
+    script: scripts/download_data.py
+    inputs: []
+    outputs:
+      - data/raw/{task_id}
+
+  - id: prepare
+    script: scripts/prepare_datasets.py
+    depends_on: [download]
+    inputs:
+      - data/raw/{task_id}
+    outputs:
+      - data/prepared/{task_id}/train.jsonl
+      - data/prepared/{task_id}/test.jsonl
+      - data/prepared/{task_id}/test_labels.jsonl
+
+  - id: train-local
+    script: scripts/train_local.py
+    trainer: lora
+    depends_on: [prepare]
+    inputs:
+      - data/prepared/{task_id}/train.jsonl
+    outputs:
+      - results/adapters/local/{model_short}/{task_id}/lora
+      - results/training/local/{model_short}/{task_id}/lora/metadata.json
+
+  - id: train-api
+    script: scripts/train_api.py
+    trainer: api-sft
+    depends_on: [prepare]
+    inputs:
+      - data/prepared/{task_id}/train.jsonl
+    outputs:
+      - results/training/api/{model_id}/{task_id}/api-sft/metadata.json
+
+  - id: eval-local
+    script: scripts/eval_local.py
+    depends_on: [train-local]
+    inputs:
+      - results/adapters/local/{model_short}/{task_id}/lora
+      - data/prepared/{task_id}/test.jsonl
+    outputs:
+      - results/predictions/local/{model_short}/{task_id}/{condition}.jsonl
+
+  - id: eval-api
+    script: scripts/eval_api.py
+    depends_on: [train-api]
+    inputs:
+      - data/prepared/{task_id}/test.jsonl
+    outputs:
+      - results/predictions/api/{model_id}/{task_id}/{condition}.jsonl
+
+  - id: classify
+    script: scripts/classify_errors.py
+    depends_on: [eval-local, eval-api]
+    inputs:
+      - results/predictions/{source}/{model}/{task_id}/{condition}.jsonl
+    outputs:
+      - results/classified/{source}/{model}/{task_id}/{condition}.jsonl
+      - results/summaries/{source}/{model}/{task_id}/{condition}.json
+
+  - id: dashboard
+    script: scripts/generate_dashboard_data.py
+    depends_on: [classify]
+    inputs:
+      - results/summaries
+    outputs:
+      - results/final/results.json
+
+nondeterminism:
+  seeded:
+    - component: prepare_datasets.py stratified_sample
+      seed_param: SEED=42
+    - component: prepare_datasets.py FPB split
+      seed_param: split_seed=42
+    - component: train_local.py SFTConfig
+      seed_param: training.seed=42 (set in configs/training/{model}.yaml)
+    - component: train_local.py data cap sampling
+      seed_param: random.Random(42)
+
+  undetermined:
+    - component: OpenAI API SFT (train_api.py)
+      reason: Cloud training infrastructure; seed control not exposed
+    - component: vLLM inference (eval_local.py)
+      reason: temperature=0 but GPU floating-point non-determinism at kernel level
+    - component: OpenAI API inference (eval_api.py)
+      reason: temperature=0 but server-side non-determinism

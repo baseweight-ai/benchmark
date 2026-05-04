@@ -41,7 +41,7 @@ def test_sync_artifacts_importable():
 
 # ── YAML configs ───────────────────────────────────────────────────────────────
 
-@pytest.mark.parametrize("task_id", ["banking77", "cuad", "ledgar", "fpb", "medmcqa", "mbpp"])
+@pytest.mark.parametrize("task_id", ["banking77", "cuad", "ledgar", "fpb", "medmcqa"])
 def test_task_config_parseable(task_id):
     path = REPO_ROOT / "configs" / "tasks" / f"{task_id}.yaml"
     assert path.exists(), f"Missing task config: {path}"
@@ -53,7 +53,7 @@ def test_task_config_parseable(task_id):
     assert "max_output_tokens" in data
 
 
-@pytest.mark.parametrize("model_id", ["qwen3-8b", "gemma3-4b", "phi4-mini"])
+@pytest.mark.parametrize("model_id", ["qwen3-8b"])
 def test_training_config_parseable(model_id):
     path = REPO_ROOT / "configs" / "training" / f"{model_id}.yaml"
     assert path.exists(), f"Missing training config: {path}"
@@ -72,19 +72,17 @@ def test_pricing_config_parseable():
     assert "self_hosted" in data
 
 
-def test_pricing_covers_all_api_models():
+def test_pricing_manual_entries_have_required_fields():
+    """Models listed in pricing.yaml (manual overrides) must have training_per_m."""
     path = REPO_ROOT / "configs" / "pricing.yaml"
     data = yaml.safe_load(path.read_text())
-    api_models = list(data["apis"].keys())
-    expected = ["gpt-5.4", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4.1-sft",
-                "gemini-2.5-flash"]
-    for model in expected:
-        assert model in api_models, f"Missing pricing for {model}"
+    for model_id, entry in data.get("apis", {}).items():
+        assert "training_per_m" in entry, f"pricing.apis.{model_id} missing training_per_m"
 
 
 # ── Prompt files ───────────────────────────────────────────────────────────────
 
-@pytest.mark.parametrize("task_id", ["banking77", "cuad", "ledgar", "fpb", "medmcqa", "mbpp"])
+@pytest.mark.parametrize("task_id", ["banking77", "cuad", "ledgar", "fpb", "medmcqa"])
 def test_prompt_file_exists_and_parseable(task_id):
     import json
     path = REPO_ROOT / "prompts" / f"{task_id}.json"
@@ -110,15 +108,16 @@ def test_env_example_has_required_keys():
         assert key in content, f".env.example missing {key}"
 
 
-# ── requirements.txt ──────────────────────────────────────────────────────────
+# ── environment.yml ───────────────────────────────────────────────────────────
 
-def test_requirements_parseable():
-    req_path = REPO_ROOT / "requirements.txt"
-    assert req_path.exists()
-    lines = [l.strip() for l in req_path.read_text().splitlines() if l.strip() and not l.startswith("#")]
-    assert len(lines) > 0
-    for line in lines:
-        # Each non-comment, non-empty line should have a package name
-        assert line[0].isalpha() or line[0].isdigit(), f"Unexpected line: {line!r}"
+def test_environment_yml_parseable():
+    env_path = REPO_ROOT / "environment.yml"
+    assert env_path.exists(), "environment.yml not found"
+    data = yaml.safe_load(env_path.read_text())
+    assert data["name"] == "baseweight-benchmark"
+    assert "dependencies" in data
+    pip_section = next((d["pip"] for d in data["dependencies"] if isinstance(d, dict) and "pip" in d), None)
+    assert pip_section is not None, "No pip section in environment.yml"
+    assert len(pip_section) > 0
 
 

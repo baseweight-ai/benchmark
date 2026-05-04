@@ -22,6 +22,8 @@ EXPECTED_COUNTS: dict[str, dict[str, int]] = {
     "medmcqa":   {"train": 100000, "test": 4000},
 }
 
+from pipeline.config import get_tasks
+
 REPO_ROOT = Path(__file__).parent.parent
 
 
@@ -43,7 +45,7 @@ def load_task_configs(task_ids: list[str]) -> list[TaskConfig]:
     return configs
 
 
-ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa"]
+ALL_TASKS: list[str] = get_tasks()
 
 TINY_TRAIN = 12
 TINY_TEST = 5

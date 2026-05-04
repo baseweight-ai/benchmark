@@ -17,7 +17,7 @@ REPO_ROOT = Path(__file__).parent.parent
 load_dotenv(REPO_ROOT / ".env")
 
 ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa"]
-ALL_MODELS = ["qwen3-8b", "gemma3-4b", "phi4-mini"]
+ALL_MODELS = ["qwen3-8b"]
 
 HF_COLLECTION_SLUG = "baseweight/baseweight-benchmark-adapters"
 HF_ORG = "baseweight"  # update to your HF org/username
@@ -229,7 +229,7 @@ def ensure_collection(dry_run: bool, hf_org: str) -> Optional[str]:
 
 
 @click.command()
-@click.option("--model", default="all", help="Model ID (qwen3-8b|gemma3-4b|phi4-mini|all)")
+@click.option("--model", default="all", help="Model ID (qwen3-8b|all)")
 @click.option("--task", default="all", help="Task ID or 'all'")
 @click.option("--condition", default="all", help="lora|all")
 @click.option("--upload-predictions", "do_predictions", is_flag=True, help="Also upload prediction logs")

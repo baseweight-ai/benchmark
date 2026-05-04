@@ -142,48 +142,48 @@ def _make_result(model_id, family, condition, metric_value, cost_per_query=None,
     }
 
 
-def test_compute_stats_picks_best_oss_lora500():
+def test_compute_stats_lora_wins_task():
     results = [
-        _make_result("qwen3-8b", "open-source", "lora-500", 0.80),
-        _make_result("gemma3-4b", "open-source", "lora-500", 0.75),
+        _make_result("qwen3-8b", "open-source", "LoRA", 0.85, task_id="fpb"),
+        _make_result("gpt-4.1-nano", "frontier", "5-shot", 0.75, task_id="fpb"),
     ]
-    stats, _, _ = compute_stats(results)
-    assert stats["best_oss_lora500_vs_frontier"]["oss_model"] == "qwen3-8b"
+    stats = compute_stats(results)
+    assert stats["tasks_won_by_oss"] == 1
+    assert stats["comparisons"]["lora_vs_5shot"]["tasks_won"] == 1
 
 
-def test_compute_stats_picks_best_frontier_5shot():
+def test_compute_stats_lora_loses_task():
     results = [
-        _make_result("gpt-4.1", "frontier", "5-shot", 0.82, cost_per_query=0.001),
-        _make_result("gpt-4.1-mini", "frontier", "5-shot", 0.78, cost_per_query=0.0002),
+        _make_result("qwen3-8b", "open-source", "LoRA", 0.60, task_id="fpb"),
+        _make_result("gpt-4.1-nano", "frontier", "5-shot", 0.80, task_id="fpb"),
     ]
-    stats, _, _ = compute_stats(results)
-    assert stats["best_oss_lora500_vs_frontier"]["frontier_model"] == "gpt-4.1"
+    stats = compute_stats(results)
+    assert stats["tasks_won_by_oss"] == 0
 
 
-def test_compute_stats_total_cost_deduplicates_by_model_condition():
+def test_compute_stats_total_training_cost():
     results = [
-        _make_result("qwen3-8b", "open-source", "lora-500", 0.8, training_cost=2.5, task_id="fpb"),
-        _make_result("qwen3-8b", "open-source", "lora-500", 0.7, training_cost=2.5, task_id="banking77"),
+        _make_result("qwen3-8b", "open-source", "LoRA", 0.8, training_cost=2.5, task_id="fpb"),
+        _make_result("qwen3-8b", "open-source", "LoRA", 0.7, training_cost=2.5, task_id="banking77"),
     ]
-    _, _, total_cost = compute_stats(results)
-    assert total_cost == pytest.approx(2.5)  # not 5.0 — same model+condition across tasks
+    stats = compute_stats(results)
+    assert stats["cost_summary"]["total_training_cost"] == pytest.approx(5.0)
 
 
 def test_compute_stats_empty_results():
-    stats, tasks_won, total_cost = compute_stats([])
-    assert stats["best_oss_lora500_vs_frontier"]["oss_model"] is None
-    assert stats["best_oss_lora500_vs_frontier"]["frontier_model"] is None
-    assert total_cost == 0.0
-    assert tasks_won == 0
+    stats = compute_stats([])
+    assert stats["tasks_won_by_oss"] == 0
+    assert stats["comparisons"]["lora_vs_5shot"]["tasks_won"] == 0
+    assert stats["cost_summary"]["total_training_cost"] is None
 
 
 def test_compute_stats_ignores_null_metric_values():
     results = [
-        _make_result("qwen3-8b", "open-source", "lora-500", None),
-        _make_result("gpt-4.1", "frontier", "5-shot", None),
+        _make_result("qwen3-8b", "open-source", "LoRA", None, task_id="fpb"),
+        _make_result("gpt-4.1-nano", "frontier", "5-shot", None, task_id="fpb"),
     ]
-    stats, _, _ = compute_stats(results)
-    assert stats["best_oss_lora500_vs_frontier"]["oss_model"] is None
+    stats = compute_stats(results)
+    assert stats["comparisons"]["lora_vs_5shot"]["tasks_won"] == 0
 
 
 # ── merge_results ──────────────────────────────────────────────────────────────

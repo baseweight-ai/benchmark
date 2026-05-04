@@ -4,7 +4,6 @@ import pytest
 from prepare_datasets import (
     format_assistant,
     format_user,
-    nested_samples,
     stratified_sample,
     to_chat,
     truncate_context,
@@ -132,30 +131,6 @@ def test_stratified_sample_capped_at_available():
     rows = _make_rows(2)  # 6 total
     result = stratified_sample(rows, "label", 100)
     assert len(result) <= 6
-
-
-# ── nested_samples ─────────────────────────────────────────────────────────────
-
-def test_nested_samples_subset_relationship():
-    rows = _make_rows(100)
-    result = nested_samples(rows, [50, 200, 500], label_key="label", seed=42)
-    ids_50 = {r["id"] for r in result[50]}
-    ids_200 = {r["id"] for r in result[200]}
-    assert ids_50.issubset(ids_200)
-
-
-def test_nested_samples_skips_oversized():
-    rows = _make_rows(2)  # 6 total
-    result = nested_samples(rows, [5, 50, 200], label_key="label", seed=42)
-    assert 200 not in result
-    assert 50 not in result
-
-
-def test_nested_samples_without_label_key():
-    rows = [{"id": str(i), "text": f"item {i}"} for i in range(100)]
-    result = nested_samples(rows, [10, 50], label_key=None, seed=42)
-    assert len(result[10]) == 10
-    assert len(result[50]) == 50
 
 
 # ── truncate_context ───────────────────────────────────────────────────────────

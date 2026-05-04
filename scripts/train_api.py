@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -13,18 +14,18 @@ import yaml
 from dotenv import load_dotenv
 
 from checkpoint_utils import atomic_write_json
+from pipeline.config import get_sft_base_models, get_tasks
+from pipeline.paths import training_meta_path
+from pipeline.versioning import git_sha as _git_sha
 
 REPO_ROOT = Path(__file__).parent.parent
 load_dotenv(REPO_ROOT / ".env")
 
-ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa"]
+ALL_TASKS: list[str] = get_tasks()
 
 _TERMINAL_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
 
-SFT_BASE_MODELS: dict[str, str] = {
-    "gpt-4.1-nano": "gpt-4.1-nano-2025-04-14",
-    "gpt-5.4-mini": "gpt-5.4-mini-2026-03-17",
-}
+SFT_BASE_MODELS: dict[str, str] = get_sft_base_models()
 
 ALL_SFT_MODELS = list(SFT_BASE_MODELS.keys())
 
@@ -32,7 +33,7 @@ _SFT_SUFFIX_MAX_LEN = 18
 
 
 def meta_path(model_id: str, task_id: str) -> Path:
-    return REPO_ROOT / "results" / "training" / "api" / model_id / task_id / "api-sft" / "metadata.json"
+    return training_meta_path(REPO_ROOT, "api", model_id, task_id, "api-sft")
 
 
 def _find_existing_sft_job(client, model_id: str, task_id: str, smoke_test: bool):
@@ -70,6 +71,7 @@ def _write_sft_metadata(job, sft_path: Path, model_id: str, mp: Path) -> dict:
         "ft_model_id": ft_model, "job_id": job.id,
         "trained_tokens": trained_tokens, "training_cost": training_cost,
         "training_time_min": training_time_min, "n_train": n_train,
+        "git_sha": _git_sha(),
     }
     atomic_write_json(meta, mp)
     return meta
@@ -81,11 +83,13 @@ def run_sft_train(
     dry_run: bool,
     smoke_test: bool,
     force: bool,
+    submit_only: bool = False,
 ) -> None:
     """Upload training data and create an OpenAI fine-tuning job.
 
     Idempotent: skips if metadata.json already exists and --force is not set.
     Falls back to searching OpenAI for an existing job before creating a new one.
+    With --submit-only, writes pending metadata and returns without polling.
     """
     prepared = REPO_ROOT / "data" / "prepared" / task_id
     sft_path = prepared / ("smoke_train.jsonl" if smoke_test else "train.jsonl")
@@ -105,7 +109,10 @@ def run_sft_train(
     try:
         cached = json.loads(mp.read_text())
         if not force:
-            click.echo(f"  SKIP [{model_id}/{task_id}/api-sft]: already trained → {cached['ft_model_id']}  (use --force to retrain)")
+            if cached.get("ft_model_id"):
+                click.echo(f"  SKIP [{model_id}/{task_id}/api-sft]: already trained → {cached['ft_model_id']}  (use --force to retrain)")
+            else:
+                click.echo(f"  SKIP [{model_id}/{task_id}/api-sft]: pending job {cached.get('job_id')} already submitted")
             return
     except FileNotFoundError:
         pass
@@ -145,8 +152,20 @@ def run_sft_train(
                 "learning_rate_multiplier": "auto",
             },
         )
-        click.echo(f"  Fine-tuning job created: {job.id} (epochs={n_epochs}). Waiting...")
+        click.echo(f"  Fine-tuning job created: {job.id} (epochs={n_epochs}).")
 
+    # Write pending metadata so eval_api can find the job and wait for it.
+    with open(sft_path) as f:
+        n_train = sum(1 for line in f if line.strip())
+    mp.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json({"job_id": job.id, "status": "pending", "n_train": n_train}, mp)
+
+    if submit_only:
+        click.echo(f"  [{model_id}/{task_id}] Submitted job {job.id} — eval_api.py will wait for completion")
+        return
+
+    click.echo(f"  Waiting for job {job.id}...")
+    key = f"{model_id}/{task_id}"
     seen_event_ids: set[str] = set()
     job_start = last_event_time = time.time()
     while job.status not in _TERMINAL_STATUSES:
@@ -157,12 +176,12 @@ def run_sft_train(
         for event in new_events:
             seen_event_ids.add(event.id)
             elapsed = int(time.time() - job_start)
-            click.echo(f"  [{job.status}] {event.message} (+{elapsed}s)")
+            click.echo(f"  [{key}/{job.status}] {event.message} (+{elapsed}s)")
             last_event_time = time.time()
         if not new_events:
             since_last = int(time.time() - last_event_time)
             total = int(time.time() - job_start)
-            click.echo(f"  [{job.status}] waiting... ({since_last}s since last event, {total}s total)")
+            click.echo(f"  [{key}/{job.status}] waiting... ({since_last}s since last event, {total}s total)")
 
     if job.status != "succeeded":
         raise RuntimeError(f"Fine-tuning job {job.id} ended with status: {job.status}")
@@ -178,33 +197,67 @@ def run_sft_train(
 @click.option("--dry-run", is_flag=True)
 @click.option("--smoke-test", is_flag=True)
 @click.option("--force", is_flag=True, help="Retrain even if metadata.json already exists")
-def main(model: str, task: str, dry_run: bool, smoke_test: bool, force: bool) -> None:
-    """Run OpenAI SFT training (idempotent — skips if already trained)."""
+@click.option("--submit-only", is_flag=True, help="Submit jobs and write pending metadata, but don't poll for completion")
+def main(model: str, task: str, dry_run: bool, smoke_test: bool, force: bool, submit_only: bool) -> None:
+    """Run OpenAI SFT training (idempotent — skips if already trained).
+
+    Multiple jobs are submitted and polled concurrently — wall time equals the
+    slowest single job rather than the sum of all jobs.
+
+    With --submit-only, jobs are submitted and pending metadata is written immediately,
+    then the process exits. eval_api.py will wait for completion when it reaches api-sft.
+    """
     model_ids = ALL_SFT_MODELS if model == "all" else [model]
     task_ids = ALL_TASKS if task == "all" else [task]
 
     if not dry_run and not os.environ.get("OPENAI_API_KEY"):
         click.echo("  WARNING: OPENAI_API_KEY not set", err=True)
 
-    failures = []
+    work = [
+        (mid, tid)
+        for mid in model_ids
+        for tid in task_ids
+        if mid in SFT_BASE_MODELS
+    ]
     for mid in model_ids:
         if mid not in SFT_BASE_MODELS:
             click.echo(f"  SKIP [{mid}]: not an SFT-capable model", err=True)
-            continue
-        for tid in task_ids:
+
+    failures = []
+
+    if dry_run or submit_only or len(work) <= 1:
+        for mid, tid in work:
             try:
-                run_sft_train(mid, tid, dry_run, smoke_test, force)
+                run_sft_train(mid, tid, dry_run, smoke_test, force, submit_only)
             except Exception as exc:
                 click.echo(f"  ERROR [{mid}/{tid}]: {exc}", err=True)
                 import traceback; traceback.print_exc()
                 failures.append((f"{mid}/{tid}", str(exc)))
+    else:
+        click.echo(f"  Submitting {len(work)} fine-tuning job(s) concurrently...")
+        with ThreadPoolExecutor(max_workers=min(len(work), 10)) as executor:
+            futures = {
+                executor.submit(run_sft_train, mid, tid, False, smoke_test, force, False): f"{mid}/{tid}"
+                for mid, tid in work
+            }
+            for future in as_completed(futures):
+                key = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    click.echo(f"  ERROR [{key}]: {exc}", err=True)
+                    import traceback; traceback.print_exc()
+                    failures.append((key, str(exc)))
 
     if failures:
         click.echo(f"\nFAILED ({len(failures)}):")
         for key, err in failures:
             click.echo(f"  {key}: {err}")
         sys.exit(1)
-    click.echo("\nAll API training completed.")
+    if submit_only:
+        click.echo("\nAll jobs submitted. Run eval_api.py to evaluate (it will wait for pending jobs).")
+    else:
+        click.echo("\nAll API training completed.")
 
 
 if __name__ == "__main__":

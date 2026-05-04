@@ -3,7 +3,6 @@ import pytest
 
 from classify_errors import (
     classify_classification,
-    classify_code,
     classify_extraction,
     classify_predictions,
     compute_metric,
@@ -189,42 +188,6 @@ def test_classify_extraction_format_violation_too_long():
     assert result == "format_violation"
 
 
-# ── classify_code ─────────────────────────────────────────────────────────────
-
-def test_classify_code_pass():
-    assert classify_code("def foo(): pass", "def foo(): pass", mbpp_passed=True) == "pass"
-
-
-def test_classify_code_syntax_error():
-    result = classify_code("def foo(:\n    pass", "def foo(): pass", mbpp_passed=False)
-    assert result == "syntax_error"
-
-
-def test_classify_code_runtime_error():
-    result = classify_code(
-        "def foo(): return x",
-        "def foo(): return 1",
-        mbpp_passed=False,
-        mbpp_error="NameError: x not defined",
-    )
-    assert result == "runtime_error"
-
-
-def test_classify_code_logic_error():
-    result = classify_code("def foo(): return 42", "def foo(): return 1", mbpp_passed=False)
-    assert result == "logic_error"
-
-
-def test_classify_code_incomplete_empty():
-    assert classify_code("", "def foo(): pass", mbpp_passed=False) == "incomplete"
-
-
-def test_classify_code_strips_fences():
-    code = "```python\ndef foo(): pass\n```"
-    result = classify_code(code, "", mbpp_passed=True)
-    assert result == "pass"
-
-
 # ── compute_metric ─────────────────────────────────────────────────────────────
 
 def _make_task_cfg(task_type: str, metric_id: str):
@@ -247,12 +210,6 @@ def test_compute_metric_token_f1():
     cfg = _make_task_cfg("extraction", "token_f1")
     rows = [{"token_f1": 1.0}, {"token_f1": 0.5}, {"token_f1": 0.0}]
     assert compute_metric(cfg, rows) == pytest.approx(0.5)
-
-
-def test_compute_metric_pass_at_1():
-    cfg = _make_task_cfg("code", "pass_at_1")
-    rows = [{"error_category": "pass"}, {"error_category": "syntax_error"}, {"error_category": "pass"}]
-    assert compute_metric(cfg, rows) == pytest.approx(2 / 3)
 
 
 def test_compute_metric_empty_rows():
