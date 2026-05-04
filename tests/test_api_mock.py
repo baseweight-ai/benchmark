@@ -1,4 +1,4 @@
-"""Layer 2 — API mocking: test eval_api.py with openai mocked.
+"""Layer 2 — API mocking: test eval_api.py and train_api.py with openai mocked.
 
 openai and aiohttp are stub-injected into sys.modules so these
 tests run without installing those packages.
@@ -15,7 +15,8 @@ import pytest
 
 import tests._api_stubs  # noqa: F401 — injects openai/aiohttp/tqdm stubs
 import eval_api
-from eval_api import TaskConfig, run_eval, run_sft
+import train_api
+from eval_api import TaskConfig, run_eval
 
 pytestmark = pytest.mark.integration
 
@@ -29,14 +30,23 @@ def _task_cfg(task_id="fpb"):
 
 
 def _setup_prepared_dir(tmp_path: Path, n: int = 5):
-    """Write toy test.jsonl and few_shot_5.jsonl into tmp_path/data/prepared/fpb/."""
+    """Write toy test.jsonl and train.jsonl into tmp_path/data/prepared/fpb/."""
     from tests.conftest import make_test_prompts, make_chat_rows, write_jsonl
 
     prep = tmp_path / "data" / "prepared" / "fpb"
     prep.mkdir(parents=True)
     write_jsonl(make_test_prompts(n), prep / "test.jsonl")
-    write_jsonl(make_chat_rows(5), prep / "few_shot_5.jsonl")
+    write_jsonl(make_chat_rows(5), prep / "train.jsonl")
     return prep
+
+
+def _write_sft_metadata(tmp_path: Path, model_id: str = "gpt-4.1-nano", task_id: str = "fpb",
+                         ft_model_id: str = "ft:gpt-4.1-nano-2025-04-14:test:abc123"):
+    meta = tmp_path / "results" / "training" / "api" / model_id / task_id / "api-sft" / "metadata.json"
+    meta.parent.mkdir(parents=True, exist_ok=True)
+    meta.write_text(json.dumps({"ft_model_id": ft_model_id, "trained_tokens": 1000,
+                                "training_cost": 0.025, "n_train": 5}))
+    return meta
 
 
 # ── Mock call_* functions directly ────────────────────────────────────────────
@@ -44,11 +54,11 @@ def _setup_prepared_dir(tmp_path: Path, n: int = 5):
 def _mock_call(response_text="positive"):
     """Return an async mock that behaves like call_openai."""
     async def _fn(*args, **kwargs):
-        return response_text, 100, 10, 150.0
+        return response_text, 100, 10, 150.0, 50.0
     return _fn
 
 
-# ── Tests ──────────────────────────────────────────────────────────────────────
+# ── eval_api tests ─────────────────────────────────────────────────────────────
 
 def test_run_eval_openai_zero_shot(tmp_path, monkeypatch):
     monkeypatch.setattr(eval_api, "REPO_ROOT", tmp_path)
@@ -57,22 +67,21 @@ def test_run_eval_openai_zero_shot(tmp_path, monkeypatch):
 
     with patch("eval_api.call_openai", side_effect=_mock_call("positive")):
         with patch("openai.AsyncOpenAI", return_value=MagicMock()):
-            asyncio.run(run_eval("gpt-4.1", "fpb", "zero-shot", _task_cfg(), dry_run=False))
+            asyncio.run(run_eval("gpt-4.1-nano", "fpb", "zero-shot", _task_cfg(), dry_run=False))
 
-    out = tmp_path / "results" / "predictions" / "gpt-4.1" / "fpb" / "zero-shot.jsonl"
+    out = tmp_path / "results" / "predictions" / "api" / "gpt-4.1-nano" / "fpb" / "zero-shot.jsonl"
     assert out.exists()
     rows = [json.loads(l) for l in out.read_text().splitlines()]
     assert len(rows) == 5
     assert all(r["output"] == "positive" for r in rows)
-    assert all(r["model"] == "gpt-4.1" for r in rows)
-
+    assert all(r["model"] == "gpt-4.1-nano" for r in rows)
 
 
 def test_run_eval_skips_existing(tmp_path, monkeypatch):
     monkeypatch.setattr(eval_api, "REPO_ROOT", tmp_path)
     _setup_prepared_dir(tmp_path, n=5)
 
-    out = tmp_path / "results" / "predictions" / "gpt-4.1" / "fpb" / "zero-shot.jsonl"
+    out = tmp_path / "results" / "predictions" / "api" / "gpt-4.1-nano" / "fpb" / "zero-shot.jsonl"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text('{"id":"x"}\n')
 
@@ -81,11 +90,11 @@ def test_run_eval_skips_existing(tmp_path, monkeypatch):
     async def counting_call(*a, **kw):
         nonlocal call_count
         call_count += 1
-        return "positive", 10, 5, 100.0
+        return "positive", 10, 5, 100.0, 50.0
 
     with patch("eval_api.call_openai", side_effect=counting_call):
         with patch("openai.AsyncOpenAI", return_value=MagicMock()):
-            asyncio.run(run_eval("gpt-4.1", "fpb", "zero-shot", _task_cfg(), dry_run=False))
+            asyncio.run(run_eval("gpt-4.1-nano", "fpb", "zero-shot", _task_cfg(), dry_run=False))
 
     assert call_count == 0
 
@@ -95,7 +104,7 @@ def test_run_eval_resumes_partial(tmp_path, monkeypatch):
     _setup_prepared_dir(tmp_path, n=5)
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
 
-    out = tmp_path / "results" / "predictions" / "gpt-4.1" / "fpb" / "zero-shot.jsonl"
+    out = tmp_path / "results" / "predictions" / "api" / "gpt-4.1-nano" / "fpb" / "zero-shot.jsonl"
     partial = out.with_name(out.name + ".partial")
     partial.parent.mkdir(parents=True, exist_ok=True)
 
@@ -103,14 +112,12 @@ def test_run_eval_resumes_partial(tmp_path, monkeypatch):
     already_done = [{"id": f"toy_test_{i:04d}", "output": "positive"} for i in range(3)]
     partial.write_text("\n".join(json.dumps(r) for r in already_done) + "\n")
 
-    called_ids = []
-
     async def tracking_call(*a, **kw):
-        return "negative", 10, 5, 100.0
+        return "negative", 10, 5, 100.0, 50.0
 
     with patch("eval_api.call_openai", side_effect=tracking_call):
         with patch("openai.AsyncOpenAI", return_value=MagicMock()):
-            asyncio.run(run_eval("gpt-4.1", "fpb", "zero-shot", _task_cfg(), dry_run=False))
+            asyncio.run(run_eval("gpt-4.1-nano", "fpb", "zero-shot", _task_cfg(), dry_run=False))
 
     # Final file should have all 5 rows (3 from partial + 2 newly run)
     rows = [json.loads(l) for l in out.read_text().splitlines()]
@@ -123,16 +130,17 @@ def test_run_eval_dry_run_no_files(tmp_path, monkeypatch):
     monkeypatch.setattr(eval_api, "REPO_ROOT", tmp_path)
     _setup_prepared_dir(tmp_path, n=5)
 
-    asyncio.run(run_eval("gpt-4.1", "fpb", "zero-shot", _task_cfg(), dry_run=True))
+    asyncio.run(run_eval("gpt-4.1-nano", "fpb", "zero-shot", _task_cfg(), dry_run=True))
 
-    out = tmp_path / "results" / "predictions" / "gpt-4.1" / "fpb" / "zero-shot.jsonl"
+    out = tmp_path / "results" / "predictions" / "api" / "gpt-4.1-nano" / "fpb" / "zero-shot.jsonl"
     assert not out.exists()
 
 
-def test_run_eval_missing_data_skips_gracefully(tmp_path, monkeypatch):
+def test_run_eval_missing_data_raises(tmp_path, monkeypatch):
     monkeypatch.setattr(eval_api, "REPO_ROOT", tmp_path)
-    # No data directory created — should skip without crashing
-    asyncio.run(run_eval("gpt-4.1", "fpb", "zero-shot", _task_cfg(), dry_run=False))
+    # No data directory created — should raise FileNotFoundError
+    with pytest.raises(FileNotFoundError):
+        asyncio.run(run_eval("gpt-4.1-nano", "fpb", "zero-shot", _task_cfg(), dry_run=False))
 
 
 def test_run_eval_5shot_builds_messages(tmp_path, monkeypatch):
@@ -145,36 +153,85 @@ def test_run_eval_5shot_builds_messages(tmp_path, monkeypatch):
 
     async def capture_call(client, model_str, messages, max_tokens, semaphore):
         captured_messages.append(messages)
-        return "positive", 10, 5, 100.0
+        return "positive", 10, 5, 100.0, 50.0
 
     with patch("eval_api.call_openai", side_effect=capture_call):
         with patch("openai.AsyncOpenAI", return_value=MagicMock()):
-            asyncio.run(run_eval("gpt-4.1", "fpb", "5-shot", _task_cfg(), dry_run=False))
+            asyncio.run(run_eval("gpt-4.1-nano", "fpb", "5-shot", _task_cfg(), dry_run=False))
 
     assert len(captured_messages) == 2
     # 5-shot: should have more than 2 messages (system + few-shot turns + user)
     assert len(captured_messages[0]) > 2
 
 
-def test_run_sft_uses_cached_ft_model(tmp_path, monkeypatch):
-    """If metadata.json already has ft_model_id, skip job creation."""
+# ── api-sft condition tests ────────────────────────────────────────────────────
+
+def test_run_eval_api_sft_reads_ft_model_from_metadata(tmp_path, monkeypatch):
+    """run_eval with api-sft reads ft_model_id from training metadata and uses it."""
     monkeypatch.setattr(eval_api, "REPO_ROOT", tmp_path)
     _setup_prepared_dir(tmp_path, n=3)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    _write_sft_metadata(tmp_path, ft_model_id="ft:gpt-4.1-nano-2025-04-14:test:abc123")
 
-    # Pre-write the SFT training data
-    sft_path = tmp_path / "data" / "prepared" / "fpb" / "openai_sft_500.jsonl"
-    sft_path.write_text('{"messages":[{"role":"user","content":"x"},{"role":"assistant","content":"y"}]}\n' * 3)
+    used_model_strs = []
 
-    # Pre-write metadata so it skips the fine-tuning job
-    meta_path = tmp_path / "results" / "training" / "gpt-4.1-sft" / "fpb" / "metadata.json"
-    meta_path.parent.mkdir(parents=True, exist_ok=True)
-    meta_path.write_text(json.dumps({"ft_model_id": "ft:gpt-4.1:test:abc123"}))
+    async def capture_call(client, model_str, messages, max_tokens, semaphore):
+        used_model_strs.append(model_str)
+        return "positive", 10, 5, 100.0, 50.0
 
-    # Patch OPENAI_MODELS so gpt-4.1-sft maps to the fake ft model
-    with patch("eval_api.call_openai", side_effect=_mock_call("positive")):
+    with patch("eval_api.call_openai", side_effect=capture_call):
         with patch("openai.AsyncOpenAI", return_value=MagicMock()):
-            with patch("openai.OpenAI", return_value=MagicMock()):
-                asyncio.run(run_sft("fpb", _task_cfg(), dry_run=False))
+            asyncio.run(run_eval("gpt-4.1-nano", "fpb", "api-sft", _task_cfg(), dry_run=False))
 
-    out = tmp_path / "results" / "predictions" / "gpt-4.1-sft" / "fpb" / "api-sft-500.jsonl"
+    out = tmp_path / "results" / "predictions" / "api" / "gpt-4.1-nano" / "fpb" / "api-sft.jsonl"
     assert out.exists()
+    assert len(used_model_strs) == 3
+    # The fine-tuned model string, not the base model, must be used for inference
+    assert all(s == "ft:gpt-4.1-nano-2025-04-14:test:abc123" for s in used_model_strs)
+
+
+def test_run_eval_api_sft_skips_if_no_metadata(tmp_path, monkeypatch):
+    """run_eval with api-sft skips gracefully when no training metadata exists."""
+    monkeypatch.setattr(eval_api, "REPO_ROOT", tmp_path)
+    _setup_prepared_dir(tmp_path, n=3)
+    # No metadata written
+
+    asyncio.run(run_eval("gpt-4.1-nano", "fpb", "api-sft", _task_cfg(), dry_run=False))
+
+    out = tmp_path / "results" / "predictions" / "api" / "gpt-4.1-nano" / "fpb" / "api-sft.jsonl"
+    assert not out.exists()
+
+
+# ── train_api tests ────────────────────────────────────────────────────────────
+
+def test_run_sft_train_skips_if_metadata_exists(tmp_path, monkeypatch):
+    """run_sft_train skips immediately if metadata.json already exists."""
+    monkeypatch.setattr(train_api, "REPO_ROOT", tmp_path)
+
+    sft_path = tmp_path / "data" / "prepared" / "fpb" / "train.jsonl"
+    sft_path.parent.mkdir(parents=True, exist_ok=True)
+    sft_path.write_text('{"messages":[]}\n')
+
+    meta = _write_sft_metadata(tmp_path, ft_model_id="ft:gpt-4.1-nano-2025-04-14:org:existing")
+    original_mtime = meta.stat().st_mtime
+
+    # Should return without touching openai — skip happens before the lazy import
+    train_api.run_sft_train("gpt-4.1-nano", "fpb", dry_run=False, smoke_test=False, force=False)
+
+    # Metadata must be unchanged (not overwritten)
+    assert meta.stat().st_mtime == original_mtime
+    assert json.loads(meta.read_text())["ft_model_id"] == "ft:gpt-4.1-nano-2025-04-14:org:existing"
+
+
+def test_run_sft_train_dry_run_no_files_created(tmp_path, monkeypatch):
+    """run_sft_train in dry-run mode never creates metadata or calls the API."""
+    monkeypatch.setattr(train_api, "REPO_ROOT", tmp_path)
+
+    sft_path = tmp_path / "data" / "prepared" / "fpb" / "train.jsonl"
+    sft_path.parent.mkdir(parents=True, exist_ok=True)
+    sft_path.write_text('{"messages":[]}\n')
+
+    train_api.run_sft_train("gpt-4.1-nano", "fpb", dry_run=True, smoke_test=False, force=False)
+
+    meta = tmp_path / "results" / "training" / "api" / "gpt-4.1-nano" / "fpb" / "api-sft" / "metadata.json"
+    assert not meta.exists()

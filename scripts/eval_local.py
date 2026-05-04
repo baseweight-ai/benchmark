@@ -19,7 +19,7 @@ import yaml
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
-from checkpoint_utils import append_jsonl, finalize_partial, load_partial_ids, partial_path
+from checkpoint_utils import append_jsonl, atomic_write_json, finalize_partial, load_partial_ids, partial_path
 from utils import build_messages, load_jsonl
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -48,7 +48,7 @@ class ModelConfig(BaseModel):
     model_short: str
     max_seq_length: int = 2048
     enable_thinking: Optional[bool] = None
-    vllm_task: str = "generate"
+    vllm_task: str = "auto"
     fallback_model_id: Optional[str] = None
 
 
@@ -137,7 +137,7 @@ def start_vllm_server(
     adapter_path: Optional[Path],
     max_seq_length: int,
     enable_thinking: Optional[bool] = None,
-    vllm_task: str = "generate",
+    vllm_task: str = "auto",
 ) -> subprocess.Popen:
     # Kill any lingering vLLM processes (server + engine subprocess) to avoid
     # orphaned GPU contexts causing OOM on the next run
@@ -360,13 +360,21 @@ async def run_eval(
 
     click.echo(f"  Evaluating {model_cfg.model_short}/{task_id}/{condition} ({len(pending_rows)}/{len(test_rows)} rows)...")
     from tqdm.asyncio import tqdm
+    t_wall_start = time.time()
     async with aiohttp.ClientSession() as session:
         await tqdm.gather(
             *[process_row(r, session) for r in pending_rows],
             desc=f"{model_cfg.model_short}/{task_id}",
         )
+    eval_wall_time_s = round(time.time() - t_wall_start, 1) or None
 
     finalize_partial(pp, out_path)
+
+    # Write wall time sidecar — vLLM batches cause all per-row timestamps to
+    # collapse to the same millisecond, making timestamp-derived wall time useless.
+    wall_path = out_path.with_suffix(".wall.json")
+    atomic_write_json({"eval_wall_time_s": eval_wall_time_s}, wall_path)
+
     click.echo(f"  Saved {len(test_rows)} predictions to {out_path.relative_to(REPO_ROOT)}")
 
 
@@ -375,7 +383,7 @@ async def run_eval(
 @click.option("--task", default="all", help="Task ID or 'all'")
 @click.option("--condition", default="all", help="zero-shot|5-shot|lora|all")
 @click.option("--dry-run", is_flag=True, help="Validate without running inference")
-@click.option("--smoke-test", is_flag=True, help="Use smoke test data and model; mirrors train.py --smoke-test")
+@click.option("--smoke-test", is_flag=True, help="Use smoke test data and model; mirrors train_local.py --smoke-test")
 def main(model: Optional[str], task: str, condition: str, dry_run: bool, smoke_test: bool) -> None:
     """Evaluate local fine-tuned models via vLLM server."""
     if model is None:

@@ -78,10 +78,10 @@ Pass `--task all` to operate on all six tasks. Both scripts require an explicit 
 
 ```bash
 # Train on 500 examples and full set
-python scripts/train.py --model qwen3-8b --task banking77 --condition all
+python scripts/train_local.py --model qwen3-8b --task banking77 --condition all
 
 # With HuggingFace auto-upload (recommended for remote GPU persistence)
-python scripts/train.py --model qwen3-8b --task banking77 --condition all --auto-upload
+python scripts/train_local.py --model qwen3-8b --task banking77 --condition all --auto-upload
 ```
 
 ### 3. Evaluate

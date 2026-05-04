@@ -25,12 +25,7 @@ os.environ.setdefault("UNSLOTH_DISABLE_AUTO_PADDING_FREE", "1")
 from dotenv import load_dotenv
 load_dotenv()
 
-import unsloth  # must be imported before transformers/peft
-from unsloth import FastModel
-
-import datasets as hf_datasets
-from transformers import AutoTokenizer, TrainerCallback
-from trl import SFTTrainer, SFTConfig
+# ML libs imported lazily inside run_training_task — keeps module importable on CPU for tests
 
 import click
 import yaml
@@ -200,6 +195,13 @@ def run_training_task(
     All heavy objects (model, trainer) are deleted before returning so the GC
     can reclaim memory before the next task starts.
     """
+    # Heavy GPU libs imported here so the module is importable on CPU for tests
+    import unsloth  # noqa: F401 — must come before transformers/peft
+    from unsloth import FastModel
+    import datasets as hf_datasets
+    from transformers import TrainerCallback
+    from trl import SFTTrainer, SFTConfig
+
     task_id = task_cfg.task_id
     model_id = model_cfg.model_id
     substituted = False

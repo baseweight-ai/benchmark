@@ -36,7 +36,7 @@ REPO_ROOT = Path(__file__).parent.parent
 
 @pytest.fixture
 def mock_ml_modules():
-    """Inject stub ML modules into sys.modules so train.py's lazy imports work."""
+    """Inject stub ML modules into sys.modules so train_local.py's lazy imports work."""
     # TrainerCallback must be a real class so _CheckpointCallback can subclass it.
     TrainerCallbackBase = type("TrainerCallback", (), {})
 
@@ -86,12 +86,12 @@ def mock_ml_modules():
 
 @pytest.fixture
 def train_env(tmp_path, monkeypatch, tmp_network_volume):
-    """Full environment: redirect REPO_ROOT + NETWORK_VOLUME for train.py."""
-    import train
+    """Full environment: redirect REPO_ROOT + NETWORK_VOLUME for train_local.py."""
+    import train_local as train
     monkeypatch.setattr(train, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(checkpoint_utils, "NETWORK_VOLUME", tmp_network_volume)
 
-    from train import ModelConfig, TaskConfig
+    from train_local import ModelConfig, TaskConfig
     model_cfg = ModelConfig(
         model_id="test/tiny",
         model_short="test-model",
@@ -138,56 +138,55 @@ def train_env(tmp_path, monkeypatch, tmp_network_volume):
 
 def test_train_one_skips_complete_condition(train_env, tmp_network_volume):
     """If train_state.json says 'complete', train_one returns without training."""
-    import train
+    import train_local as train
 
     e = train_env
-    save_train_state("test-model", "toy", "lora-500", {"status": "complete", "eval_loss": 0.2})
+    save_train_state("test-model", "toy", "lora", {"status": "complete", "eval_loss": 0.2})
 
     # Write dummy metadata so the early-return has something to load
-    meta_path = e["tmp_path"] / "results" / "training" / "test-model" / "toy" / "lora-500" / "metadata.json"
+    meta_path = e["tmp_path"] / "results" / "training" / "local" / "test-model" / "toy" / "lora" / "metadata.json"
     meta_path.parent.mkdir(parents=True, exist_ok=True)
     meta_path.write_text(json.dumps({"model_id": "test-model", "n_train": 1}))
 
-    with patch.dict(sys.modules, {"unsloth": MagicMock()}):
-        result = train.train_one(e["model_cfg"], e["task_cfg"], "lora-500", e["data_path"], dry_run=False)
+    result = train.train_one(e["model_cfg"], e["task_cfg"], e["data_path"], dry_run=False)
 
     assert result.get("model_id") == "test-model"
 
 
 def test_train_one_writes_in_progress_state(train_env, tmp_network_volume, mock_ml_modules):
     """Training starts by writing status=in_progress to the network volume."""
-    import train
+    import train_local as train
 
     e = train_env
-    train.train_one(e["model_cfg"], e["task_cfg"], "lora-500", e["data_path"], dry_run=False)
+    train.train_one(e["model_cfg"], e["task_cfg"], e["data_path"], dry_run=False)
 
     # State must be "complete" after successful training, but check it was written
-    state = load_train_state("test-model", "toy", "lora-500")
+    state = load_train_state("test-model", "toy", "lora")
     assert state is not None
     assert state["status"] == "complete"
 
 
 def test_train_one_writes_complete_state(train_env, tmp_network_volume, mock_ml_modules):
     """After training, train_state.json has status=complete with eval_loss."""
-    import train
+    import train_local as train
 
     e = train_env
     mock_ml_modules["train_result"].metrics = {"eval_loss": 0.42}
-    train.train_one(e["model_cfg"], e["task_cfg"], "lora-500", e["data_path"], dry_run=False)
+    train.train_one(e["model_cfg"], e["task_cfg"], e["data_path"], dry_run=False)
 
-    state = load_train_state("test-model", "toy", "lora-500")
+    state = load_train_state("test-model", "toy", "lora")
     assert state["status"] == "complete"
     assert state["eval_loss"] == pytest.approx(0.42)
 
 
 def test_train_one_writes_metadata_atomically(train_env, tmp_network_volume, mock_ml_modules):
     """metadata.json is written atomically (no .tmp residue)."""
-    import train
+    import train_local as train
 
     e = train_env
-    train.train_one(e["model_cfg"], e["task_cfg"], "lora-500", e["data_path"], dry_run=False)
+    train.train_one(e["model_cfg"], e["task_cfg"], e["data_path"], dry_run=False)
 
-    log_dir = e["tmp_path"] / "results" / "training" / "test-model" / "toy" / "lora-500"
+    log_dir = e["tmp_path"] / "results" / "training" / "local" / "test-model" / "toy" / "lora"
     meta = log_dir / "metadata.json"
     assert meta.exists()
     assert not (log_dir / "metadata.json.tmp").exists()
@@ -197,7 +196,7 @@ def test_train_one_writes_metadata_atomically(train_env, tmp_network_volume, moc
 
 def test_train_one_mirrors_adapter_to_network_volume(train_env, tmp_network_volume, mock_ml_modules):
     """Adapter is copied (via shutil.copytree) to ckpt_dir/final_adapter."""
-    import train
+    import train_local as train
 
     e = train_env
     copied_src = []
@@ -207,8 +206,8 @@ def test_train_one_mirrors_adapter_to_network_volume(train_env, tmp_network_volu
         copied_src.append(Path(src))
         Path(dst).mkdir(parents=True, exist_ok=True)
 
-    with patch("train.shutil.copytree", side_effect=tracking_copytree):
-        train.train_one(e["model_cfg"], e["task_cfg"], "lora-500", e["data_path"], dry_run=False)
+    with patch("train_local.shutil.copytree", side_effect=tracking_copytree):
+        train.train_one(e["model_cfg"], e["task_cfg"], e["data_path"], dry_run=False)
 
     assert len(copied_src) == 1
     # Source should be the local adapter dir (in REPO_ROOT)
@@ -217,14 +216,14 @@ def test_train_one_mirrors_adapter_to_network_volume(train_env, tmp_network_volu
 
 def test_train_one_passes_resume_checkpoint_to_trainer(train_env, tmp_network_volume, mock_ml_modules):
     """If a checkpoint-N dir exists on the network volume, it is passed to trainer.train()."""
-    import train
+    import train_local as train
 
     e = train_env
-    ckpt_dir = checkpoint_dir("test-model", "toy", "lora-500")
+    ckpt_dir = checkpoint_dir("test-model", "toy", "lora")
     ckpt_dir.mkdir(parents=True)
     (ckpt_dir / "checkpoint-5").mkdir()
 
-    train.train_one(e["model_cfg"], e["task_cfg"], "lora-500", e["data_path"], dry_run=False)
+    train.train_one(e["model_cfg"], e["task_cfg"], e["data_path"], dry_run=False)
 
     trainer = mock_ml_modules["trainer"]
     resume_arg = trainer.train.call_args.kwargs.get("resume_from_checkpoint")
@@ -234,7 +233,7 @@ def test_train_one_passes_resume_checkpoint_to_trainer(train_env, tmp_network_vo
 
 def test_checkpoint_callback_updates_state(train_env, tmp_network_volume, mock_ml_modules):
     """_CheckpointCallback.on_save must write epoch/step to train_state.json."""
-    import train
+    import train_local as train
 
     e = train_env
     captured_callback = None
@@ -250,7 +249,7 @@ def test_checkpoint_callback_updates_state(train_env, tmp_network_volume, mock_m
 
     sys.modules["trl"].SFTTrainer = capture_trainer
 
-    train.train_one(e["model_cfg"], e["task_cfg"], "lora-500", e["data_path"], dry_run=False)
+    train.train_one(e["model_cfg"], e["task_cfg"], e["data_path"], dry_run=False)
 
     assert captured_callback is not None
     # Simulate on_save being called by the trainer
@@ -261,19 +260,19 @@ def test_checkpoint_callback_updates_state(train_env, tmp_network_volume, mock_m
     mock_state.best_model_checkpoint = "/tmp/ckpt"
     captured_callback.on_save(MagicMock(), mock_state, MagicMock())
 
-    state = load_train_state("test-model", "toy", "lora-500")
+    state = load_train_state("test-model", "toy", "lora")
     assert state["epoch"] == 2
     assert state["global_step"] == 50
 
 
 def test_train_one_dry_run_writes_metadata_no_training(train_env, tmp_network_volume):
     """--dry-run writes metadata.json but never imports unsloth."""
-    import train
+    import train_local as train
 
     e = train_env
-    result = train.train_one(e["model_cfg"], e["task_cfg"], "lora-500", e["data_path"], dry_run=True)
+    result = train.train_one(e["model_cfg"], e["task_cfg"], e["data_path"], dry_run=True)
 
     assert result["model_id"] == "test-model"
     assert result["n_train"] >= 0
-    meta_path = e["tmp_path"] / "results" / "training" / "test-model" / "toy" / "lora-500" / "metadata.json"
+    meta_path = e["tmp_path"] / "results" / "training" / "local" / "test-model" / "toy" / "lora" / "metadata.json"
     assert meta_path.exists()

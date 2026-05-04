@@ -4,7 +4,7 @@ max_seq_length: 256
 load_in_4bit: false
 dtype: float32
 enable_thinking: null
-vllm_task: generate
+vllm_task: auto
 fallback_model_id: null
 lora:
   rank: 4

@@ -248,17 +248,23 @@ def process_model_task_condition(
     total_input_tokens = sum(r.get("input_tokens", 0) for r in predictions)
     total_output_tokens = sum(r.get("output_tokens", 0) for r in predictions)
 
-    # Actual eval throughput: derived from the timestamp span across all predictions.
-    # With concurrent requests, max-min timestamps ≈ total wall time for the run.
-    from datetime import datetime, timezone as tz
-    timestamps = [r["timestamp"] for r in predictions if r.get("timestamp")]
+    # Wall time: prefer the sidecar written by eval_local.py (vLLM batch processing
+    # collapses per-row timestamps to the same millisecond, making the span useless).
+    # Fall back to timestamp-derived span for API predictions which lack a sidecar.
+    wall_sidecar = pred_path.with_suffix(".wall.json")
     eval_wall_time_s = None
-    if len(timestamps) >= 2:
-        def _parse(ts: str) -> datetime:
-            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        elapsed = (_parse(max(timestamps)) - _parse(min(timestamps))).total_seconds()
-        rounded = round(elapsed, 1)
-        eval_wall_time_s = rounded if rounded > 0 else None
+    try:
+        with open(wall_sidecar) as _wf:
+            eval_wall_time_s = json.load(_wf).get("eval_wall_time_s")
+    except FileNotFoundError:
+        from datetime import datetime, timezone as tz
+        timestamps = [r["timestamp"] for r in predictions if r.get("timestamp")]
+        if len(timestamps) >= 2:
+            def _parse(ts: str) -> datetime:
+                return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            elapsed = (_parse(max(timestamps)) - _parse(min(timestamps))).total_seconds()
+            rounded = round(elapsed, 1)
+            eval_wall_time_s = rounded if rounded > 0 else None
 
     summary = {
         "model": model_short,

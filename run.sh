@@ -8,9 +8,10 @@
 #   --setup          Run scripts/setup.sh (env + hardware-specific packages)
 #   --download       Run download_data.py
 #   --prepare        Run prepare_datasets.py
-#   --train          Run train.py
-#   --eval-local     Run eval_local.py  (vLLM, fine-tuned models)
-#   --eval-api       Run eval_api.py    (frontier API models)
+#   --train          Run train_local.py         (local QLoRA training)
+#   --train-api      Run train_api.py     (OpenAI SFT training — idempotent, never reruns unless --force)
+#   --eval-local     Run eval_local.py    (vLLM, fine-tuned models)
+#   --eval-api       Run eval_api.py      (frontier API eval; api-sft requires --train-api first)
 #   --classify       Run classify_errors.py (error classification + summaries)
 #   --dashboard      Run generate_dashboard_data.py
 #   --all            All of the above
@@ -21,6 +22,7 @@
 #   --model MODEL    Model ID or 'all' (default: qwen3-8b; qwen2.5-0.5b with --smoke-test)
 #   --clean          Delete prior outputs for selected steps/model/task, then run
 #   --dry-run        Pass --dry-run to all supporting scripts
+#   --force          Pass --force to train_api.py (retrain even if already trained)
 #   -h, --help       Show this message
 
 set -euo pipefail
@@ -37,6 +39,7 @@ DO_SETUP=false
 DO_DOWNLOAD=false
 DO_PREPARE=false
 DO_TRAIN=false
+DO_TRAIN_API=false
 DO_EVAL_LOCAL=false
 DO_EVAL_API=false
 DO_CLASSIFY=false
@@ -48,6 +51,7 @@ TASK="all"
 MODEL_OVERRIDE=""   # explicit --model; empty = use resolved default below
 CLEAN=false
 DRY_RUN=false
+FORCE=false
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -63,19 +67,22 @@ while [[ $# -gt 0 ]]; do
         --download)    DO_DOWNLOAD=true;   ANY_STEP=true; shift ;;
         --prepare)     DO_PREPARE=true;    ANY_STEP=true; shift ;;
         --train)       DO_TRAIN=true;      ANY_STEP=true; shift ;;
+        --train-api)   DO_TRAIN_API=true;  ANY_STEP=true; shift ;;
         --eval-local)  DO_EVAL_LOCAL=true; ANY_STEP=true; shift ;;
         --eval-api)    DO_EVAL_API=true;   ANY_STEP=true; shift ;;
         --classify)    DO_CLASSIFY=true;   ANY_STEP=true; shift ;;
         --dashboard)   DO_DASHBOARD=true;  ANY_STEP=true; shift ;;
         --all)
             DO_SETUP=true; DO_DOWNLOAD=true; DO_PREPARE=true; DO_TRAIN=true
-            DO_EVAL_LOCAL=true; DO_EVAL_API=true; DO_CLASSIFY=true; DO_DASHBOARD=true
+            DO_TRAIN_API=true; DO_EVAL_LOCAL=true; DO_EVAL_API=true
+            DO_CLASSIFY=true; DO_DASHBOARD=true
             ANY_STEP=true; shift ;;
         --smoke-test)  SMOKE_TEST=true;        shift ;;
         --task)        TASK="$2";              shift 2 ;;
         --model)       MODEL_OVERRIDE="$2";    shift 2 ;;
         --clean)       CLEAN=true;             shift ;;
         --dry-run)     DRY_RUN=true;           shift ;;
+        --force)       FORCE=true;             shift ;;
         -h|--help)     usage ;;
         *) echo "Unknown argument: $1" >&2; usage ;;
     esac
@@ -87,7 +94,7 @@ if [[ "$ANY_STEP" == false ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Resolve model — mirrors train.py defaults so all steps stay in sync
+# Resolve model — mirrors train_local.py defaults so all steps stay in sync
 # ---------------------------------------------------------------------------
 if [[ -n "$MODEL_OVERRIDE" ]]; then
     MODEL="$MODEL_OVERRIDE"
@@ -166,6 +173,9 @@ if [[ "$SMOKE_TEST" == true ]]; then SMOKE_FLAG="--smoke-test"; fi
 DRY_FLAG=""
 if [[ "$DRY_RUN" == true ]]; then DRY_FLAG="--dry-run"; fi
 
+FORCE_FLAG=""
+if [[ "$FORCE" == true ]]; then FORCE_FLAG="--force"; fi
+
 # Glob-safe delete — skips patterns that match nothing.
 clean_paths() {
     local p hit
@@ -224,6 +234,11 @@ if [[ "$CLEAN" == true ]]; then
             "${REPO_ROOT}/results/predictions/local/${MODEL_G}/${TASK_G}/*.partial"
     fi
 
+    if [[ "$DO_TRAIN_API" == true ]]; then
+        API_MODEL_G=$(glob "${MODEL_OVERRIDE:-all}")
+        clean_paths "${REPO_ROOT}/results/training/api/${API_MODEL_G}/${TASK_G}"
+    fi
+
     if [[ "$DO_EVAL_API" == true ]]; then
         API_MODEL_G=$(glob "${MODEL_OVERRIDE:-all}")
         clean_paths \
@@ -253,7 +268,7 @@ if [[ "$DO_SETUP" == true ]]; then
     _resolve_python   # env now exists (created or updated by setup.sh)
 fi
 
-if [[ "$DO_EVAL_API" == true ]]; then
+if [[ "$DO_TRAIN_API" == true ]] || [[ "$DO_EVAL_API" == true ]]; then
     _check_api_keys
 fi
 
@@ -275,11 +290,22 @@ fi
 
 if [[ "$DO_TRAIN" == true ]]; then
     step "Train  (model=${MODEL}, task=${TASK})"
-    $PYTHON "${SCRIPTS}/train.py" \
+    $PYTHON "${SCRIPTS}/train_local.py" \
         --task "$TASK" \
         --model "$MODEL" \
         $SMOKE_FLAG \
         $DRY_FLAG
+fi
+
+if [[ "$DO_TRAIN_API" == true ]]; then
+    API_MODEL="${MODEL_OVERRIDE:-all}"
+    step "Train API  (model=${API_MODEL}, task=${TASK})"
+    $PYTHON "${SCRIPTS}/train_api.py" \
+        --task "$TASK" \
+        --model "$API_MODEL" \
+        $SMOKE_FLAG \
+        $DRY_FLAG \
+        $FORCE_FLAG
 fi
 
 if [[ "$DO_EVAL_LOCAL" == true ]]; then

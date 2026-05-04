@@ -4,7 +4,7 @@ max_seq_length: 2048
 load_in_4bit: true
 dtype: "bfloat16"
 enable_thinking: false
-vllm_task: generate
+vllm_task: auto
 fallback_model_id: "Qwen/Qwen2.5-7B-Instruct"
 lora:
   rank: 32
