@@ -7,6 +7,7 @@ import random
 import shutil
 import sys
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -16,9 +17,11 @@ from pydantic import BaseModel, Field
 
 import hashlib
 
-from checkpoint_utils import nv_prepared_dir
+from checkpoint_utils import atomic_write_json, nv_prepared_dir
+from pipeline.cache import rows_sha
 from pipeline.config import get_tasks
 from pipeline.paths import prompt_path
+from pipeline.validation import check_contamination, validate_dataset
 
 REPO_ROOT = Path(__file__).parent.parent
 SEED = 42
@@ -270,19 +273,51 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
             out.append(d)
         return out
 
-    # Write files
+    prefix = "smoke_" if smoke_test else ""
+    src_train = train_rows[:SMOKE_TRAIN_N] if smoke_test else train_rows
+    src_test  = test_rows[:SMOKE_TEST_N]  if smoke_test else test_rows
+    fmt_train = fmt_rows(src_train)
+    fmt_test  = fmt_test_prompts(src_test)
+    fmt_labs  = fmt_labels(src_test)
+
+    _, invalid_train = validate_dataset(fmt_train)
+    if invalid_train:
+        click.echo(f"  WARNING [{cfg.task_id}]: {len(invalid_train)} training rows failed validation", err=True)
+        for row in invalid_train[:3]:
+            click.echo(f"    {row['validation_error']}", err=True)
+
+    contam_hits = check_contamination(fmt_train, fmt_test)
+    if contam_hits:
+        click.echo(
+            f"  WARNING [{cfg.task_id}]: {len(contam_hits)} training examples overlap test set",
+            err=True,
+        )
+        for hit in contam_hits[:3]:
+            click.echo(f"    {hit}", err=True)
+
+    write_jsonl(fmt_train, out_dir / f"{prefix}train.jsonl")
+    write_jsonl(fmt_test,  out_dir / f"{prefix}test.jsonl")
+    write_jsonl(fmt_labs,  out_dir / f"{prefix}test_labels.jsonl")
     if smoke_test:
-        smoke_train = train_rows[:SMOKE_TRAIN_N]
-        smoke_test_rows = test_rows[:SMOKE_TEST_N]
-        write_jsonl(fmt_rows(smoke_train), out_dir / "smoke_train.jsonl")
-        write_jsonl(fmt_test_prompts(smoke_test_rows), out_dir / "smoke_test.jsonl")
-        write_jsonl(fmt_labels(smoke_test_rows), out_dir / "smoke_test_labels.jsonl")
-        click.echo(f"  [{cfg.task_id}] Done — {len(smoke_test_rows)} smoke_test, {len(smoke_train)} smoke_train")
+        click.echo(f"  [{cfg.task_id}] Done — {len(src_test)} smoke_test, {len(src_train)} smoke_train")
     else:
-        write_jsonl(fmt_rows(train_rows), out_dir / "train.jsonl")
-        write_jsonl(fmt_test_prompts(test_rows), out_dir / "test.jsonl")
-        write_jsonl(fmt_labels(test_rows), out_dir / "test_labels.jsonl")
-        click.echo(f"  [{cfg.task_id}] Done — {len(test_rows)} test, {len(train_rows)} train")
+        click.echo(f"  [{cfg.task_id}] Done — {len(src_test)} test, {len(src_train)} train")
+
+    atomic_write_json(
+        {
+            "task_id": cfg.task_id,
+            "prompt_sha": prompt_sha,
+            "train_sha": rows_sha(fmt_train),
+            "test_sha": rows_sha(fmt_test),
+            "n_train": len(fmt_train),
+            "n_test": len(fmt_test),
+            "validation_errors": len(invalid_train),
+            "contamination_hits": len(contam_hits),
+            "smoke_test": smoke_test,
+            "prepared_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        },
+        out_dir / "dataset_meta.json",
+    )
 
     # Prompt versioning sidecar — records which prompt produced this prepared data.
     (out_dir / "prompt_sha.txt").write_text(prompt_sha + "\n")

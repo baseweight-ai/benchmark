@@ -42,6 +42,7 @@ from checkpoint_utils import (
     training_log,
 )
 from utils import write_jsonl
+from pipeline.cache import inputs_changed, training_inputs_hash
 from pipeline.config import get_local_models, get_tasks
 from pipeline.paths import adapter_path, training_meta_path
 from pipeline.versioning import git_sha as _git_sha
@@ -201,6 +202,7 @@ def run_training_task(
     adapter_dir: Path,
     log_dir: Path,
     smoke_test: bool,
+    input_hash: str = "",
 ) -> dict:
     """Load model, train, save adapter. Returns metadata dict.
 
@@ -382,6 +384,7 @@ def run_training_task(
         "model_used": model_id,
         "substituted": substituted,
         "git_sha": _git_sha(),
+        "input_hash": input_hash,
     }
     atomic_write_json(meta, log_dir / "metadata.json")
     atomic_write_json(meta, ckpt_dir / "metadata.json")
@@ -439,14 +442,25 @@ def train_one(
     epochs = 1 if smoke_test else get_epochs(n_train)
     click.echo(f"  [{model_cfg.model_short}/{task_id}/{CONDITION}] n={n_train}, epochs={epochs}, seq_len={hw_cfg.seq_len}")
 
+    input_hash = training_inputs_hash(data_path, {
+        "epochs": epochs,
+        "smoke_test": smoke_test,
+        "lora": model_cfg.lora,
+        "training": model_cfg.training,
+        "seq_len": hw_cfg.seq_len,
+        "load_in_4bit": hw_cfg.load_in_4bit,
+    })
+    meta_path = log_dir / "metadata.json"
+
     prior_state = load_train_state(model_cfg.model_short, task_id, CONDITION)
     if prior_state and prior_state.get("status") == "complete":
-        click.echo(f"  SKIP [{model_cfg.model_short}/{task_id}/{CONDITION}]: already complete")
-        meta_path = log_dir / "metadata.json"
-        if meta_path.exists():
-            with open(meta_path) as f:
-                return json.load(f)
-        return {}
+        if not inputs_changed(input_hash, meta_path):
+            click.echo(f"  SKIP [{model_cfg.model_short}/{task_id}/{CONDITION}]: already complete")
+            if meta_path.exists():
+                with open(meta_path) as f:
+                    return json.load(f)
+            return {}
+        click.echo(f"  RETRAIN [{model_cfg.model_short}/{task_id}/{CONDITION}]: inputs changed")
 
     if dry_run:
         click.echo(f"  [dry-run] Would train {model_cfg.model_id} on {data_path.name}")
@@ -482,6 +496,7 @@ def train_one(
             adapter_dir=adapter_dir,
             log_dir=log_dir,
             smoke_test=smoke_test,
+            input_hash=input_hash,
         )
 
     if auto_upload:
