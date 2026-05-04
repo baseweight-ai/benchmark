@@ -9,14 +9,19 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
+import traceback as _tb
+
 import click
 import yaml
 from dotenv import load_dotenv
 
 from checkpoint_utils import atomic_write_json
 from pipeline.config import get_sft_base_models, get_tasks
+from pipeline.log import configure, get_logger
 from pipeline.paths import training_meta_path
 from pipeline.versioning import git_sha as _git_sha
+
+_log = get_logger("train-api")
 
 REPO_ROOT = Path(__file__).parent.parent
 load_dotenv(REPO_ROOT / ".env")
@@ -111,8 +116,12 @@ def run_sft_train(
         if not force:
             if cached.get("ft_model_id"):
                 click.echo(f"  SKIP [{model_id}/{task_id}/api-sft]: already trained → {cached['ft_model_id']}  (use --force to retrain)")
+                _log.info("training skip", model=model_id, task=task_id, condition="api-sft",
+                          event="stage_skip", reason="already trained")
             else:
                 click.echo(f"  SKIP [{model_id}/{task_id}/api-sft]: pending job {cached.get('job_id')} already submitted")
+                _log.info("training skip", model=model_id, task=task_id, condition="api-sft",
+                          event="stage_skip", reason="pending job already submitted")
             return
     except FileNotFoundError:
         pass
@@ -123,8 +132,11 @@ def run_sft_train(
     job = _find_existing_sft_job(client, model_id, task_id, smoke_test)
     if job and job.status == "succeeded":
         click.echo(f"  Found completed job {job.id} on OpenAI → {job.fine_tuned_model}")
-        _write_sft_metadata(job, sft_path, model_id, mp)
+        meta = _write_sft_metadata(job, sft_path, model_id, mp)
         click.echo(f"  Wrote metadata to {mp.relative_to(REPO_ROOT)}")
+        _log.info("training complete", model=model_id, task=task_id, condition="api-sft",
+                  event="stage_complete", training_cost=meta["training_cost"],
+                  training_time_min=meta["training_time_min"], n_train=meta["n_train"])
         return
     elif job:
         click.echo(f"  Found in-progress job {job.id} (status={job.status}), attaching...")
@@ -189,6 +201,9 @@ def run_sft_train(
     meta = _write_sft_metadata(job, sft_path, model_id, mp)
     click.echo(f"  Fine-tuned model: {meta['ft_model_id']}, cost: ${meta['training_cost']:.3f}")
     click.echo(f"  Wrote metadata to {mp.relative_to(REPO_ROOT)}")
+    _log.info("training complete", model=model_id, task=task_id, condition="api-sft",
+              event="stage_complete", training_cost=meta["training_cost"],
+              training_time_min=meta["training_time_min"], n_train=meta["n_train"])
 
 
 @click.command()
@@ -207,11 +222,13 @@ def main(model: str, task: str, dry_run: bool, smoke_test: bool, force: bool, su
     With --submit-only, jobs are submitted and pending metadata is written immediately,
     then the process exits. eval_api.py will wait for completion when it reaches api-sft.
     """
+    configure(REPO_ROOT)
     model_ids = ALL_SFT_MODELS if model == "all" else [model]
     task_ids = ALL_TASKS if task == "all" else [task]
 
     if not dry_run and not os.environ.get("OPENAI_API_KEY"):
         click.echo("  WARNING: OPENAI_API_KEY not set", err=True)
+        _log.warning("OPENAI_API_KEY not set")
 
     work = [
         (mid, tid)
@@ -231,22 +248,29 @@ def main(model: str, task: str, dry_run: bool, smoke_test: bool, force: bool, su
                 run_sft_train(mid, tid, dry_run, smoke_test, force, submit_only)
             except Exception as exc:
                 click.echo(f"  ERROR [{mid}/{tid}]: {exc}", err=True)
-                import traceback; traceback.print_exc()
+                _tb.print_exc()
+                _log.error(f"training failed: {type(exc).__name__}: {exc}",
+                           model=mid, task=tid, condition="api-sft",
+                           exc=str(exc), traceback=_tb.format_exc())
                 failures.append((f"{mid}/{tid}", str(exc)))
     else:
         click.echo(f"  Submitting {len(work)} fine-tuning job(s) concurrently...")
         with ThreadPoolExecutor(max_workers=min(len(work), 10)) as executor:
             futures = {
-                executor.submit(run_sft_train, mid, tid, False, smoke_test, force, False): f"{mid}/{tid}"
+                executor.submit(run_sft_train, mid, tid, False, smoke_test, force, False): (mid, tid)
                 for mid, tid in work
             }
             for future in as_completed(futures):
-                key = futures[future]
+                mid, tid = futures[future]
                 try:
                     future.result()
                 except Exception as exc:
+                    key = f"{mid}/{tid}"
                     click.echo(f"  ERROR [{key}]: {exc}", err=True)
-                    import traceback; traceback.print_exc()
+                    _tb.print_exc()
+                    _log.error(f"training failed: {type(exc).__name__}: {exc}",
+                               model=mid, task=tid, condition="api-sft",
+                               exc=str(exc), traceback=_tb.format_exc())
                     failures.append((key, str(exc)))
 
     if failures:

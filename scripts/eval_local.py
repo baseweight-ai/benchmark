@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import traceback as _tb
+
 import click
 import yaml
 from dotenv import load_dotenv
@@ -22,8 +24,11 @@ from pydantic import BaseModel, Field
 from checkpoint_utils import append_jsonl, atomic_write_json, finalize_partial, load_partial_ids, partial_path
 from utils import build_messages, load_jsonl
 from pipeline.config import get_local_models, get_tasks
+from pipeline.log import configure, get_logger
 from pipeline.paths import adapter_path, pred_path
 from pipeline.providers import call_vllm  # noqa: F401  # re-exported for test patching
+
+_log = get_logger("eval-local")
 
 REPO_ROOT = Path(__file__).parent.parent
 load_dotenv(REPO_ROOT / ".env")
@@ -264,6 +269,8 @@ async def run_eval(
 
     if out_path.exists():
         click.echo(f"  SKIP [{model_cfg.model_short}/{task_id}/{condition}]: already exists")
+        _log.info("eval skip", model=model_cfg.model_short, task=task_id, condition=condition,
+                  event="stage_skip", reason="already exists")
         return
 
     pp = partial_path(out_path)
@@ -279,6 +286,7 @@ async def run_eval(
         return
 
     semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+    totals = [0, 0]  # [input_tokens, output_tokens]
 
     async def process_row(row: dict, session: "aiohttp.ClientSession") -> None:
         msgs = build_messages(row, few_shot, condition)
@@ -288,6 +296,8 @@ async def run_eval(
             )
         except Exception as exc:
             text, in_tok, out_tok, lat, ttft = f"ERROR: {exc}", 0, 0, 0.0, 0.0
+        totals[0] += in_tok
+        totals[1] += out_tok
         result = {
             "id": row.get("id", ""),
             "model": model_cfg.model_short,
@@ -303,6 +313,8 @@ async def run_eval(
         }
         append_jsonl(result, pp)
 
+    _log.info("evaluating", model=model_cfg.model_short, task=task_id, condition=condition,
+              n_rows=len(pending_rows), n_total=len(test_rows))
     click.echo(f"  Evaluating {model_cfg.model_short}/{task_id}/{condition} ({len(pending_rows)}/{len(test_rows)} rows)...")
     from tqdm.asyncio import tqdm
     t_wall_start = time.time()
@@ -321,6 +333,9 @@ async def run_eval(
     atomic_write_json({"eval_wall_time_s": eval_wall_time_s}, wall_path)
 
     click.echo(f"  Saved {len(test_rows)} predictions to {out_path.relative_to(REPO_ROOT)}")
+    _log.info("eval complete", model=model_cfg.model_short, task=task_id, condition=condition,
+              event="stage_complete", n_rows=len(test_rows),
+              total_input_tokens=totals[0], total_output_tokens=totals[1])
 
 
 @click.command()
@@ -336,6 +351,7 @@ def main(model: Optional[str], task: str, condition: str, dry_run: bool, smoke_t
     upfront, eliminating per-task server restarts. Zero-shot, 5-shot, and all
     LoRA conditions are served from the same running instance.
     """
+    configure(REPO_ROOT)
     if model is None:
         model = "qwen2.5-0.5b" if smoke_test else "qwen3-8b"
     model_ids = ALL_MODELS if model == "all" else [model]
@@ -395,6 +411,9 @@ def main(model: Optional[str], task: str, condition: str, dry_run: bool, smoke_t
                     asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, model_name, dry_run=True, smoke_test=smoke_test))
                 except Exception as exc:
                     click.echo(f"  ERROR [{mid}/{tid}/{cond}]: {exc}", err=True)
+                    _log.error(f"eval failed: {type(exc).__name__}: {exc}",
+                               model=mid, task=tid, condition=cond,
+                               exc=str(exc), traceback=_tb.format_exc())
                     failures.append((f"{mid}/{tid}/{cond}", str(exc)))
             continue
 
@@ -417,9 +436,14 @@ def main(model: Optional[str], task: str, condition: str, dry_run: bool, smoke_t
                     asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, model_name, dry_run=False, smoke_test=smoke_test))
                 except Exception as exc:
                     click.echo(f"  ERROR [{mid}/{tid}/{cond}]: {exc}", err=True)
+                    _log.error(f"eval failed: {type(exc).__name__}: {exc}",
+                               model=mid, task=tid, condition=cond,
+                               exc=str(exc), traceback=_tb.format_exc())
                     failures.append((f"{mid}/{tid}/{cond}", str(exc)))
         except Exception as exc:
             click.echo(f"  ERROR [{mid}]: {exc}", err=True)
+            _log.error(f"vLLM server error: {type(exc).__name__}: {exc}",
+                       model=mid, exc=str(exc), traceback=_tb.format_exc())
             failures.append((mid, str(exc)))
         finally:
             stop_vllm_server(proc)

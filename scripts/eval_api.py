@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import traceback as _tb
+
 import click
 import yaml
 from dotenv import load_dotenv
@@ -18,8 +20,11 @@ from pydantic import BaseModel, Field
 from checkpoint_utils import append_jsonl, finalize_partial, load_partial_ids, partial_path
 from utils import build_messages, load_jsonl
 from pipeline.config import get_model_conditions, get_openai_models, get_tasks
+from pipeline.log import configure, get_logger
 from pipeline.paths import pred_path, training_meta_path
 from pipeline.providers import call_openai  # noqa: F401  # re-exported for test patching
+
+_log = get_logger("eval-api")
 
 REPO_ROOT = Path(__file__).parent.parent
 load_dotenv(REPO_ROOT / ".env")
@@ -154,6 +159,8 @@ async def run_eval(
     out_path = pred_path(REPO_ROOT, "api", model_id, task_id, condition)
     if out_path.exists():
         click.echo(f"  SKIP [{model_id}/{task_id}/{condition}]: already exists")
+        _log.info("eval skip", model=model_id, task=task_id, condition=condition,
+                  event="stage_skip", reason="already exists")
         return
 
     pp = partial_path(out_path)
@@ -171,6 +178,8 @@ async def run_eval(
     client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
     semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 
+    totals = [0, 0]  # [input_tokens, output_tokens]
+
     async def process_row(row: dict) -> None:
         msgs = build_messages(row, few_shot, condition)
         ground_truth = row.get("label", "")
@@ -180,6 +189,8 @@ async def run_eval(
             )
         except Exception as exc:
             text, in_tok, out_tok, lat, ttft = f"ERROR: {exc}", 0, 0, 0, 0.0
+        totals[0] += in_tok
+        totals[1] += out_tok
         result = {
             "id": row.get("id", ""),
             "model": model_id,
@@ -195,12 +206,17 @@ async def run_eval(
         }
         append_jsonl(result, pp)
 
+    _log.info("evaluating", model=model_id, task=task_id, condition=condition,
+              n_rows=len(pending_rows), n_total=len(test_rows))
     click.echo(f"  Evaluating {model_id}/{task_id}/{condition} ({len(pending_rows)}/{len(test_rows)} rows)...")
     from tqdm.asyncio import tqdm
     await tqdm.gather(*[process_row(r) for r in pending_rows], desc=f"{model_id}/{task_id}")
 
     finalize_partial(pp, out_path)
     click.echo(f"  Saved {len(test_rows)} predictions to {out_path.relative_to(REPO_ROOT)}")
+    _log.info("eval complete", model=model_id, task=task_id, condition=condition,
+              event="stage_complete", n_rows=len(test_rows),
+              total_input_tokens=totals[0], total_output_tokens=totals[1])
 
 
 @click.command()
@@ -214,12 +230,14 @@ def main(model: str, task: str, condition: str, dry_run: bool, smoke_test: bool)
 
     For api-sft conditions, training metadata must already exist (run train_api.py first).
     """
+    configure(REPO_ROOT)
     default_models = SMOKE_MODELS if smoke_test else PROD_MODELS
     model_ids = default_models if model == "all" else [model]
 
     if not dry_run and any(m in OPENAI_MODELS for m in model_ids):
         if not os.environ.get("OPENAI_API_KEY"):
             click.echo("  WARNING: OPENAI_API_KEY not set", err=True)
+            _log.warning("OPENAI_API_KEY not set")
     task_ids = ALL_TASKS if task == "all" else [task]
     failures = []
 
@@ -241,7 +259,10 @@ def main(model: str, task: str, condition: str, dry_run: bool, smoke_test: bool)
                         await run_eval(mid, tid, cond, task_cfg, dry_run, smoke_test)
                 except Exception as exc:
                     click.echo(f"  ERROR [{mid}/{tid}]: {exc}", err=True)
-                    import traceback; traceback.print_exc()
+                    _tb.print_exc()
+                    _log.error(f"eval failed: {type(exc).__name__}: {exc}",
+                               model=mid, task=tid,
+                               exc=str(exc), traceback=_tb.format_exc())
                     failures.append((f"{mid}/{tid}", str(exc)))
 
     asyncio.run(run_all())

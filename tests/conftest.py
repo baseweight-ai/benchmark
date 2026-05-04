@@ -89,6 +89,14 @@ def toy_test_prompts():
     return make_test_prompts(n=5)
 
 
+@pytest.fixture(autouse=True)
+def reset_circuit_breakers():
+    from pipeline.providers import _openai_cb, _vllm_cb
+    yield
+    _openai_cb.reset()
+    _vllm_cb.reset()
+
+
 @pytest.fixture
 def tmp_network_volume(tmp_path, monkeypatch):
     """Redirect NETWORK_VOLUME to a temp dir so checkpoint tests don't touch /workspace."""

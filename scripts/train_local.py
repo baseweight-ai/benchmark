@@ -44,8 +44,11 @@ from checkpoint_utils import (
 from utils import write_jsonl
 from pipeline.cache import inputs_changed, training_inputs_hash
 from pipeline.config import get_local_models, get_tasks
+from pipeline.log import configure, get_logger
 from pipeline.paths import adapter_path, training_meta_path
 from pipeline.versioning import git_sha as _git_sha
+
+_log = get_logger("train-local")
 
 REPO_ROOT = Path(__file__).parent.parent
 ALL_TASKS: list[str] = get_tasks()
@@ -456,6 +459,8 @@ def train_one(
     if prior_state and prior_state.get("status") == "complete":
         if not inputs_changed(input_hash, meta_path):
             click.echo(f"  SKIP [{model_cfg.model_short}/{task_id}/{CONDITION}]: already complete")
+            _log.info("training skip", model=model_cfg.model_short, task=task_id, condition=CONDITION,
+                      event="stage_skip")
             if meta_path.exists():
                 with open(meta_path) as f:
                     return json.load(f)
@@ -499,6 +504,11 @@ def train_one(
             input_hash=input_hash,
         )
 
+    _log.info("training complete", model=model_cfg.model_short, task=task_id, condition=CONDITION,
+              event="stage_complete", training_cost=meta.get("training_cost"),
+              training_time_min=meta.get("training_time_min"), eval_loss=meta.get("eval_loss"),
+              n_train=meta.get("n_train"))
+
     if auto_upload:
         _upload_adapter(model_cfg.model_short, task_id, CONDITION)
 
@@ -526,6 +536,7 @@ def _upload_adapter(model_short: str, task_id: str, condition: str) -> None:
 @click.option("--smoke-test", is_flag=True, help="Smoke test: reduced seq_len/rank/alpha, 4 threads.")
 def main(model: Optional[str], task: str, cap: Optional[int], auto_upload: bool, dry_run: bool, smoke_test: bool) -> None:
     """QLoRA fine-tune one or more model/task combinations."""
+    configure(REPO_ROOT)
     if smoke_test:
         torch.set_num_threads(4)
         click.echo("Smoke-test mode: 4 threads, seq_len=256, r=4.")
@@ -556,6 +567,9 @@ def main(model: Optional[str], task: str, cap: Optional[int], auto_upload: bool,
             except Exception as exc:
                 click.echo(f"  ERROR [{mid}/{tid}]: {exc}", err=True)
                 traceback.print_exc()
+                _log.error(f"training failed: {type(exc).__name__}: {exc}",
+                           model=mid, task=tid, condition=CONDITION,
+                           exc=str(exc), traceback=traceback.format_exc())
                 failures.append((f"{mid}/{tid}", str(exc)))
 
     if failures:
