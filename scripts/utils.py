@@ -1,15 +1,35 @@
 """Shared utilities for benchmark pipeline scripts."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import random
 from pathlib import Path
-
 
 
 def load_jsonl(path: Path) -> list[dict]:
     with open(path) as f:
-        return [json.loads(line) for line in f]
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def rows_hash(rows: list[dict]) -> str:
+    """Stable hash of a list of dicts (sort_keys for cross-source consistency)."""
+    h = hashlib.sha256(json.dumps(rows, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
+    return h
+
+
+def read_prompt_sha(prepared: Path) -> str | None:
+    p = prepared / "prompt_sha.txt"
+    return p.read_text().strip() if p.exists() else None
+
+
+def seed_sample(rows: list[dict], n: int, seed: int) -> list[dict]:
+    """Reproducibly sample n rows from rows using the given seed."""
+    rng = random.Random(seed)
+    pool = list(rows)
+    rng.shuffle(pool)
+    return pool[:n]
 
 
 def write_jsonl(rows: list[dict], path: Path) -> None:

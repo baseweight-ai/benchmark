@@ -1,9 +1,12 @@
 """Assemble results.json for the benchmark dashboard from summaries and metadata."""
 from __future__ import annotations
 
+import csv
 import json
 import math
 import os
+import random
+from io import StringIO
 from pathlib import Path
 from typing import Optional
 
@@ -182,15 +185,25 @@ def compute_tco_12mo(
 
 
 def load_summary(source: str, model_short: str, task_id: str, condition: str) -> Optional[dict]:
-    path = REPO_ROOT / "results" / "summaries" / source / model_short / task_id / f"{condition}.json"
-    if not path.exists():
-        return None
-    with open(path) as f:
-        return json.load(f)
+    summaries_root = REPO_ROOT / "results" / "summaries" / source / model_short / task_id
+    # Prefer aggregated multi-seed summary when it exists.
+    agg_path = summaries_root / f"{condition}_agg.json"
+    if agg_path.exists():
+        with open(agg_path) as f:
+            return json.load(f)
+    base_path = summaries_root / f"{condition}.json"
+    if base_path.exists():
+        with open(base_path) as f:
+            return json.load(f)
+    return None
 
 
 def discover_summaries() -> list[tuple[str, str, str, str]]:
-    """Return (source, model, task, condition) for every summary file found."""
+    """Return (source, model, task, condition) for base condition files only.
+
+    Skips seed-specific (*_seedN.json) and aggregated (*_agg.json) files —
+    load_summary() will transparently return the agg variant when it exists.
+    """
     summaries_root = REPO_ROOT / "results" / "summaries"
     found = []
     if not summaries_root.exists():
@@ -205,7 +218,10 @@ def discover_summaries() -> list[tuple[str, str, str, str]]:
                 if not task_dir.is_dir():
                     continue
                 for f in sorted(task_dir.glob("*.json")):
-                    found.append((source_dir.name, model_dir.name, task_dir.name, f.stem))
+                    stem = f.stem
+                    if "_seed" in stem or stem.endswith("_agg"):
+                        continue
+                    found.append((source_dir.name, model_dir.name, task_dir.name, stem))
     return found
 
 
@@ -260,6 +276,11 @@ def build_result(
 
     tco_12mo = compute_tco_12mo(model_id, training_cost, cost_per_query or 0, daily_volume, pricing, eval_wall_time_s, n_predictions) if cost_per_query is not None else None
 
+    metric_std = summary.get("metric_std") if summary else None
+    metric_ci_lo = summary.get("metric_ci_lo") if summary else None
+    metric_ci_hi = summary.get("metric_ci_hi") if summary else None
+    n_seeds = summary.get("n_seeds") if summary else None
+
     return {
         # Identity
         "model_id": model_id,
@@ -267,9 +288,13 @@ def build_result(
         "family": meta["family"],
         "task_id": task_id,
         "condition": _condition_label(condition),
-        # Accuracy
+        # Accuracy (mean when multi-seed, single value otherwise)
         "metric_id": summary["metric_id"] if summary else None,
         "metric_value": metric_value,
+        "metric_std": round(metric_std, 4) if metric_std is not None else None,
+        "metric_ci_lo": round(metric_ci_lo, 4) if metric_ci_lo is not None else None,
+        "metric_ci_hi": round(metric_ci_hi, 4) if metric_ci_hi is not None else None,
+        "n_seeds": n_seeds,
         "n_predictions": n_predictions,
         # Cost (derived)
         "cost_per_query": round(cost_per_query, 8) if cost_per_query is not None else None,
@@ -296,6 +321,24 @@ def build_result(
         "eval_wall_time_s": eval_wall_time_s,
     }
 
+
+
+def _sign_flip_p_value(gains: list[float], n_perm: int = 5000) -> Optional[float]:
+    """One-sided sign-flip permutation p-value: P(mean gain ≥ observed | H0: no effect).
+
+    H0 assumes gains are symmetric around 0. We flip each gain's sign randomly and
+    ask what fraction of permutations produce a mean as large as observed. Small
+    p-value → fine-tuned model is significantly better.
+    """
+    if len(gains) < 2:
+        return None
+    rng = random.Random(42)
+    obs = sum(gains) / len(gains)
+    count = sum(
+        1 for _ in range(n_perm)
+        if sum(g * rng.choice((-1, 1)) for g in gains) / len(gains) >= obs
+    )
+    return round(count / n_perm, 4)
 
 
 def _comparison(results: list[dict], fine_family: str, fine_cond: str, base_family: str, base_cond: str) -> dict:
@@ -340,12 +383,14 @@ def _comparison(results: list[dict], fine_family: str, fine_cond: str, base_fami
         m = len(s) // 2
         return s[m] if len(s) % 2 else (s[m - 1] + s[m]) / 2
 
+    p_value = _sign_flip_p_value(acc_deltas) if acc_deltas else None
     return {
         "tasks_won": tasks_won,
         "tasks_total": len(shared_tasks),
         "cost_per_correct_ratio": round(_mean(cp1k_ratios), 1) if cp1k_ratios else None,
         "avg_accuracy_gain_pp": round(_mean(acc_deltas) * 100, 1) if acc_deltas else None,
         "median_accuracy_gain_pp": round(_median(acc_deltas) * 100, 1) if acc_deltas else None,
+        "p_value_gain": p_value,
         "per_task": {
             t: {
                 "fine_metric": round(best_fine[t], 4),
@@ -418,6 +463,57 @@ def compute_stats(results: list[dict]) -> dict:
     }
 
 
+def _write_snapshot(data: dict, repo_root: Path, run_id: str) -> Path:
+    """Write an immutable snapshot of results.json for this run."""
+    from pipeline.paths import snapshot_path
+    from checkpoint_utils import atomic_write_json
+    snap = snapshot_path(repo_root, run_id)
+    snap.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(data, snap)
+    return snap
+
+
+def _export_tables(results: list[dict], out_dir: Path) -> None:
+    """Write CSV and Markdown summary tables to out_dir."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Per-task accuracy table: rows = models, cols = conditions
+    tasks = sorted({r["task_id"] for r in results})
+
+    # CSV: one row per (model, task, condition)
+    csv_path = out_dir / "results.csv"
+    fieldnames = ["model_id", "task_id", "condition", "metric_id", "metric_value",
+                  "metric_std", "metric_ci_lo", "metric_ci_hi",
+                  "cost_per_query", "avg_latency_ms", "n_predictions"]
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        w.writeheader()
+        for r in sorted(results, key=lambda x: (x["model_id"], x["task_id"], x["condition"])):
+            w.writerow({k: r.get(k) for k in fieldnames})
+
+    # Markdown: accuracy leaderboard per task
+    md_lines = ["# Benchmark Results\n"]
+    for task in tasks:
+        task_rows = [r for r in results if r["task_id"] == task and r.get("metric_value") is not None]
+        if not task_rows:
+            continue
+        md_lines.append(f"\n## {task}\n")
+        md_lines.append("| Model | Condition | Metric | Value | Std | CI |")
+        md_lines.append("|-------|-----------|--------|-------|-----|-----|")
+        for r in sorted(task_rows, key=lambda x: -(x["metric_value"] or 0)):
+            std = f"±{r['metric_std']:.4f}" if r.get("metric_std") is not None else ""
+            ci = (f"[{r['metric_ci_lo']:.4f},{r['metric_ci_hi']:.4f}]"
+                  if r.get("metric_ci_lo") is not None else "")
+            md_lines.append(
+                f"| {r['model_id']} | {r['condition']} | {r.get('metric_id','')} "
+                f"| {r['metric_value']:.4f} | {std} | {ci} |"
+            )
+
+    md_path = out_dir / "results.md"
+    md_path.write_text("\n".join(md_lines) + "\n")
+    click.echo(f"  Tables written to {out_dir}")
+
+
 def merge_results(fresh: list[dict], existing_path: Path) -> list[dict]:
     """Merge fresh results with existing ones.
 
@@ -470,10 +566,20 @@ def build_dashboard_data(daily_volume: int = 10000) -> dict:
 @click.command()
 @click.option("--daily-volume", default=10000, help="Daily query volume for TCO calc")
 @click.option("--out", default=None, help="Output path (default: data/benchmark/results.json in site)")
+@click.option("--run-id", "run_id", default=None, help="Run ID for immutable snapshot (from pipeline manifest)")
 @click.option("--also-benchmark-repo", is_flag=True, help="Also write to dashboard-data/results.json in benchmark repo")
 @click.option("--merge", is_flag=True, help="Preserve existing results where new run has no data (matched by model+task+condition)")
+@click.option("--export-tables", is_flag=True, help="Also write CSV and Markdown tables to results/tables/")
 @click.option("--dry-run", is_flag=True)
-def main(daily_volume: int, out: Optional[str], also_benchmark_repo: bool, merge: bool, dry_run: bool) -> None:
+def main(
+    daily_volume: int,
+    out: Optional[str],
+    run_id: Optional[str],
+    also_benchmark_repo: bool,
+    merge: bool,
+    export_tables: bool,
+    dry_run: bool,
+) -> None:
     """Generate dashboard results.json from summaries."""
     from datetime import datetime, timezone
     data = build_dashboard_data(daily_volume)
@@ -494,11 +600,15 @@ def main(daily_volume: int, out: Optional[str], also_benchmark_repo: bool, merge
         data.update(compute_stats(merged))
 
     data["generated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    if run_id:
+        data["run_id"] = run_id
 
     if dry_run:
         n_results = len(data["results"])
         n_with_data = sum(1 for r in data["results"] if r["metric_value"] is not None)
         click.echo(f"  [dry-run] Would write {n_results} results ({n_with_data} with data) to {out_path}")
+        if run_id:
+            click.echo(f"  [dry-run] Would write snapshot for run {run_id}")
         return
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -518,6 +628,13 @@ def main(daily_volume: int, out: Optional[str], also_benchmark_repo: bool, merge
         with open(repo_out, "w") as f:
             json.dump(data, f, indent=2)
         click.echo(f"  Also written to {repo_out}")
+
+    if run_id:
+        snap = _write_snapshot(data, REPO_ROOT, run_id)
+        click.echo(f"  Snapshot written to {snap}")
+
+    if export_tables:
+        _export_tables(data["results"], REPO_ROOT / "results" / "tables")
 
 
 if __name__ == "__main__":

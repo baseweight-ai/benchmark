@@ -10,6 +10,8 @@ max_output_tokens: 8
 test_sample_size: 1000
 test_split: validation
 training_cap: 10000
+lm_eval_task_id: medmcqa
+eval_axes: [accuracy, cost, latency, instruction_following]
 prompt_file: "prompts/medmcqa.json"
 label_field: cop
 label_type: letter_mapped

@@ -1,6 +1,9 @@
 """Classify prediction errors and compute primary metrics per task."""
 from __future__ import annotations
 
+import json
+import math
+import random
 import re
 import sys
 from collections import defaultdict
@@ -9,7 +12,7 @@ from typing import Optional
 
 import click
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from checkpoint_utils import atomic_write_json
 from utils import load_jsonl, write_jsonl as _write_jsonl
@@ -140,6 +143,59 @@ def classify_extraction(prediction: str, ground_truth: str, f1_threshold_partial
 
 
 
+# ── Bootstrap CI and multi-seed aggregation ───────────────────────────────
+
+def bootstrap_ci(
+    values: list[float], n_boot: int = 5000, ci: float = 0.95
+) -> tuple[float, float]:
+    """Return (lower, upper) percentile bootstrap CI for the mean."""
+    if len(values) < 2:
+        v = values[0] if values else 0.0
+        return v, v
+    rng = random.Random(0)
+    n = len(values)
+    means = sorted(
+        sum(rng.choices(values, k=n)) / n for _ in range(n_boot)
+    )
+    alpha = (1 - ci) / 2
+    return means[int(alpha * n_boot)], means[int((1 - alpha) * n_boot)]
+
+
+def aggregate_seed_summaries(summaries: list[dict]) -> dict:
+    """Aggregate summaries from multiple eval seeds into mean ± std + CI."""
+    metric_values = [s["metric_value"] for s in summaries if s.get("metric_value") is not None]
+    if not metric_values:
+        return {}
+    n = len(metric_values)
+    mean = sum(metric_values) / n
+    variance = sum((v - mean) ** 2 for v in metric_values) / n
+    std = math.sqrt(variance)
+    ci_lo, ci_hi = bootstrap_ci(metric_values)
+    # Aggregate error counts by summing across seeds
+    all_counts: dict[str, int] = defaultdict(int)
+    for s in summaries:
+        for k, v in s.get("error_counts", {}).items():
+            all_counts[k] += v
+    base = summaries[0]  # representative row for metadata
+    return {
+        "model": base.get("model"),
+        "task_id": base.get("task_id"),
+        "condition": base.get("condition"),
+        "n_seeds": n,
+        "seed_metric_values": metric_values,
+        "metric_id": base.get("metric_id"),
+        "metric_value": round(mean, 4),    # mean used as the primary value
+        "metric_mean": round(mean, 4),
+        "metric_std": round(std, 4),
+        "metric_ci_lo": round(ci_lo, 4),
+        "metric_ci_hi": round(ci_hi, 4),
+        "n_predictions": sum(s.get("n_predictions", 0) for s in summaries),
+        "error_counts": dict(all_counts),
+        "prompt_sha": base.get("prompt_sha"),
+        "few_shot_hash": base.get("few_shot_hash"),
+    }
+
+
 # ── Primary metric computation ─────────────────────────────────────────────
 
 def compute_metric(task_cfg: TaskConfig, classified_rows: list[dict]) -> Optional[float]:
@@ -215,8 +271,13 @@ def process_model_task_condition(
     dry_run: bool,
     source: str = "local",
 ) -> Optional[dict]:
-    """Classify one predictions file and write summary."""
+    """Classify one predictions file and write summary.
+
+    condition is the filename stem, which may include a _seedN suffix.
+    """
     input_path = pred_path(REPO_ROOT, source, model_short, task_id, condition)
+    # Logical condition name strips any _seedN suffix for storage in summary.
+    base_condition = condition.split("_seed")[0] if "_seed" in condition else condition
     label = f"{source}/{model_short}/{task_id}/{condition}"
     if not input_path.exists():
         return None
@@ -264,14 +325,38 @@ def process_model_task_condition(
             rounded = round(elapsed, 1)
             eval_wall_time_s = rounded if rounded > 0 else None
 
+    n = len(predictions)
+    # Derived compliance/error rates
+    format_violation_n = counts.get("format_violation", 0)
+    refusal_n = counts.get("refusal", 0)
+    empty_n = counts.get("empty", 0)
+    partial_n = counts.get("partial", 0)
+    format_compliance_rate = round(1 - format_violation_n / n, 4) if n else None
+    refusal_rate = round(refusal_n / n, 4) if n else None
+    empty_rate = round(empty_n / n, 4) if n else None
+    partial_rate = round(partial_n / n, 4) if n else None
+
+    # Propagate reproducibility fields from first prediction row
+    first = predictions[0] if predictions else {}
+    prompt_sha = first.get("prompt_sha")
+    few_shot_hash = first.get("few_shot_hash")
+    eval_seed = first.get("eval_seed", 0)
+
     summary = {
         "model": model_short,
         "task_id": task_id,
-        "condition": condition,
-        "n_predictions": len(predictions),
+        "condition": base_condition,
+        "eval_seed": eval_seed,
+        "prompt_sha": prompt_sha,
+        "few_shot_hash": few_shot_hash,
+        "n_predictions": n,
         "metric_id": task_cfg.metric_id,
         "metric_value": round(metric_value, 4) if metric_value is not None else None,
         "error_counts": counts,
+        "format_compliance_rate": format_compliance_rate,
+        "refusal_rate": refusal_rate,
+        "empty_rate": empty_rate,
+        "partial_rate": partial_rate,
         "avg_latency_ms": round(avg_latency, 1) if avg_latency is not None else None,
         "ttft_p50_ms": round(ttft_p50, 1) if ttft_p50 is not None else None,
         "ttft_p95_ms": round(ttft_p95, 1) if ttft_p95 is not None else None,
@@ -280,6 +365,7 @@ def process_model_task_condition(
         "eval_wall_time_s": eval_wall_time_s,
     }
 
+    # condition_key is the filename stem (may include _seedN suffix)
     summary_out = summary_path(REPO_ROOT, source, model_short, task_id, condition)
     atomic_write_json(summary, summary_out)
     metric_str = f"{metric_value:.4f}" if metric_value is not None else "N/A"
@@ -338,17 +424,54 @@ def main(model: str, task: str, condition: str, source: str, dry_run: bool) -> N
                     failures.append((f"{src}/{ms}/{tid}", str(exc)))
                     continue
 
-                for cond in conditions:
+                # Collect base conditions plus any seed-specific files in the predictions dir
+                pred_dir = pred_root / src / ms / tid
+                seed_conds: list[str] = []
+                if pred_dir.exists():
+                    for f in sorted(pred_dir.glob("*_seed*.jsonl")):
+                        stem = f.stem
+                        if stem not in seed_conds:
+                            seed_conds.append(stem)
+
+                all_conds = list(conditions) + [c for c in seed_conds if c not in conditions]
+
+                # Track summaries by base condition for aggregation
+                seed_summaries: dict[str, list[dict]] = defaultdict(list)
+
+                for cond in all_conds:
                     try:
                         result = process_model_task_condition(
                             ms, tid, cond, task_cfg, valid_labels, dry_run, source=src
                         )
                         if result is not None:
                             processed += 1
+                            # Collect seed summaries for aggregation
+                            base_cond = cond.split("_seed")[0] if "_seed" in cond else None
+                            if base_cond:
+                                seed_summaries[base_cond].append(result)
                     except Exception as exc:
                         click.echo(f"  ERROR [{src}/{ms}/{tid}/{cond}]: {exc}", err=True)
                         import traceback; traceback.print_exc()
                         failures.append((f"{src}/{ms}/{tid}/{cond}", str(exc)))
+
+                # Aggregate multi-seed summaries per base condition
+                for base_cond, seed_summs in seed_summaries.items():
+                    if len(seed_summs) < 2:
+                        continue
+                    if dry_run:
+                        continue
+                    try:
+                        agg = aggregate_seed_summaries(seed_summs)
+                        agg["condition"] = base_cond
+                        agg_out = summary_path(REPO_ROOT, src, ms, tid, f"{base_cond}_agg")
+                        atomic_write_json(agg, agg_out)
+                        click.echo(
+                            f"  [{src}/{ms}/{tid}/{base_cond}] aggregated {len(seed_summs)} seeds → "
+                            f"mean={agg['metric_mean']:.4f} ±{agg['metric_std']:.4f} "
+                            f"[{agg['metric_ci_lo']:.4f}, {agg['metric_ci_hi']:.4f}]"
+                        )
+                    except Exception as exc:
+                        click.echo(f"  WARN: seed aggregation failed for {src}/{ms}/{tid}/{base_cond}: {exc}", err=True)
 
     if failures:
         click.echo(f"\nFAILED ({len(failures)}):")

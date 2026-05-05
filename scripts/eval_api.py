@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 from checkpoint_utils import append_jsonl, finalize_partial, load_partial_ids, partial_path
-from utils import build_messages, load_jsonl
+from utils import build_messages, load_jsonl, rows_hash as _rows_hash, read_prompt_sha as _read_prompt_sha, seed_sample as _seed_sample
 from pipeline.config import get_model_conditions, get_openai_models, get_tasks
 from pipeline.log import configure, get_logger
 from pipeline.paths import pred_path, training_meta_path
@@ -121,23 +121,45 @@ async def run_eval(
     task_cfg: TaskConfig,
     dry_run: bool,
     smoke_test: bool = False,
+    eval_seed: int = 0,
 ) -> None:
     """Evaluate one model/task/condition combination."""
     prepared = REPO_ROOT / "data" / "prepared" / task_id
     suffix = "smoke_" if smoke_test else ""
-    test_path = prepared / f"{suffix}test.jsonl"
+    base_test_path = prepared / f"{suffix}test.jsonl"
+    full_test_path = prepared / "test_full.jsonl"
     few_shot_path = prepared / ("smoke_train.jsonl" if smoke_test else "train.jsonl")
 
-    if not test_path.exists():
-        raise FileNotFoundError(f"test data not found: {test_path}")
+    if not base_test_path.exists():
+        raise FileNotFoundError(f"test data not found: {base_test_path}")
 
-    test_rows = load_jsonl(test_path)
+    # For seed > 0, resample from the full test set when it's available.
+    if eval_seed > 0 and full_test_path.exists() and not smoke_test:
+        meta_path = prepared / "dataset_meta.json"
+        if meta_path.exists():
+            with open(meta_path) as f:
+                n_test = json.load(f)["n_test"]
+        else:
+            n_test = len(load_jsonl(base_test_path))
+        full_rows = load_jsonl(full_test_path)
+        test_rows = _seed_sample(full_rows, n_test, eval_seed)
+    else:
+        test_rows = load_jsonl(base_test_path)
+
     labels_path = prepared / f"{suffix}test_labels.jsonl"
-    if labels_path.exists():
+    full_labels_path = prepared / "test_full_labels.jsonl"
+    if eval_seed > 0 and full_labels_path.exists() and not smoke_test:
+        label_map = {r["id"]: r["label"] for r in load_jsonl(full_labels_path)}
+    elif labels_path.exists():
         label_map = {r["id"]: r["label"] for r in load_jsonl(labels_path)}
-        for row in test_rows:
-            row["label"] = label_map.get(row["id"], "")
+    else:
+        label_map = {}
+    for row in test_rows:
+        row["label"] = label_map.get(row["id"], "")
+
     few_shot = load_jsonl(few_shot_path)[:5] if few_shot_path.exists() else []
+    prompt_sha = _read_prompt_sha(prepared)
+    few_shot_hash = _rows_hash(few_shot) if few_shot else None
 
     # Resolve the exact model string to use — task-specific for api-sft, base otherwise.
     # Never mutate the module-level OPENAI_MODELS dict; keep model_str local so
@@ -153,10 +175,12 @@ async def run_eval(
             raise ValueError(f"Model string not set for {model_id}")
 
     if dry_run:
-        click.echo(f"  [dry-run] Would eval {model_id} on {task_id}/{condition} ({len(test_rows)} examples)")
+        seed_label = f" seed={eval_seed}" if eval_seed > 0 else ""
+        click.echo(f"  [dry-run] Would eval {model_id} on {task_id}/{condition}{seed_label} ({len(test_rows)} examples)")
         return
 
-    out_path = pred_path(REPO_ROOT, "api", model_id, task_id, condition)
+    cond_key = condition if eval_seed == 0 else f"{condition}_seed{eval_seed}"
+    out_path = pred_path(REPO_ROOT, "api", model_id, task_id, cond_key)
     if out_path.exists():
         click.echo(f"  SKIP [{model_id}/{task_id}/{condition}]: already exists")
         _log.info("eval skip", model=model_id, task=task_id, condition=condition,
@@ -195,6 +219,9 @@ async def run_eval(
             "id": row.get("id", ""),
             "model": model_id,
             "condition": condition,
+            "eval_seed": eval_seed,
+            "prompt_sha": prompt_sha,
+            "few_shot_hash": few_shot_hash,
             "input": msgs[-1]["content"] if msgs else "",
             "output": text,
             "ground_truth": ground_truth,
@@ -206,9 +233,10 @@ async def run_eval(
         }
         append_jsonl(result, pp)
 
-    _log.info("evaluating", model=model_id, task=task_id, condition=condition,
+    seed_label = f" seed={eval_seed}" if eval_seed > 0 else ""
+    _log.info("evaluating", model=model_id, task=task_id, condition=condition, eval_seed=eval_seed,
               n_rows=len(pending_rows), n_total=len(test_rows))
-    click.echo(f"  Evaluating {model_id}/{task_id}/{condition} ({len(pending_rows)}/{len(test_rows)} rows)...")
+    click.echo(f"  Evaluating {model_id}/{task_id}/{condition}{seed_label} ({len(pending_rows)}/{len(test_rows)} rows)...")
     from tqdm.asyncio import tqdm
     await tqdm.gather(*[process_row(r) for r in pending_rows], desc=f"{model_id}/{task_id}")
 
@@ -223,9 +251,11 @@ async def run_eval(
 @click.option("--model", default="all", help=f"Model ID or 'all'. Choices: {', '.join(ALL_API_MODELS)}")
 @click.option("--task", default="all", help="Task ID or 'all'")
 @click.option("--condition", default="all", help="zero-shot|5-shot|api-sft|all")
+@click.option("--eval-seed", "eval_seed", default=0, type=int,
+              help="Evaluation seed (0 = deterministic sample; >0 resamples from test_full.jsonl)")
 @click.option("--dry-run", is_flag=True)
 @click.option("--smoke-test", is_flag=True)
-def main(model: str, task: str, condition: str, dry_run: bool, smoke_test: bool) -> None:
+def main(model: str, task: str, condition: str, eval_seed: int, dry_run: bool, smoke_test: bool) -> None:
     """Evaluate frontier OpenAI models on benchmark tasks.
 
     For api-sft conditions, training metadata must already exist (run train_api.py first).
@@ -256,7 +286,7 @@ def main(model: str, task: str, condition: str, dry_run: bool, smoke_test: bool)
                         click.echo(f"  SKIP [{mid}/{tid}/{condition}]: not supported for {mid}")
                         continue
                     for cond in conditions_to_run:
-                        await run_eval(mid, tid, cond, task_cfg, dry_run, smoke_test)
+                        await run_eval(mid, tid, cond, task_cfg, dry_run, smoke_test, eval_seed)
                 except Exception as exc:
                     click.echo(f"  ERROR [{mid}/{tid}]: {exc}", err=True)
                     _tb.print_exc()

@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 from checkpoint_utils import append_jsonl, atomic_write_json, finalize_partial, load_partial_ids, partial_path
-from utils import build_messages, load_jsonl
+from utils import build_messages, load_jsonl, rows_hash as _rows_hash, read_prompt_sha as _read_prompt_sha, seed_sample as _seed_sample
 from pipeline.config import get_local_models, get_tasks
 from pipeline.log import configure, get_logger
 from pipeline.paths import adapter_path, pred_path
@@ -78,16 +78,33 @@ def get_test_path(task_id: str, smoke_test: bool) -> Path:
     return prepared / ("smoke_test.jsonl" if smoke_test else "test.jsonl")
 
 
-def load_test_rows(task_id: str, smoke_test: bool) -> list[dict]:
-    """Load test prompts joined with their labels by id."""
+def load_test_rows(task_id: str, smoke_test: bool, eval_seed: int = 0) -> list[dict]:
+    """Load test prompts joined with their labels by id.
+
+    When eval_seed > 0 and test_full.jsonl exists, resamples the full set.
+    """
     prepared = REPO_ROOT / "data" / "prepared" / task_id
     suffix = "smoke_" if smoke_test else ""
-    prompts = load_jsonl(prepared / f"{suffix}test.jsonl")
-    labels_path = prepared / f"{suffix}test_labels.jsonl"
-    if labels_path.exists():
-        label_map = {r["id"]: r["label"] for r in load_jsonl(labels_path)}
-        for row in prompts:
-            row["label"] = label_map.get(row["id"], "")
+    base_path = prepared / f"{suffix}test.jsonl"
+    full_path = prepared / "test_full.jsonl"
+    full_labels_path = prepared / "test_full_labels.jsonl"
+
+    base_prompts = load_jsonl(base_path)
+
+    if eval_seed > 0 and full_path.exists() and not smoke_test:
+        full_prompts = load_jsonl(full_path)
+        prompts = _seed_sample(full_prompts, len(base_prompts), eval_seed)
+        if full_labels_path.exists():
+            label_map = {r["id"]: r["label"] for r in load_jsonl(full_labels_path)}
+        else:
+            label_map = {}
+    else:
+        prompts = base_prompts
+        labels_path = prepared / f"{suffix}test_labels.jsonl"
+        label_map = {r["id"]: r["label"] for r in load_jsonl(labels_path)} if labels_path.exists() else {}
+
+    for row in prompts:
+        row["label"] = label_map.get(row["id"], "")
     return prompts
 
 
@@ -244,6 +261,7 @@ async def run_eval(
     model_name: str,
     dry_run: bool,
     smoke_test: bool = False,
+    eval_seed: int = 0,
 ) -> None:
     """Run eval for one (task, condition). model_name is passed directly to vLLM:
     use model_cfg.model_id for base conditions, 'adapter_{task_id}' for LoRA.
@@ -252,15 +270,18 @@ async def run_eval(
 
     test_path = get_test_path(task_id, smoke_test)
     few_shot = get_few_shot(task_id, model_cfg.model_short, smoke_test)
+    prompt_sha = _read_prompt_sha(REPO_ROOT / "data" / "prepared" / task_id)
+    few_shot_hash = _rows_hash(few_shot) if few_shot else None
 
     if not test_path.exists():
         raise FileNotFoundError(f"test data not found: {test_path}")
 
-    test_rows = load_test_rows(task_id, smoke_test)
+    test_rows = load_test_rows(task_id, smoke_test, eval_seed)
 
+    cond_key = condition if eval_seed == 0 else f"{condition}_seed{eval_seed}"
     out_path = (
         REPO_ROOT / "results" / "predictions" / "local"
-        / model_cfg.model_short / task_id / f"{condition}.jsonl"
+        / model_cfg.model_short / task_id / f"{cond_key}.jsonl"
     )
 
     if dry_run:
@@ -302,6 +323,9 @@ async def run_eval(
             "id": row.get("id", ""),
             "model": model_cfg.model_short,
             "condition": condition,
+            "eval_seed": eval_seed,
+            "prompt_sha": prompt_sha,
+            "few_shot_hash": few_shot_hash,
             "input": msgs[-1]["content"] if msgs else "",
             "output": text,
             "ground_truth": row.get("label", ""),
@@ -313,9 +337,10 @@ async def run_eval(
         }
         append_jsonl(result, pp)
 
-    _log.info("evaluating", model=model_cfg.model_short, task=task_id, condition=condition,
+    seed_label = f" seed={eval_seed}" if eval_seed > 0 else ""
+    _log.info("evaluating", model=model_cfg.model_short, task=task_id, condition=condition, eval_seed=eval_seed,
               n_rows=len(pending_rows), n_total=len(test_rows))
-    click.echo(f"  Evaluating {model_cfg.model_short}/{task_id}/{condition} ({len(pending_rows)}/{len(test_rows)} rows)...")
+    click.echo(f"  Evaluating {model_cfg.model_short}/{task_id}/{condition}{seed_label} ({len(pending_rows)}/{len(test_rows)} rows)...")
     from tqdm.asyncio import tqdm
     t_wall_start = time.time()
     async with aiohttp.ClientSession() as session:
@@ -342,9 +367,11 @@ async def run_eval(
 @click.option("--model", default=None, help="Model ID or 'all'. Defaults to 'qwen2.5-0.5b' with --smoke-test, 'qwen3-8b' otherwise.")
 @click.option("--task", default="all", help="Task ID or 'all'")
 @click.option("--condition", default="all", help="zero-shot|5-shot|lora|all")
+@click.option("--eval-seed", "eval_seed", default=0, type=int,
+              help="Evaluation seed (0 = deterministic sample; >0 resamples from test_full.jsonl)")
 @click.option("--dry-run", is_flag=True, help="Validate without running inference")
 @click.option("--smoke-test", is_flag=True, help="Use smoke test data and model; mirrors train_local.py --smoke-test")
-def main(model: Optional[str], task: str, condition: str, dry_run: bool, smoke_test: bool) -> None:
+def main(model: Optional[str], task: str, condition: str, eval_seed: int, dry_run: bool, smoke_test: bool) -> None:
     """Evaluate local fine-tuned models via vLLM server.
 
     Starts one vLLM server per model with all available LoRA adapters loaded
@@ -394,21 +421,22 @@ def main(model: Optional[str], task: str, condition: str, dry_run: bool, smoke_t
                     click.echo(f"  SKIP [{mid}/{tid}/lora]: adapter not found at {ap}")
 
         # Build the full work list, checking idempotency up front.
+        cond_key_for = lambda cond: cond if eval_seed == 0 else f"{cond}_seed{eval_seed}"
         pending: list[tuple[str, str, TaskConfig, str]] = []
         for tid, task_cfg in task_cfgs.items():
             for cond in conditions:
                 if cond == "lora" and f"adapter_{tid}" not in lora_modules:
                     continue  # already reported above
                 model_name = f"adapter_{tid}" if cond == "lora" else model_cfg.model_id
-                if not dry_run and _pred_path(model_cfg.model_short, tid, cond).exists():
-                    click.echo(f"  SKIP [{mid}/{tid}/{cond}]: already complete")
+                if not dry_run and _pred_path(model_cfg.model_short, tid, cond_key_for(cond)).exists():
+                    click.echo(f"  SKIP [{mid}/{tid}/{cond_key_for(cond)}]: already complete")
                     continue
                 pending.append((tid, cond, task_cfg, model_name))
 
         if dry_run:
             for tid, cond, task_cfg, model_name in pending:
                 try:
-                    asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, model_name, dry_run=True, smoke_test=smoke_test))
+                    asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, model_name, dry_run=True, smoke_test=smoke_test, eval_seed=eval_seed))
                 except Exception as exc:
                     click.echo(f"  ERROR [{mid}/{tid}/{cond}]: {exc}", err=True)
                     _log.error(f"eval failed: {type(exc).__name__}: {exc}",
@@ -433,7 +461,7 @@ def main(model: Optional[str], task: str, condition: str, dry_run: bool, smoke_t
                 raise RuntimeError("vLLM server did not become ready in time")
             for tid, cond, task_cfg, model_name in pending:
                 try:
-                    asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, model_name, dry_run=False, smoke_test=smoke_test))
+                    asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, model_name, dry_run=False, smoke_test=smoke_test, eval_seed=eval_seed))
                 except Exception as exc:
                     click.echo(f"  ERROR [{mid}/{tid}/{cond}]: {exc}", err=True)
                     _log.error(f"eval failed: {type(exc).__name__}: {exc}",

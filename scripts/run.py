@@ -38,7 +38,7 @@ _STATUS_ICON = {
 }
 
 
-def _build_stages(cfg: RunConfig, selected_ids: list[str]) -> list[Stage]:
+def _build_stages(cfg: RunConfig, selected_ids: list[str], run_id: str | None = None) -> list[Stage]:
     """Construct Stage objects for the selected stage IDs."""
     py = sys.executable
     smoke = ["--smoke-test"] if cfg.smoke_test else []
@@ -51,6 +51,8 @@ def _build_stages(cfg: RunConfig, selected_ids: list[str]) -> list[Stage]:
     local_model = cfg.effective_local_model() or "all"
     api_model = cfg.effective_api_model_arg()
     t = cfg.timeouts
+
+    run_id_flag = ["--run-id", run_id] if run_id else []
 
     all_stages = [
         Stage(
@@ -104,14 +106,46 @@ def _build_stages(cfg: RunConfig, selected_ids: list[str]) -> list[Stage]:
         ),
         Stage(
             id="dashboard",
-            cmd=[py, str(SCRIPTS / "generate_dashboard_data.py"), *dry],
+            cmd=[py, str(SCRIPTS / "generate_dashboard_data.py"), *run_id_flag, *dry],
             depends_on=["classify"],
             compute="cpu",
             timeout_s=t.dashboard_s,
         ),
     ]
 
-    selected = [s for s in all_stages if s.id in selected_ids]
+    # Inject per-seed eval stages for seeds 1..n_eval_seeds-1
+    working_ids = list(selected_ids)
+    if cfg.n_eval_seeds > 1:
+        classify_stage = next((s for s in all_stages if s.id == "classify"), None)
+        for n in range(1, cfg.n_eval_seeds):
+            if "eval-local" in working_ids:
+                sid = f"eval-local-seed{n}"
+                all_stages.append(Stage(
+                    id=sid,
+                    cmd=[py, str(SCRIPTS / "eval_local.py"), *task, "--model", local_model,
+                         "--eval-seed", str(n), *smoke, *dry],
+                    depends_on=["train-local"],
+                    compute="gpu",
+                    timeout_s=t.eval_local_s,
+                ))
+                working_ids.append(sid)
+                if classify_stage:
+                    classify_stage.depends_on.append(sid)
+            if "eval-api" in working_ids:
+                sid = f"eval-api-seed{n}"
+                all_stages.append(Stage(
+                    id=sid,
+                    cmd=[py, str(SCRIPTS / "eval_api.py"), *task, "--model", api_model,
+                         "--eval-seed", str(n), *smoke, *dry],
+                    depends_on=["train-api"],
+                    compute="cloud",
+                    timeout_s=t.eval_api_s,
+                ))
+                working_ids.append(sid)
+                if classify_stage:
+                    classify_stage.depends_on.append(sid)
+
+    selected = [s for s in all_stages if s.id in working_ids]
     selected_set = {s.id for s in selected}
     for s in selected:
         s.depends_on = [d for d in s.depends_on if d in selected_set]
@@ -211,7 +245,7 @@ def main(
     if cpu:
         selected_ids = [s for s in selected_ids if s not in ("train-local", "eval-local")]
 
-    stage_list = _build_stages(cfg, selected_ids)
+    stage_list = _build_stages(cfg, selected_ids, run_id=manifest.run_id if manifest else None)
     if not stage_list:
         click.echo("No stages to run.")
         return

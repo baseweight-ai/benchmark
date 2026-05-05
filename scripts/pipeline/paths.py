@@ -42,3 +42,12 @@ def prompt_path(root: Path, task_id: str) -> Path:
 
 def run_manifest_path(root: Path, run_id: str) -> Path:
     return root / "runs" / f"{run_id}.json"
+
+
+def test_full_path(root: Path, task_id: str, smoke: bool = False) -> Path:
+    prefix = "smoke_" if smoke else ""
+    return root / "data" / "prepared" / task_id / f"{prefix}test_full.jsonl"
+
+
+def snapshot_path(root: Path, run_id: str) -> Path:
+    return root / "results" / "snapshots" / run_id / "results.json"

@@ -9,6 +9,8 @@ metric_label: "Weighted F1"
 max_output_tokens: 32
 test_sample_size: null
 training_cap: null
+lm_eval_task_id: null
+eval_axes: [accuracy, cost, latency, instruction_following]
 prompt_file: "prompts/fpb.json"
 text_field: sentence
 label_field: label

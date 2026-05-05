@@ -9,6 +9,8 @@ metric_label: "Weighted F1"
 max_output_tokens: 32
 test_sample_size: null
 training_cap: 10000
+lm_eval_task_id: null
+eval_axes: [accuracy, cost, latency, instruction_following]
 prompt_file: "prompts/banking77.json"
 text_field: text
 label_field: label

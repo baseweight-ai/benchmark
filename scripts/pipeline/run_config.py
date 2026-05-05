@@ -31,6 +31,7 @@ class RunConfig(BaseModel):
     smoke_test: bool = False
     dry_run: bool = False
     force: bool = False
+    n_eval_seeds: int = 1
     timeouts: Timeouts = Field(default_factory=Timeouts)
     cost_caps: CostCaps = Field(default_factory=CostCaps)
 

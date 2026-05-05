@@ -238,6 +238,7 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
 
     # ── Stratified test sample for ledgar, medmcqa ────────────────────────
     label_key = cfg.label_field or "label"
+    test_rows_full = test_rows  # capture before potential sampling
     if cfg.test_sample_size and len(test_rows) > cfg.test_sample_size:
         test_rows = stratified_sample(test_rows, label_key, cfg.test_sample_size, SEED)
         click.echo(f"  Test set sampled to {len(test_rows)}")
@@ -298,6 +299,14 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
     write_jsonl(fmt_train, out_dir / f"{prefix}train.jsonl")
     write_jsonl(fmt_test,  out_dir / f"{prefix}test.jsonl")
     write_jsonl(fmt_labs,  out_dir / f"{prefix}test_labels.jsonl")
+
+    # Save full unsampled test set when sampling was applied — enables multi-seed resampling.
+    if not smoke_test and cfg.test_sample_size and len(test_rows_full) > len(src_test):
+        fmt_test_full = fmt_test_prompts(test_rows_full)
+        fmt_labs_full = fmt_labels(test_rows_full)
+        write_jsonl(fmt_test_full, out_dir / "test_full.jsonl")
+        write_jsonl(fmt_labs_full, out_dir / "test_full_labels.jsonl")
+
     if smoke_test:
         click.echo(f"  [{cfg.task_id}] Done — {len(src_test)} smoke_test, {len(src_train)} smoke_train")
     else:

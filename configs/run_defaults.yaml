@@ -10,6 +10,7 @@ api_models:
 smoke_test: false
 dry_run: false
 force: false
+n_eval_seeds: 1
 
 timeouts:
   download_s: 1800
