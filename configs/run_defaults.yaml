@@ -21,6 +21,7 @@ timeouts:
   eval_api_s: 3600       # 1 h
   classify_s: 1800
   dashboard_s: 300
+  catalog_s: 60
 
 cost_caps:
   train_api_usd: 100.0

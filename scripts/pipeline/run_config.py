@@ -16,6 +16,7 @@ class Timeouts(BaseModel):
     eval_api_s: int = 3600       # 1 h
     classify_s: int = 1800
     dashboard_s: int = 300
+    catalog_s: int = 60
 
 
 class CostCaps(BaseModel):

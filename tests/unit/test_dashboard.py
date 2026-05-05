@@ -127,6 +127,42 @@ def test_build_result_unknown_model(pricing):
     assert result["family"] == "frontier"  # default
 
 
+@pytest.fixture
+def axis_scores_summary():
+    return {
+        "metric_value": 0.85,
+        "metric_id": "weighted_f1",
+        "n_predictions": 100,
+        "total_input_tokens": 10_000,
+        "total_output_tokens": 1_000,
+        "ttft_p50_ms": None,
+        "ttft_p95_ms": None,
+        "error_counts": {"correct": 85, "wrong_class": 15},
+        "eval_axes": ["accuracy", "instruction_following", "cost"],
+        "axis_scores": {
+            "accuracy": {"value": 0.85, "higher_is_better": True},
+            "instruction_following": {"value": 1.0, "higher_is_better": True},
+        },
+    }
+
+
+def test_build_result_propagates_summary_axis_scores(axis_scores_summary, pricing):
+    result = build_result("gpt-4.1", "fpb", "zero-shot", axis_scores_summary, None, pricing)
+    assert result["axis_scores"]["accuracy"]["value"] == pytest.approx(0.85)
+    assert result["axis_scores"]["instruction_following"]["value"] == pytest.approx(1.0)
+
+
+def test_build_result_adds_cost_axis_score(axis_scores_summary, pricing):
+    result = build_result("gpt-4.1", "fpb", "zero-shot", axis_scores_summary, None, pricing)
+    assert "cost" in result["axis_scores"]
+    assert result["axis_scores"]["cost"]["higher_is_better"] is False
+
+
+def test_build_result_axis_scores_none_without_summary(pricing):
+    result = build_result("gpt-4.1", "fpb", "zero-shot", None, None, pricing)
+    assert result["axis_scores"] is None
+
+
 # ── compute_stats ──────────────────────────────────────────────────────────────
 
 def _make_result(model_id, family, condition, metric_value, cost_per_query=None, training_cost=None, task_id="fpb"):

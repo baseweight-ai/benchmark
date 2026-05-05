@@ -1,0 +1,29 @@
+# Eval axis registry — maps axis names to display metadata.
+# eval_axes lists in task configs reference these names.
+# Computation logic lives in classify_errors.py (source: summary)
+# and generate_dashboard_data.py (source: dashboard).
+
+accuracy:
+  description: "Primary task metric (weighted F1, accuracy, etc.)"
+  higher_is_better: true
+  source: summary     # computed from metric_value
+
+token_f1:
+  description: "Token-level F1 for extraction tasks"
+  higher_is_better: true
+  source: summary     # computed from metric_value
+
+instruction_following:
+  description: "Fraction of outputs that are non-empty, non-refusal, and format-valid"
+  higher_is_better: true
+  source: summary     # computed from error_counts
+
+latency:
+  description: "Average end-to-end response latency (ms)"
+  higher_is_better: false
+  source: summary     # computed from avg_latency_ms
+
+cost:
+  description: "Inference cost per query (USD)"
+  higher_is_better: false
+  source: dashboard   # requires token pricing; added in generate_dashboard_data.py

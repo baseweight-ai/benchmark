@@ -262,6 +262,9 @@ def run_training_task(
     )
 
     class _CheckpointCallback(TrainerCallback):
+        def __init__(self):
+            self.gpu_util_samples: list[float] = []
+
         def on_train_begin(self, args, state, control, **kwargs):
             click.echo(f"  Training started: {state.max_steps} steps")
 
@@ -270,6 +273,10 @@ def run_training_task(
                 click.echo(f"  Step 1 complete — loss={state.log_history[-1].get('loss', '?'):.4f}")
 
         def on_log(self, args, state, control, logs=None, **kwargs):
+            try:
+                self.gpu_util_samples.append(torch.cuda.utilization())
+            except Exception:
+                pass
             if logs:
                 step = state.global_step
                 loss = logs.get("loss", logs.get("train_loss"))
@@ -349,9 +356,12 @@ def run_training_task(
     sft_config = SFTConfig(**sft_kwargs)
 
     click.echo("  Building trainer...")
+    callback = _CheckpointCallback()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     trainer = SFTTrainer(
         model=model, tokenizer=tokenizer, train_dataset=train_ds, args=sft_config,
-        callbacks=[_CheckpointCallback()],
+        callbacks=[callback],
     )
 
     click.echo("  Starting trainer.train()...")
@@ -360,7 +370,10 @@ def run_training_task(
         resume_from_checkpoint=str(resume_ckpt) if resume_ckpt else None
     )
     elapsed_min = (time.time() - t0) / 60
-    training_cost = 0.0 if smoke_test else (elapsed_min / 60) * GPU_HOURLY
+    gpu_hours = round(elapsed_min / 60, 4)
+    training_cost = 0.0 if smoke_test else gpu_hours * GPU_HOURLY
+    peak_gpu_mem_mb = round(torch.cuda.max_memory_allocated() / 1024**2) if torch.cuda.is_available() else None
+    avg_gpu_util_pct = round(sum(callback.gpu_util_samples) / len(callback.gpu_util_samples)) if callback.gpu_util_samples else None
 
     model.save_pretrained(str(adapter_dir))
     tokenizer.save_pretrained(str(adapter_dir))
@@ -382,6 +395,9 @@ def run_training_task(
         "seq_len": hw_cfg.seq_len,
         "training_cost": round(training_cost, 4),
         "training_time_min": round(elapsed_min, 1),
+        "gpu_hours": gpu_hours,
+        "peak_gpu_mem_mb": peak_gpu_mem_mb,
+        "avg_gpu_util_pct": avg_gpu_util_pct,
         "eval_loss": eval_loss,
         "train_loss": train_loss,
         "model_used": model_id,
@@ -400,7 +416,9 @@ def run_training_task(
     })
 
     loss_display = eval_loss if eval_loss is not None else train_loss
-    click.echo(f"  Done: {elapsed_min:.1f} min, ${training_cost:.3f}, loss={loss_display}")
+    mem_str = f", peak_mem={peak_gpu_mem_mb}MB" if peak_gpu_mem_mb is not None else ""
+    util_str = f", gpu_util={avg_gpu_util_pct}%" if avg_gpu_util_pct is not None else ""
+    click.echo(f"  Done: {elapsed_min:.1f} min ({gpu_hours:.4f} GPU-h), ${training_cost:.3f}, loss={loss_display}{mem_str}{util_str}")
 
     rss_before = _rss_mb()
     del trainer, model, tokenizer, train_ds, result
@@ -506,8 +524,9 @@ def train_one(
 
     _log.info("training complete", model=model_cfg.model_short, task=task_id, condition=CONDITION,
               event="stage_complete", training_cost=meta.get("training_cost"),
-              training_time_min=meta.get("training_time_min"), eval_loss=meta.get("eval_loss"),
-              n_train=meta.get("n_train"))
+              training_time_min=meta.get("training_time_min"), gpu_hours=meta.get("gpu_hours"),
+              peak_gpu_mem_mb=meta.get("peak_gpu_mem_mb"), avg_gpu_util_pct=meta.get("avg_gpu_util_pct"),
+              eval_loss=meta.get("eval_loss"), n_train=meta.get("n_train"))
 
     if auto_upload:
         _upload_adapter(model_cfg.model_short, task_id, CONDITION)

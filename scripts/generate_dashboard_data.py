@@ -258,6 +258,9 @@ def build_result(
     training_cost = training_meta.get("training_cost") if training_meta else None
     training_time_min = training_meta.get("training_time_min") if training_meta else None
     n_train = training_meta.get("n_train") if training_meta else None
+    gpu_hours = training_meta.get("gpu_hours") if training_meta else None
+    peak_gpu_mem_mb = training_meta.get("peak_gpu_mem_mb") if training_meta else None
+    avg_gpu_util_pct = training_meta.get("avg_gpu_util_pct") if training_meta else None
 
     # Decomposed cost inputs — stored so the site can recalculate or display assumptions.
     n = n_predictions or 1
@@ -280,6 +283,12 @@ def build_result(
     metric_ci_lo = summary.get("metric_ci_lo") if summary else None
     metric_ci_hi = summary.get("metric_ci_hi") if summary else None
     n_seeds = summary.get("n_seeds") if summary else None
+
+    # Per-axis scores: start from what classify_errors.py computed, then add cost.
+    eval_axes: list[str] = summary.get("eval_axes", []) if summary else []
+    axis_scores: dict[str, dict] = dict(summary.get("axis_scores", {})) if summary else {}
+    if "cost" in eval_axes and cost_per_query is not None:
+        axis_scores["cost"] = {"value": round(cost_per_query, 8), "higher_is_better": False}
 
     return {
         # Identity
@@ -307,7 +316,12 @@ def build_result(
         # Training
         "training_cost": round(training_cost, 4) if training_cost is not None else None,
         "training_time_min": training_time_min,
+        "gpu_hours": gpu_hours,
+        "peak_gpu_mem_mb": peak_gpu_mem_mb,
+        "avg_gpu_util_pct": avg_gpu_util_pct,
         "n_train": n_train,
+        # Per-axis scores
+        "axis_scores": axis_scores or None,
         # Error breakdown
         "error_counts": error_counts,
         # Cost inputs (decomposed for transparency / recalculation)

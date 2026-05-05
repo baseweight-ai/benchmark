@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -10,6 +11,8 @@ import click
 from dotenv import load_dotenv
 from pydantic import BaseModel
 import yaml
+
+from checkpoint_utils import atomic_write_json
 
 load_dotenv(Path(__file__).parent.parent / ".env", override=True)
 
@@ -81,10 +84,15 @@ def download_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> N
         return
 
     from datasets import DatasetDict, DownloadMode  # lazy import
+    from huggingface_hub import HfApi
     out_dir = REPO_ROOT / "data" / "raw" / cfg.task_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
     hf_token = os.environ.get("HF_TOKEN") or None
+
+    # Record the exact Hub commit so every experiment is traceable to a specific version.
+    ds_info = HfApi(token=hf_token).dataset_info(cfg.dataset_path)
+
     load_kwargs: dict = {
         "token": hf_token,
         "download_mode": DownloadMode.FORCE_REDOWNLOAD,
@@ -134,7 +142,15 @@ def download_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> N
             click.echo(f"  {split}: {count:,} rows — {status}")
 
     ds.save_to_disk(str(out_dir))
-    click.echo(f"  Saved to {out_dir}")
+
+    version_meta = {
+        "dataset_id": cfg.dataset_path,
+        "sha": getattr(ds_info, "sha", None),
+        "last_modified": str(getattr(ds_info, "last_modified", None)),
+        "downloaded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    atomic_write_json(version_meta, out_dir / "dataset_version.json")
+    click.echo(f"  Saved to {out_dir} (sha={version_meta['sha']})")
 
 
 @click.command()

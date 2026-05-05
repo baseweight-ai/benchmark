@@ -26,7 +26,7 @@ _ALL_STAGE_IDS = [
     "download", "prepare",
     "train-local", "train-api",
     "eval-local", "eval-api",
-    "classify", "dashboard",
+    "classify", "dashboard", "catalog",
 ]
 
 _STATUS_ICON = {
@@ -110,6 +110,13 @@ def _build_stages(cfg: RunConfig, selected_ids: list[str], run_id: str | None = 
             depends_on=["classify"],
             compute="cpu",
             timeout_s=t.dashboard_s,
+        ),
+        Stage(
+            id="catalog",
+            cmd=[py, str(SCRIPTS / "catalog.py"), "rebuild"],
+            depends_on=["dashboard"],
+            compute="cpu",
+            timeout_s=t.catalog_s,
         ),
     ]
 

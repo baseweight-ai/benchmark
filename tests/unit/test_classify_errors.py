@@ -5,6 +5,7 @@ from classify_errors import (
     classify_classification,
     classify_extraction,
     classify_predictions,
+    compute_axis_scores,
     compute_metric,
     get_valid_labels,
     is_empty,
@@ -263,3 +264,88 @@ def test_get_valid_labels_banking77_none():
 
 def test_get_valid_labels_cuad_none():
     assert get_valid_labels("cuad") is None
+
+
+# ── compute_axis_scores ────────────────────────────────────────────────────────
+
+_AXIS_DEFS = {
+    "accuracy":             {"higher_is_better": True,  "source": "summary"},
+    "token_f1":             {"higher_is_better": True,  "source": "summary"},
+    "instruction_following":{"higher_is_better": True,  "source": "summary"},
+    "latency":              {"higher_is_better": False, "source": "summary"},
+    "cost":                 {"higher_is_better": False, "source": "dashboard"},
+}
+
+
+@pytest.mark.parametrize("axis,value", [
+    ("accuracy", 0.85),
+    ("token_f1", 0.72),
+])
+def test_compute_axis_scores_metric_value_axes(axis, value):
+    summary = {"metric_value": value, "n_predictions": 100, "error_counts": {}}
+    scores = compute_axis_scores(summary, [axis], _AXIS_DEFS)
+    assert scores[axis]["value"] == pytest.approx(value)
+    assert scores[axis]["higher_is_better"] is True
+
+
+def test_compute_axis_scores_instruction_following():
+    summary = {
+        "metric_value": 0.85,
+        "n_predictions": 100,
+        "error_counts": {"correct": 80, "wrong_class": 10, "format_violation": 5, "empty": 3, "refusal": 2},
+    }
+    scores = compute_axis_scores(summary, ["instruction_following"], _AXIS_DEFS)
+    # (5 + 3 + 2) = 10 non-compliant / 100 → 0.9
+    assert scores["instruction_following"]["value"] == pytest.approx(0.9)
+    assert scores["instruction_following"]["higher_is_better"] is True
+
+
+def test_compute_axis_scores_instruction_following_perfect():
+    summary = {"metric_value": 1.0, "n_predictions": 50, "error_counts": {"correct": 50}}
+    scores = compute_axis_scores(summary, ["instruction_following"], _AXIS_DEFS)
+    assert scores["instruction_following"]["value"] == pytest.approx(1.0)
+
+
+def test_compute_axis_scores_instruction_following_clamps_zero():
+    # More non-compliant than total is impossible but clamp to 0 defensively
+    summary = {"metric_value": 0.0, "n_predictions": 10,
+               "error_counts": {"empty": 6, "refusal": 5, "format_violation": 3}}
+    scores = compute_axis_scores(summary, ["instruction_following"], _AXIS_DEFS)
+    assert scores["instruction_following"]["value"] == pytest.approx(0.0)
+
+
+def test_compute_axis_scores_latency():
+    summary = {"metric_value": 0.85, "n_predictions": 100, "error_counts": {}, "avg_latency_ms": 423.5}
+    scores = compute_axis_scores(summary, ["latency"], _AXIS_DEFS)
+    assert scores["latency"]["value"] == pytest.approx(423.5)
+    assert scores["latency"]["higher_is_better"] is False
+
+
+@pytest.mark.parametrize("axis,defs", [
+    pytest.param("cost", _AXIS_DEFS, id="dashboard_source_excluded"),
+    pytest.param("unknown_axis", {}, id="not_in_defs"),
+])
+def test_compute_axis_scores_axis_excluded(axis, defs):
+    summary = {"metric_value": 0.85, "n_predictions": 100, "error_counts": {}}
+    assert axis not in compute_axis_scores(summary, [axis], defs)
+
+
+def test_compute_axis_scores_multiple_axes():
+    summary = {
+        "metric_value": 0.9,
+        "n_predictions": 50,
+        "error_counts": {"correct": 45, "format_violation": 2, "empty": 1, "refusal": 2},
+        "avg_latency_ms": 200.0,
+    }
+    scores = compute_axis_scores(summary, ["accuracy", "instruction_following", "latency"], _AXIS_DEFS)
+    assert scores["accuracy"]["value"] == pytest.approx(0.9)
+    # (2 + 1 + 2) = 5 non-compliant / 50 → 0.9
+    assert scores["instruction_following"]["value"] == pytest.approx(0.9)
+    assert scores["latency"]["value"] == pytest.approx(200.0)
+
+
+@pytest.mark.parametrize("axis", ["instruction_following", "latency"])
+def test_compute_axis_scores_zero_predictions_returns_none(axis):
+    summary = {"metric_value": None, "n_predictions": 0, "error_counts": {}}
+    scores = compute_axis_scores(summary, [axis], _AXIS_DEFS)
+    assert scores[axis]["value"] is None

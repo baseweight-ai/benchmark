@@ -7,6 +7,7 @@ import random
 import re
 import sys
 from collections import defaultdict
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -23,10 +24,64 @@ REPO_ROOT = Path(__file__).parent.parent
 ALL_TASKS: list[str] = get_tasks()
 
 
+@lru_cache(maxsize=1)
+def _get_axis_definitions() -> dict[str, dict]:
+    path = REPO_ROOT / "configs" / "eval_axes.yaml"
+    try:
+        with open(path) as f:
+            return yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        return {}
+
+
+def compute_axis_scores(
+    summary: dict,
+    eval_axes: list[str],
+    axis_defs: dict[str, dict],
+) -> dict[str, dict]:
+    """Compute per-axis scores from summary data for all summary-source axes.
+
+    Cost axis (source: dashboard) is intentionally excluded — it requires token
+    pricing not available at classify time.  generate_dashboard_data.py adds it.
+    """
+    scores: dict[str, dict] = {}
+    n = summary.get("n_predictions", 0)
+
+    for axis in eval_axes:
+        defn = axis_defs.get(axis)
+        if defn is None or defn.get("source") != "summary":
+            continue
+
+        higher = defn.get("higher_is_better", True)
+
+        if axis in ("accuracy", "token_f1"):
+            val = summary.get("metric_value")
+
+        elif axis == "instruction_following":
+            if n:
+                counts = summary.get("error_counts", {})
+                non_compliant = (counts.get("empty", 0) + counts.get("refusal", 0)
+                                 + counts.get("format_violation", 0))
+                val = round(max(0.0, 1.0 - non_compliant / n), 4)
+            else:
+                val = None
+
+        elif axis == "latency":
+            val = summary.get("avg_latency_ms")
+
+        else:
+            val = None
+
+        scores[axis] = {"value": val, "higher_is_better": higher}
+
+    return scores
+
+
 class TaskConfig(BaseModel):
     task_id: str
     task_type: str
     metric_id: str
+    eval_axes: list[str] = []
 
 
 def load_task_config(task_id: str) -> TaskConfig:
@@ -177,6 +232,20 @@ def aggregate_seed_summaries(summaries: list[dict]) -> dict:
         for k, v in s.get("error_counts", {}).items():
             all_counts[k] += v
     base = summaries[0]  # representative row for metadata
+
+    eval_axes = base.get("eval_axes", [])
+    agg_axis_scores: dict[str, dict] = {}
+    axis_defs = _get_axis_definitions()
+    for axis in eval_axes:
+        vals = [
+            s["axis_scores"][axis]["value"]
+            for s in summaries
+            if s.get("axis_scores", {}).get(axis, {}).get("value") is not None
+        ]
+        if vals:
+            higher = axis_defs.get(axis, {}).get("higher_is_better", True)
+            agg_axis_scores[axis] = {"value": round(sum(vals) / len(vals), 4), "higher_is_better": higher}
+
     return {
         "model": base.get("model"),
         "task_id": base.get("task_id"),
@@ -193,6 +262,8 @@ def aggregate_seed_summaries(summaries: list[dict]) -> dict:
         "error_counts": dict(all_counts),
         "prompt_sha": base.get("prompt_sha"),
         "few_shot_hash": base.get("few_shot_hash"),
+        "eval_axes": eval_axes,
+        "axis_scores": agg_axis_scores,
     }
 
 
@@ -364,6 +435,9 @@ def process_model_task_condition(
         "total_output_tokens": total_output_tokens,
         "eval_wall_time_s": eval_wall_time_s,
     }
+
+    summary["eval_axes"] = task_cfg.eval_axes
+    summary["axis_scores"] = compute_axis_scores(summary, task_cfg.eval_axes, _get_axis_definitions())
 
     # condition_key is the filename stem (may include _seedN suffix)
     summary_out = summary_path(REPO_ROOT, source, model_short, task_id, condition)
