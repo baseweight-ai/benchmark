@@ -24,9 +24,7 @@ training:
   bf16: true
   seed: 42
   save_strategy: "epoch"
-  eval_strategy: "epoch"
-  load_best_model_at_end: true
-  metric_for_best_model: "eval_loss"
-  greater_is_better: false
+  eval_strategy: "no"
+  load_best_model_at_end: false
   logging_steps: 10
   report_to: "none"

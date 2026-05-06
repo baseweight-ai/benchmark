@@ -89,7 +89,6 @@ class ModelConfig(BaseModel):
 
 class TaskConfig(BaseModel):
     task_id: str
-    training_cap: Optional[int] = None
     max_seq_length: Optional[int] = None  # overrides model max_seq_length when set
 
 
@@ -342,8 +341,8 @@ def run_training_task(
         bf16=training_cfg.get("bf16", True),
         seed=training_cfg.get("seed", 42),
         save_strategy=training_cfg.get("save_strategy", "epoch"),
-        eval_strategy=training_cfg.get("eval_strategy", "epoch"),
-        load_best_model_at_end=training_cfg.get("load_best_model_at_end", True),
+        eval_strategy=training_cfg.get("eval_strategy", "no"),
+        load_best_model_at_end=training_cfg.get("load_best_model_at_end", False),
         metric_for_best_model=training_cfg.get("metric_for_best_model", "eval_loss"),
         greater_is_better=training_cfg.get("greater_is_better", False),
         logging_steps=training_cfg.get("logging_steps", 10),
@@ -392,6 +391,19 @@ def run_training_task(
     eval_loss  = m.get("eval_loss")
     train_loss = round(m["train_loss"], 4) if "train_loss" in m else None
 
+    loss_history = [
+        {"step": e.get("step", 0), "loss": round(e["loss"], 6), "lr": e.get("learning_rate")}
+        for e in trainer.state.log_history if "loss" in e
+    ]
+    hyperparams = {
+        "lora_rank": hw_cfg.lora_rank,
+        "lora_alpha": hw_cfg.lora_alpha,
+        **{k: sft_kwargs[k] for k in (
+            "learning_rate", "per_device_train_batch_size", "gradient_accumulation_steps",
+            "lr_scheduler_type", "warmup_steps", "weight_decay", "optim",
+        )},
+    }
+
     meta = {
         "model_id": model_cfg.model_short,
         "task_id": task_id,
@@ -411,6 +423,8 @@ def run_training_task(
         "substituted": substituted,
         "git_sha": _git_sha(),
         "input_hash": input_hash,
+        "loss_history": loss_history,
+        "hyperparams": hyperparams,
     }
     atomic_write_json(meta, log_dir / "metadata.json")
     atomic_write_json(meta, ckpt_dir / "metadata.json")

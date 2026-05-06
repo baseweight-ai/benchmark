@@ -44,6 +44,7 @@ class TaskConfig(BaseModel):
     task_id: str
     max_output_tokens: int
     task_type: str
+    skip_conditions: list[str] = []
 
 
 def load_task_config(task_id: str) -> TaskConfig:
@@ -282,6 +283,7 @@ def main(model: str, task: str, condition: str, eval_seed: int, dry_run: bool, s
                         else [condition] if condition in supported
                         else []
                     )
+                    conditions_to_run = [c for c in conditions_to_run if c not in task_cfg.skip_conditions]
                     if not conditions_to_run:
                         click.echo(f"  SKIP [{mid}/{tid}/{condition}]: not supported for {mid}")
                         continue

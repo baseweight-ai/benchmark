@@ -48,7 +48,7 @@ def test_task_config_parseable(task_id):
     data = yaml.safe_load(path.read_text())
     assert data["task_id"] == task_id
     assert "task_type" in data
-    assert data["task_type"] in ("classification", "extraction", "code")
+    assert data["task_type"] in ("classification", "extraction")
     assert "metric_id" in data
     assert "max_output_tokens" in data
 

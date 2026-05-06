@@ -111,7 +111,7 @@ python scripts/generate_dashboard_data.py
 
 Each task has a YAML in `configs/tasks/<task_id>.yaml`. Key fields:
 
-- `metric_id`: which metric to compute (`weighted_f1`, `macro_f1`, `accuracy`, `token_f1`, `pass_at_1`)
+- `metric_id`: which metric to compute (`weighted_f1`, `macro_f1`, `accuracy`, `token_f1`)
 - `max_seq_length`: overrides the model's default for that task
 - `training_cap`: caps the full training set size
 - `test_sample_size`: caps test set for faster evaluation

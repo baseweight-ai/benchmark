@@ -157,6 +157,9 @@ def test_smoke_pipeline(toy_repo, monkeypatch):
     assert summary["metric_value"] is not None
     assert 0.0 <= summary["metric_value"] <= 1.0
     assert sum(summary["error_counts"].values()) == N
+    assert summary["per_class_metrics"] is not None
+    for cls_data in summary["per_class_metrics"].values():
+        assert {"correct", "total", "accuracy"} <= cls_data.keys()
 
     classified_path = root / "results" / "classified" / "api" / MODEL_ID / TASK_ID / f"{CONDITION}.jsonl"
     assert classified_path.exists()

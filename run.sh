@@ -29,6 +29,7 @@
 #   --clean          Delete prior outputs for selected steps/model/task, then run
 #   --dry-run        Pass --dry-run to all supporting scripts
 #   --force          Pass --force to train_api.py (retrain even if already trained)
+#   --test-sampling  Run download+prepare with full production data to verify sampling. --task still applies.
 #   -h, --help       Show this message
 
 set -euo pipefail
@@ -57,6 +58,7 @@ ALL_STEPS=false
 
 SMOKE_TEST=false
 CPU=false
+TEST_SAMPLING=false
 TASK="all"
 MODEL_OVERRIDE=""   # explicit --model; empty = use resolved default below
 CLEAN=false
@@ -93,9 +95,10 @@ while [[ $# -gt 0 ]]; do
         --task)        TASK="$2";              shift 2 ;;
         --model)       MODEL_OVERRIDE="$2";    shift 2 ;;
         --from)        FROM_STAGE="$2";        ANY_STEP=true; shift 2 ;;
-        --clean)       CLEAN=true;             shift ;;
-        --dry-run)     DRY_RUN=true;           shift ;;
-        --force)       FORCE=true;             shift ;;
+        --clean)         CLEAN=true;             shift ;;
+        --dry-run)       DRY_RUN=true;           shift ;;
+        --force)         FORCE=true;             shift ;;
+        --test-sampling) TEST_SAMPLING=true;     shift ;;
         -h|--help)     usage ;;
         *) echo "Unknown argument: $1" >&2; usage ;;
     esac
@@ -379,7 +382,10 @@ _add_stage() { STAGES="${STAGES:+${STAGES},}${1}"; }
 [[ "$DO_CLASSIFY" == true ]]    && _add_stage "classify"
 [[ "$DO_DASHBOARD" == true ]]   && _add_stage "dashboard"
 
-if [[ -n "$STAGES" ]]; then
+if [[ "$TEST_SAMPLING" == true ]]; then
+    RUN_ARGS=("--test-sampling" "--task" "$TASK")
+    $PYTHON "${SCRIPTS}/run.py" "${RUN_ARGS[@]}"
+elif [[ -n "$STAGES" ]]; then
     RUN_ARGS=(
         "--stages" "$STAGES"
         "--task"   "$TASK"

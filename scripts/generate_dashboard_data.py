@@ -261,6 +261,9 @@ def build_result(
     gpu_hours = training_meta.get("gpu_hours") if training_meta else None
     peak_gpu_mem_mb = training_meta.get("peak_gpu_mem_mb") if training_meta else None
     avg_gpu_util_pct = training_meta.get("avg_gpu_util_pct") if training_meta else None
+    loss_history = training_meta.get("loss_history") if training_meta else None
+    hyperparams = training_meta.get("hyperparams") if training_meta else None
+    per_class_metrics = summary.get("per_class_metrics") if summary else None
 
     # Decomposed cost inputs — stored so the site can recalculate or display assumptions.
     n = n_predictions or 1
@@ -324,6 +327,10 @@ def build_result(
         "axis_scores": axis_scores or None,
         # Error breakdown
         "error_counts": error_counts,
+        "per_class_metrics": per_class_metrics,
+        # Training details
+        "loss_history": loss_history,
+        "hyperparams": hyperparams,
         # Cost inputs (decomposed for transparency / recalculation)
         "total_input_tokens": total_input if summary else None,
         "total_output_tokens": total_output if summary else None,

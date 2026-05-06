@@ -7,10 +7,20 @@ num_classes: 4
 metric_id: accuracy
 metric_label: "Accuracy"
 max_output_tokens: 8
-test_sample_size: 1000
 test_split: validation
-training_cap: 10000
 lm_eval_task_id: medmcqa
+train_sampling:
+  strategy: stratified
+  stratify_by: subject_name
+  total_cap: 2500
+  min_per_group: 10
+  seed: 42
+test_sampling:
+  strategy: stratified
+  stratify_by: subject_name
+  total_cap: 500
+  min_per_group: 1
+  seed: 42
 eval_axes: [accuracy, cost, latency, instruction_following]
 prompt_file: "prompts/medmcqa.json"
 label_field: cop

@@ -407,6 +407,24 @@ def process_model_task_condition(
     empty_rate = round(empty_n / n, 4) if n else None
     partial_rate = round(partial_n / n, 4) if n else None
 
+    # Per-class breakdown (classification only — used for reporting without rerunning)
+    per_class_metrics: Optional[dict] = None
+    if task_cfg.task_type == "classification":
+        _per_class: dict = defaultdict(lambda: {"correct": 0, "total": 0})
+        for row in classified:
+            gt = str(row.get("ground_truth", ""))
+            _per_class[gt]["total"] += 1
+            if row.get("error_category") == "correct":
+                _per_class[gt]["correct"] += 1
+        per_class_metrics = {
+            cls: {
+                "correct": d["correct"],
+                "total": d["total"],
+                "accuracy": round(d["correct"] / d["total"], 4) if d["total"] else None,
+            }
+            for cls, d in sorted(_per_class.items())
+        }
+
     # Propagate reproducibility fields from first prediction row
     first = predictions[0] if predictions else {}
     prompt_sha = first.get("prompt_sha")
@@ -434,6 +452,7 @@ def process_model_task_condition(
         "total_input_tokens": total_input_tokens,
         "total_output_tokens": total_output_tokens,
         "eval_wall_time_s": eval_wall_time_s,
+        "per_class_metrics": per_class_metrics,
     }
 
     summary["eval_axes"] = task_cfg.eval_axes

@@ -1,9 +1,0 @@
-{
-  "task_id": "mbpp",
-  "system": "Write a Python function that solves the given problem. Output only the function code. No explanations, no test cases, no markdown.",
-  "user_template": "{text}",
-  "label_format": "code",
-  "text_field": "text",
-  "label_field": "code",
-  "test_field": "test_list"
-}

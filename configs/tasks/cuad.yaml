@@ -6,12 +6,23 @@ task_type: extraction
 metric_id: token_f1
 metric_label: "Token F1"
 max_output_tokens: 512
-test_sample_size: null
-training_cap: 10000
 lm_eval_task_id: null
+train_sampling:
+  strategy: stratified
+  stratify_by: clause_type
+  total_cap: 3000
+  min_per_group: 5
+  seed: 42
+test_sampling:
+  strategy: stratified
+  stratify_by: clause_type
+  total_cap: 500
+  min_per_group: 1
+  seed: 42
 eval_axes: [token_f1, cost, latency]
 prompt_file: "prompts/cuad.json"
 context_max_tokens: 1500
+skip_conditions: [5-shot]
 epochs_by_size:
   small: 10
   medium: 5

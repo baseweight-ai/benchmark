@@ -1,10 +1,12 @@
 """Unit tests for prepare_datasets.py helper functions."""
+from collections import Counter
+
 import pytest
 
 from prepare_datasets import (
     format_assistant,
     format_user,
-    stratified_sample,
+    sample,
     to_chat,
     truncate_context,
 )
@@ -59,12 +61,6 @@ def test_format_assistant_letter():
     assert format_assistant(prompt, row) == "C"
 
 
-def test_format_assistant_code():
-    prompt = {"label_format": "code", "label_field": "code"}
-    row = {"code": "def foo(): return 42"}
-    assert format_assistant(prompt, row) == "def foo(): return 42"
-
-
 def test_format_assistant_extractive_with_answer():
     prompt = {"label_format": "extractive", "answer_field": "answers"}
     row = {"answers": {"text": ["January 2025", "Jan 2025"], "answer_start": [0, 0]}}
@@ -94,7 +90,7 @@ def test_to_chat_without_assistant():
     assert all(m["role"] != "assistant" for m in result["messages"])
 
 
-# ── stratified_sample ──────────────────────────────────────────────────────────
+# ── sample helpers ─────────────────────────────────────────────────────────────
 
 def _make_rows(n_per_class: int, classes=("A", "B", "C")) -> list[dict]:
     rows = []
@@ -104,33 +100,97 @@ def _make_rows(n_per_class: int, classes=("A", "B", "C")) -> list[dict]:
     return rows
 
 
-def test_stratified_sample_count():
-    rows = _make_rows(20)
-    result = stratified_sample(rows, "label", 15)
+# ── sample — error paths ──────────────────────────────────────────────────────
+
+def test_sample_empty_data_returns_empty():
+    assert sample([], strategy="stratified", stratify_by="label", total_cap=10) == []
+    assert sample([], strategy="balanced", stratify_by="label", per_group_cap=5) == []
+
+
+def test_sample_stratified_missing_total_cap_raises():
+    with pytest.raises(ValueError, match="total_cap"):
+        sample(_make_rows(5), strategy="stratified", stratify_by="label")
+
+
+def test_sample_balanced_missing_per_group_cap_raises():
+    with pytest.raises(ValueError, match="per_group_cap"):
+        sample(_make_rows(5), strategy="balanced", stratify_by="label")
+
+
+def test_sample_unknown_strategy_raises():
+    with pytest.raises(ValueError, match="Unknown sampling strategy"):
+        sample(_make_rows(5), strategy="reservoir", stratify_by="label", total_cap=10)
+
+
+# ── sample — stratified ────────────────────────────────────────────────────────
+
+def test_stratified_sample_total_count():
+    rows = _make_rows(20)  # 60 total
+    result = sample(rows, strategy="stratified", stratify_by="label", total_cap=15)
     assert len(result) == 15
 
 
-def test_stratified_sample_class_balance():
-    rows = _make_rows(100)
-    result = stratified_sample(rows, "label", 30, seed=42)
-    from collections import Counter
+def test_stratified_sample_proportional_balance():
+    rows = _make_rows(100)  # equal classes → equal allocation
+    result = sample(rows, strategy="stratified", stratify_by="label", total_cap=30, seed=42)
     counts = Counter(r["label"] for r in result)
-    # Each class should have ~10 (30 // 3)
     for cls in ["A", "B", "C"]:
         assert 8 <= counts[cls] <= 12
 
 
 def test_stratified_sample_deterministic():
     rows = _make_rows(50)
-    r1 = stratified_sample(rows, "label", 20, seed=42)
-    r2 = stratified_sample(rows, "label", 20, seed=42)
+    r1 = sample(rows, strategy="stratified", stratify_by="label", total_cap=20, seed=42)
+    r2 = sample(rows, strategy="stratified", stratify_by="label", total_cap=20, seed=42)
     assert [r["id"] for r in r1] == [r["id"] for r in r2]
 
 
 def test_stratified_sample_capped_at_available():
     rows = _make_rows(2)  # 6 total
-    result = stratified_sample(rows, "label", 100)
+    result = sample(rows, strategy="stratified", stratify_by="label", total_cap=100)
     assert len(result) <= 6
+
+
+def test_stratified_sample_min_per_group():
+    # Imbalanced: A has 1000, B has 5 — without min_per_group B might get 0 at small total
+    rows = [{"label": "A", "id": f"A{i}"} for i in range(1000)]
+    rows += [{"label": "B", "id": f"B{i}"} for i in range(5)]
+    result = sample(rows, strategy="stratified", stratify_by="label", total_cap=20, min_per_group=2, seed=42)
+    counts = Counter(r["label"] for r in result)
+    assert counts["B"] >= 2
+
+
+# ── sample — balanced ──────────────────────────────────────────────────────────
+
+def test_balanced_sample_per_group_cap():
+    rows = _make_rows(50)  # 50 per class
+    result = sample(rows, strategy="balanced", stratify_by="label", per_group_cap=10, seed=42)
+    counts = Counter(r["label"] for r in result)
+    assert len(result) == 30
+    for cls in ["A", "B", "C"]:
+        assert counts[cls] == 10
+
+
+def test_balanced_sample_capped_at_available():
+    rows = _make_rows(3)  # only 3 per class
+    result = sample(rows, strategy="balanced", stratify_by="label", per_group_cap=10, seed=42)
+    counts = Counter(r["label"] for r in result)
+    for cls in ["A", "B", "C"]:
+        assert counts[cls] == 3
+
+
+def test_balanced_sample_deterministic():
+    rows = _make_rows(50)
+    r1 = sample(rows, strategy="balanced", stratify_by="label", per_group_cap=10, seed=42)
+    r2 = sample(rows, strategy="balanced", stratify_by="label", per_group_cap=10, seed=42)
+    assert [r["id"] for r in r1] == [r["id"] for r in r2]
+
+
+def test_balanced_sample_different_seeds_differ():
+    rows = _make_rows(50)
+    r1 = sample(rows, strategy="balanced", stratify_by="label", per_group_cap=20, seed=1)
+    r2 = sample(rows, strategy="balanced", stratify_by="label", per_group_cap=20, seed=2)
+    assert [r["id"] for r in r1] != [r["id"] for r in r2]
 
 
 # ── truncate_context ───────────────────────────────────────────────────────────

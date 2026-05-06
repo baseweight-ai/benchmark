@@ -76,12 +76,17 @@ def test_load_task_config_fpb():
     cfg = load_task_config("fpb")
     assert cfg.task_id == "fpb"
     assert cfg.max_output_tokens > 0
-    assert cfg.task_type in ("classification", "extraction", "code")
+    assert cfg.task_type in ("classification", "extraction")
 
 
 def test_load_task_config_missing_raises():
     with pytest.raises(FileNotFoundError):
         load_task_config("nonexistent_task_xyz")
+
+
+def test_load_task_config_cuad_skip_conditions():
+    cfg = load_task_config("cuad")
+    assert "5-shot" in cfg.skip_conditions
 
 
 def test_load_model_config_smoke_default():

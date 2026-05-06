@@ -7,9 +7,18 @@ num_classes: 100
 metric_id: weighted_f1
 metric_label: "Weighted F1"
 max_output_tokens: 32
-test_sample_size: 1000
-training_cap: 10000
 lm_eval_task_id: lex_glue_ledgar
+train_sampling:
+  strategy: balanced
+  stratify_by: label
+  per_group_cap: 30
+  seed: 42
+test_sampling:
+  strategy: stratified
+  stratify_by: label
+  total_cap: 1000
+  min_per_group: 1
+  seed: 42
 eval_axes: [accuracy, cost, latency, instruction_following]
 prompt_file: "prompts/ledgar.json"
 text_field: text

@@ -7,9 +7,17 @@ num_classes: 3
 metric_id: weighted_f1
 metric_label: "Weighted F1"
 max_output_tokens: 32
-test_sample_size: null
-training_cap: null
 lm_eval_task_id: null
+train_sampling:
+  strategy: balanced
+  stratify_by: label
+  per_group_cap: 200
+  seed: 42
+test_sampling:
+  strategy: balanced
+  stratify_by: label
+  per_group_cap: 50
+  seed: 42
 eval_axes: [accuracy, cost, latency, instruction_following]
 prompt_file: "prompts/fpb.json"
 text_field: sentence

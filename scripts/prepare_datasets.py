@@ -1,9 +1,12 @@
 """Prepare datasets for training and evaluation: split, sample, format, save JSONL."""
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
 import random
+import re
 import shutil
 import sys
 from collections import defaultdict
@@ -13,9 +16,7 @@ from typing import Any, Optional
 
 import click
 import yaml
-from pydantic import BaseModel, Field
-
-import hashlib
+from pydantic import BaseModel
 
 from checkpoint_utils import atomic_write_json, nv_prepared_dir
 from pipeline.cache import rows_sha
@@ -24,14 +25,25 @@ from pipeline.paths import prompt_path
 from pipeline.validation import check_contamination, require_dir, validate_dataset
 
 REPO_ROOT = Path(__file__).parent.parent
-SEED = 42
 ALL_TASKS: list[str] = get_tasks()
 
 SMOKE_TRAIN_N = 20
 SMOKE_TEST_N = 10
 
+# Regex to extract CUAD clause type from question text.
+_CUAD_CLAUSE_RE = re.compile(r'related to "([^"]+)"', re.IGNORECASE)
+
 
 # ── Config models ──────────────────────────────────────────────────────────
+
+class SamplingConfig(BaseModel):
+    strategy: str                       # "balanced" | "stratified"
+    stratify_by: str                    # field name in the raw row dict
+    total_cap: Optional[int] = None     # stratified: target total count
+    per_group_cap: Optional[int] = None # balanced: max examples per group
+    min_per_group: int = 1              # stratified: floor per group
+    seed: int = 42
+
 
 class TaskConfig(BaseModel):
     task_id: str
@@ -41,8 +53,6 @@ class TaskConfig(BaseModel):
     task_type: str
     metric_id: str
     max_output_tokens: int
-    test_sample_size: Optional[int] = None
-    training_cap: Optional[int] = None
     text_field: Optional[str] = None
     label_field: Optional[str] = None
     label_type: Optional[str] = None
@@ -51,6 +61,8 @@ class TaskConfig(BaseModel):
     split_seed: Optional[int] = None
     context_max_tokens: Optional[int] = None
     test_split: str = "test"
+    train_sampling: Optional[SamplingConfig] = None
+    test_sampling: Optional[SamplingConfig] = None
 
 
 def load_task_config(task_id: str) -> TaskConfig:
@@ -81,8 +93,6 @@ def format_user(prompt: dict, row: dict) -> str:
 
 def format_assistant(prompt: dict, row: dict, label_names: Optional[list[str]] = None) -> str:
     lf = prompt.get("label_format")
-    if lf == "code":
-        return str(row.get(prompt.get("label_field", "code"), ""))
     if lf == "letter":
         label_map = prompt.get("label_map", {"0": "A", "1": "B", "2": "C", "3": "D"})
         val = row.get(prompt.get("label_field", "cop"), 0)
@@ -105,30 +115,78 @@ def to_chat(system: str, user: str, assistant: Optional[str] = None) -> dict:
     return {"messages": msgs}
 
 
-# ── Stratified sampling ────────────────────────────────────────────────────
+# ── Sampling ───────────────────────────────────────────────────────────────
 
-def stratified_sample(rows: list[dict], label_key: str, n: int, seed: int = 42) -> list[dict]:
-    """Return stratified sample of n rows, preserving class distribution."""
+def sample(
+    data: list[dict],
+    strategy: str,
+    stratify_by: str,
+    seed: int = 42,
+    total_cap: Optional[int] = None,
+    per_group_cap: Optional[int] = None,
+    min_per_group: int = 1,
+) -> list[dict]:
+    """Balanced: per_group_cap rows per group. Stratified: total_cap rows via LRM allocation."""
+    if not data:
+        return []
+
     rng = random.Random(seed)
-    by_label: dict[Any, list[dict]] = defaultdict(list)
-    for r in rows:
-        by_label[r.get(label_key)].append(r)
-    classes = sorted(by_label.keys(), key=str)
-    result = []
-    per_class = max(1, n // len(classes))
-    for cls in classes:
-        pool = by_label[cls]
-        k = min(per_class, len(pool))
-        result.extend(rng.sample(pool, k))
-    # top up if needed
-    all_remaining = [r for r in rows if r not in result]
-    rng.shuffle(all_remaining)
-    result = result[:n]
-    if len(result) < n:
-        result.extend(all_remaining[:n - len(result)])
-    rng.shuffle(result)
-    return result[:n]
 
+    groups: dict[Any, list[dict]] = defaultdict(list)
+    for row in data:
+        groups[row.get(stratify_by)].append(row)
+    sorted_keys = sorted(groups.keys(), key=str)
+
+    if strategy == "balanced":
+        if per_group_cap is None:
+            raise ValueError("balanced strategy requires per_group_cap")
+        result: list[dict] = []
+        for k in sorted_keys:
+            pool = list(groups[k])
+            rng.shuffle(pool)
+            result.extend(pool[:per_group_cap])
+        rng.shuffle(result)
+        return result
+
+    if strategy == "stratified":
+        if total_cap is None:
+            raise ValueError("stratified strategy requires total_cap")
+
+        group_sizes = {k: len(groups[k]) for k in sorted_keys}
+        total_available = sum(group_sizes.values())
+        total = min(total_cap, total_available)
+
+        targets = {k: total * (group_sizes[k] / total_available) for k in sorted_keys}
+        allocs: dict[Any, int] = {k: max(min_per_group, math.floor(targets[k])) for k in sorted_keys}
+
+        remainder = total - sum(allocs.values())
+
+        if remainder > 0:
+            # largest-remainder method: give +1 to groups with the biggest fractional part
+            by_frac = sorted(sorted_keys, key=lambda k: targets[k] - math.floor(targets[k]), reverse=True)
+            for k in by_frac[:remainder]:
+                allocs[k] += 1
+        elif remainder < 0:
+            # min_per_group floors pushed us over total; trim from groups with most slack
+            over = -remainder
+            for k in sorted(sorted_keys, key=lambda k: allocs[k] - min_per_group, reverse=True):
+                if over <= 0:
+                    break
+                slack = allocs[k] - min_per_group
+                cut = min(slack, over)
+                if cut > 0:
+                    allocs[k] -= cut
+                    over -= cut
+
+        result = []
+        for k in sorted_keys:
+            pool = list(groups[k])
+            rng.shuffle(pool)
+            result.extend(pool[:min(allocs[k], group_sizes[k])])
+        rng.shuffle(result)
+        return result
+
+    raise ValueError(f"Unknown sampling strategy: {strategy!r}. Expected 'balanced' or 'stratified'.")
 
 
 # ── Context truncation ─────────────────────────────────────────────────────
@@ -153,7 +211,7 @@ def write_jsonl(rows: list[dict], path: Path) -> None:
 # ── Per-task preprocessing ─────────────────────────────────────────────────
 
 def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> None:
-    from datasets import load_from_disk, Dataset  # lazy
+    from datasets import load_from_disk  # lazy
     label = " (smoke)" if smoke_test else ""
     click.echo(f"\n[{cfg.task_id}] Processing {cfg.task_name}{label}...")
 
@@ -170,42 +228,35 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
     system = prompt["system"]
     ds = load_from_disk(str(raw_dir))
 
-    # ── Task-specific split handling ───────────────────────────────────────
+    # ── Split into train / test ────────────────────────────────────────────
     if cfg.task_id == "fpb":
+        # FPB has no test split on HF; derive train/test from the single train split.
         all_rows = list(ds["train"])
         label_names = cfg.custom_label_names or ["negative", "neutral", "positive"]
         rng = random.Random(cfg.split_seed or 42)
         rng.shuffle(all_rows)
         if smoke_test:
-            # Download provided 2x rows; split evenly into 12 train / 12 test
             half = len(all_rows) // 2
             train_rows = all_rows[:half]
             test_rows = all_rows[half:]
-            val_rows = []
             click.echo(f"  FPB smoke split: train={len(train_rows)}, test={len(test_rows)}")
         else:
-            # Prod: 70/15/15
             n = len(all_rows)
             n_train = int(n * 0.70)
             n_val = int(n * 0.15)
             train_rows = all_rows[:n_train]
-            val_rows = all_rows[n_train:n_train + n_val]
-            test_rows = all_rows[n_train + n_val:]
-            click.echo(f"  FPB split: train={len(train_rows)}, val={len(val_rows)}, test={len(test_rows)}")
+            test_rows = all_rows[n_train + n_val:]  # skip the val slice (n_train:n_train+n_val)
+            click.echo(f"  FPB split: train={len(train_rows)}, test={len(test_rows)}")
     else:
         label_names = None
         split_name = cfg.test_split
-        if "train" in ds:
-            train_rows = list(ds["train"])
-        else:
-            train_rows = []
+        train_rows = list(ds["train"]) if "train" in ds else []
         if split_name in ds:
             test_rows = list(ds[split_name])
         else:
             test_rows = train_rows[-100:]
-        val_rows = list(ds.get("validation", ds.get("val", [])))
 
-    # Label names for integer-mapped tasks
+    # ── Label names for integer-mapped tasks ───────────────────────────────
     if cfg.label_type == "integer_mapped" and cfg.task_id != "fpb":
         try:
             split_key = "train" if "train" in ds else list(ds.keys())[0]
@@ -218,7 +269,7 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
         except Exception:
             label_names = cfg.custom_label_names
 
-    # ── CUAD: flatten SQuAD format ─────────────────────────────────────────
+    # ── CUAD: flatten SQuAD format and tag clause_type ────────────────────
     if cfg.task_id == "cuad":
         def flatten_squad(rows: list[dict]) -> list[dict]:
             out = []
@@ -226,28 +277,40 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
                 ctx = truncate_context(row.get("context", ""), cfg.context_max_tokens or 1500)
                 answers = row.get("answers", {})
                 texts = answers.get("text", []) if isinstance(answers, dict) else []
+                question = row.get("question", "")
+                m = _CUAD_CLAUSE_RE.search(question)
+                clause_type = m.group(1) if m else "unknown"
                 out.append({
                     "context": ctx,
-                    "question": row.get("question", ""),
+                    "question": question,
                     "answers": {"text": [texts[0]] if texts else [], "answer_start": [0] if texts else []},
                     "id": row.get("id", ""),
+                    "clause_type": clause_type,
                 })
             return out
         train_rows = flatten_squad(train_rows)
         test_rows = flatten_squad(test_rows)
-        val_rows = flatten_squad(val_rows)
 
-    # ── Stratified test sample for ledgar, medmcqa ────────────────────────
-    label_key = cfg.label_field or "label"
-    test_rows_full = test_rows  # capture before potential sampling
-    if cfg.test_sample_size and len(test_rows) > cfg.test_sample_size:
-        test_rows = stratified_sample(test_rows, label_key, cfg.test_sample_size, SEED)
-        click.echo(f"  Test set sampled to {len(test_rows)}")
+    # ── Sampling (non-smoke only) ──────────────────────────────────────────
+    test_rows_full: Optional[list[dict]] = None
+    if not smoke_test:
+        if cfg.train_sampling:
+            train_rows = sample(train_rows, **cfg.train_sampling.model_dump())
+            click.echo(f"  Train: {len(train_rows)} rows ({cfg.train_sampling.strategy}, {cfg.train_sampling.stratify_by})")
+        if cfg.test_sampling:
+            test_rows_full = test_rows
+            test_rows = sample(test_rows, **cfg.test_sampling.model_dump())
+            click.echo(f"  Test:  {len(test_rows)} rows ({cfg.test_sampling.strategy}, {cfg.test_sampling.stratify_by})")
 
-    # ── Cap training set ───────────────────────────────────────────────────
-    if cfg.training_cap and len(train_rows) > cfg.training_cap:
-        train_rows = stratified_sample(train_rows, label_key, cfg.training_cap, SEED)
-        click.echo(f"  Training set capped at {len(train_rows)}")
+    # ── FPB: assert no overlap between train and test ─────────────────────
+    if cfg.task_id == "fpb" and not smoke_test:
+        train_sentences = {r.get("sentence", "") for r in train_rows}
+        overlap = [r for r in test_rows if r.get("sentence", "") in train_sentences]
+        assert not overlap, f"FPB: {len(overlap)} rows overlap between train and test after sampling"
+
+    # ── Smoke capping ─────────────────────────────────────────────────────
+    src_train = train_rows[:SMOKE_TRAIN_N] if smoke_test else train_rows
+    src_test  = test_rows[:SMOKE_TEST_N]  if smoke_test else test_rows
 
     # ── Format to chat JSONL ───────────────────────────────────────────────
     def fmt_rows(rows: list[dict], include_assistant: bool = True) -> list[dict]:
@@ -259,25 +322,25 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
         return out
 
     def fmt_labels(rows: list[dict]) -> list[dict]:
-        out = []
-        for i, r in enumerate(rows):
-            asst = format_assistant(prompt, r, label_names)
-            out.append({"id": f"{cfg.task_id}_test_{i:04d}", "label": asst})
-        return out
+        return [
+            {"id": f"{cfg.task_id}_test_{i:04d}", "label": format_assistant(prompt, r, label_names)}
+            for i, r in enumerate(rows)
+        ]
 
     def fmt_test_prompts(rows: list[dict]) -> list[dict]:
         out = []
         for i, r in enumerate(rows):
             user = format_user(prompt, r)
-            d = {"id": f"{cfg.task_id}_test_{i:04d}", "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+            d: dict = {
+                "id": f"{cfg.task_id}_test_{i:04d}",
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            }
             if cfg.task_id == "cuad":
                 d["context"] = r.get("context", "")
             out.append(d)
         return out
 
     prefix = "smoke_" if smoke_test else ""
-    src_train = train_rows[:SMOKE_TRAIN_N] if smoke_test else train_rows
-    src_test  = test_rows[:SMOKE_TEST_N]  if smoke_test else test_rows
     fmt_train = fmt_rows(src_train)
     fmt_test  = fmt_test_prompts(src_test)
     fmt_labs  = fmt_labels(src_test)
@@ -290,10 +353,7 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
 
     contam_hits = check_contamination(fmt_train, fmt_test)
     if contam_hits:
-        click.echo(
-            f"  WARNING [{cfg.task_id}]: {len(contam_hits)} training examples overlap test set",
-            err=True,
-        )
+        click.echo(f"  WARNING [{cfg.task_id}]: {len(contam_hits)} training examples overlap test set", err=True)
         for hit in contam_hits[:3]:
             click.echo(f"    {hit}", err=True)
 
@@ -301,12 +361,10 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
     write_jsonl(fmt_test,  out_dir / f"{prefix}test.jsonl")
     write_jsonl(fmt_labs,  out_dir / f"{prefix}test_labels.jsonl")
 
-    # Save full unsampled test set when sampling was applied — enables multi-seed resampling.
-    if not smoke_test and cfg.test_sample_size and len(test_rows_full) > len(src_test):
-        fmt_test_full = fmt_test_prompts(test_rows_full)
-        fmt_labs_full = fmt_labels(test_rows_full)
-        write_jsonl(fmt_test_full, out_dir / "test_full.jsonl")
-        write_jsonl(fmt_labs_full, out_dir / "test_full_labels.jsonl")
+    # Save full unsampled test set when sampling reduced it — enables multi-seed resampling.
+    if test_rows_full is not None and len(test_rows_full) > len(src_test):
+        write_jsonl(fmt_test_prompts(test_rows_full), out_dir / "test_full.jsonl")
+        write_jsonl(fmt_labels(test_rows_full),       out_dir / "test_full_labels.jsonl")
 
     if smoke_test:
         click.echo(f"  [{cfg.task_id}] Done — {len(src_test)} smoke_test, {len(src_train)} smoke_train")

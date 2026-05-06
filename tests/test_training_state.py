@@ -120,7 +120,7 @@ def train_env(tmp_path, monkeypatch, tmp_network_volume):
             "report_to": "none",
         },
     )
-    task_cfg = TaskConfig(task_id="toy", training_cap=None, max_seq_length=512)
+    task_cfg = TaskConfig(task_id="toy", max_seq_length=512)
 
     # Write a tiny training JSONL
     data_dir = tmp_path / "data" / "prepared" / "toy"

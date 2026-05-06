@@ -224,6 +224,8 @@ def _print_results(results: dict[str, StageResult], ordered_ids: list[str]) -> N
 @click.option("--dry-run", is_flag=True)
 @click.option("--force", is_flag=True, help="Re-run even if outputs exist")
 @click.option("--cpu", is_flag=True, help="Skip GPU stages (train-local, eval-local)")
+@click.option("--test-sampling", "test_sampling", is_flag=True,
+              help="Run only download + prepare with full (non-smoke) data to verify sampling. --task still applies.")
 def main(
     config_path: str | None,
     stages: str,
@@ -234,6 +236,7 @@ def main(
     dry_run: bool,
     force: bool,
     cpu: bool,
+    test_sampling: bool,
 ) -> None:
     """Run pipeline stages as a dependency-aware DAG."""
     configure(REPO_ROOT)
@@ -250,7 +253,13 @@ def main(
         cfg.api_models = [api_model]
 
     # Resolve stage selection
-    if stages == "all":
+    if test_sampling:
+        selected_ids = ["download", "prepare"]
+        cfg.smoke_test = False
+        cfg.dry_run = False
+        cfg.force = True
+        click.echo("--test-sampling: running download+prepare with full production data.")
+    elif stages == "all":
         selected_ids = list(_ALL_STAGE_IDS)
     else:
         selected_ids = [s.strip() for s in stages.split(",") if s.strip()]

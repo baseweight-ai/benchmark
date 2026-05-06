@@ -49,6 +49,7 @@ class TaskConfig(BaseModel):
     max_output_tokens: int
     task_type: str
     max_seq_length: Optional[int] = None
+    skip_conditions: list[str] = []
 
 
 class ModelConfig(BaseModel):
@@ -445,6 +446,9 @@ def main(model: Optional[str], task: str, condition: str, eval_seed: int, dry_ru
         pending: list[tuple[str, str, TaskConfig, str]] = []
         for tid, task_cfg in task_cfgs.items():
             for cond in conditions:
+                if cond in task_cfg.skip_conditions:
+                    click.echo(f"  SKIP [{mid}/{tid}/{cond}]: condition excluded for this task")
+                    continue
                 if cond == "lora" and f"adapter_{tid}" not in lora_modules:
                     continue  # already reported above
                 model_name = f"adapter_{tid}" if cond == "lora" else model_cfg.model_id
