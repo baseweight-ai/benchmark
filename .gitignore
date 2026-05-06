@@ -21,3 +21,4 @@ unsloth_compiled_cache/
 environment.lock.yml
 runs/*
 !runs/.gitkeep
+condaenv.*.requirements.txt
