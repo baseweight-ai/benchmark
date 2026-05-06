@@ -21,7 +21,7 @@ from checkpoint_utils import atomic_write_json, nv_prepared_dir
 from pipeline.cache import rows_sha
 from pipeline.config import get_tasks
 from pipeline.paths import prompt_path
-from pipeline.validation import check_contamination, validate_dataset
+from pipeline.validation import check_contamination, require_dir, validate_dataset
 
 REPO_ROOT = Path(__file__).parent.parent
 SEED = 42
@@ -165,6 +165,7 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
         click.echo(f"  [dry-run] Would process {cfg.task_id}")
         return
 
+    require_dir(raw_dir, min_files=1, desc=f"raw data for {cfg.task_id}")
     prompt, prompt_sha = load_prompt(cfg.task_id)
     system = prompt["system"]
     ds = load_from_disk(str(raw_dir))

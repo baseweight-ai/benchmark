@@ -61,6 +61,7 @@ def _build_stages(cfg: RunConfig, selected_ids: list[str], run_id: str | None = 
             depends_on=[],
             compute="cpu",
             timeout_s=t.download_s,
+            description="Download raw task datasets from HuggingFace.",
         ),
         Stage(
             id="prepare",
@@ -68,6 +69,7 @@ def _build_stages(cfg: RunConfig, selected_ids: list[str], run_id: str | None = 
             depends_on=["download"],
             compute="cpu",
             timeout_s=t.prepare_s,
+            description="Format raw data into train/test JSONL files for each task.",
         ),
         Stage(
             id="train-local",
@@ -75,6 +77,7 @@ def _build_stages(cfg: RunConfig, selected_ids: list[str], run_id: str | None = 
             depends_on=["prepare"],
             compute="gpu",
             timeout_s=t.train_local_s,
+            description=f"Fine-tune {local_model} with QLoRA on the local GPU.",
         ),
         Stage(
             id="train-api",
@@ -82,6 +85,7 @@ def _build_stages(cfg: RunConfig, selected_ids: list[str], run_id: str | None = 
             depends_on=["prepare"],
             compute="cloud",
             timeout_s=t.train_api_s,
+            description=f"Submit and wait for OpenAI SFT fine-tuning jobs ({api_model}).",
         ),
         Stage(
             id="eval-local",
@@ -89,6 +93,7 @@ def _build_stages(cfg: RunConfig, selected_ids: list[str], run_id: str | None = 
             depends_on=["train-local"],
             compute="gpu",
             timeout_s=t.eval_local_s,
+            description=f"Evaluate fine-tuned {local_model} adapter via vLLM.",
         ),
         Stage(
             id="eval-api",
@@ -96,6 +101,7 @@ def _build_stages(cfg: RunConfig, selected_ids: list[str], run_id: str | None = 
             depends_on=["train-api"],
             compute="cloud",
             timeout_s=t.eval_api_s,
+            description=f"Evaluate fine-tuned and base API models ({api_model}).",
         ),
         Stage(
             id="classify",
@@ -103,6 +109,8 @@ def _build_stages(cfg: RunConfig, selected_ids: list[str], run_id: str | None = 
             depends_on=["eval-local", "eval-api"],
             compute="cpu",
             timeout_s=t.classify_s,
+            requires_all_deps=True,
+            description="Classify prediction errors and generate per-task summaries.",
         ),
         Stage(
             id="dashboard",
@@ -110,6 +118,7 @@ def _build_stages(cfg: RunConfig, selected_ids: list[str], run_id: str | None = 
             depends_on=["classify"],
             compute="cpu",
             timeout_s=t.dashboard_s,
+            description="Aggregate results into dashboard JSON for the web UI.",
         ),
         Stage(
             id="catalog",
@@ -117,6 +126,7 @@ def _build_stages(cfg: RunConfig, selected_ids: list[str], run_id: str | None = 
             depends_on=["dashboard"],
             compute="cpu",
             timeout_s=t.catalog_s,
+            description="Rebuild the run catalog index from all available results.",
         ),
     ]
 
@@ -252,12 +262,11 @@ def main(
     if cpu:
         selected_ids = [s for s in selected_ids if s not in ("train-local", "eval-local")]
 
+    manifest = _init_run_manifest(REPO_ROOT)
     stage_list = _build_stages(cfg, selected_ids, run_id=manifest.run_id if manifest else None)
     if not stage_list:
         click.echo("No stages to run.")
         return
-
-    manifest = _init_run_manifest(REPO_ROOT)
     caps = cfg.cost_caps
 
     def after_stage(result: StageResult) -> bool:

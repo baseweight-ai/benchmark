@@ -23,6 +23,9 @@
 #   --cpu            Skip train-local and eval-local (GPU steps); run API steps only
 #   --task TASK      Task ID or 'all' (default: all)
 #   --model MODEL    Model ID or 'all' (default: qwen3-8b; qwen2.5-0.5b with --smoke-test)
+#   --from STAGE     Run STAGE and all downstream stages. Aliases: train (both branches),
+#                    eval (both branches). Specific: train-local, train-api, eval-local,
+#                    eval-api, classify, dashboard. Overrides explicit step flags.
 #   --clean          Delete prior outputs for selected steps/model/task, then run
 #   --dry-run        Pass --dry-run to all supporting scripts
 #   --force          Pass --force to train_api.py (retrain even if already trained)
@@ -32,6 +35,8 @@ set -euo pipefail
 source "$HOME/miniconda3/etc/profile.d/conda.sh" 2>/dev/null || \
     source "$HOME/anaconda3/etc/profile.d/conda.sh" 2>/dev/null || \
     { echo "ERROR: conda not found — run: source /workspace/config/start.sh"; exit 1; }
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main >/dev/null 2>&1 || true
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r >/dev/null 2>&1 || true
 REPO_ROOT="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)"
 SCRIPTS="${REPO_ROOT}/scripts"
 
@@ -57,6 +62,7 @@ MODEL_OVERRIDE=""   # explicit --model; empty = use resolved default below
 CLEAN=false
 DRY_RUN=false
 FORCE=false
+FROM_STAGE=""
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -86,6 +92,7 @@ while [[ $# -gt 0 ]]; do
         --cpu)         CPU=true;               shift ;;
         --task)        TASK="$2";              shift 2 ;;
         --model)       MODEL_OVERRIDE="$2";    shift 2 ;;
+        --from)        FROM_STAGE="$2";        ANY_STEP=true; shift 2 ;;
         --clean)       CLEAN=true;             shift ;;
         --dry-run)     DRY_RUN=true;           shift ;;
         --force)       FORCE=true;             shift ;;
@@ -105,27 +112,95 @@ if [[ "$ALL_STEPS" == true ]]; then
     DO_EVAL_API=true; DO_CLASSIFY=true; DO_DASHBOARD=true
 fi
 
+# --from overrides step flags with the given stage and all downstream stages.
+_apply_from_stage() {
+    DO_SETUP=false
+    DO_DOWNLOAD=false; DO_PREPARE=false
+    DO_TRAIN_LOCAL=false; DO_TRAIN_API=false
+    DO_EVAL_LOCAL=false; DO_EVAL_API=false
+    DO_CLASSIFY=false; DO_DASHBOARD=false
+    case "$1" in
+        download)
+            DO_DOWNLOAD=true; DO_PREPARE=true
+            DO_TRAIN_LOCAL=true; DO_TRAIN_API=true
+            DO_EVAL_LOCAL=true; DO_EVAL_API=true
+            DO_CLASSIFY=true; DO_DASHBOARD=true ;;
+        prepare)
+            DO_PREPARE=true
+            DO_TRAIN_LOCAL=true; DO_TRAIN_API=true
+            DO_EVAL_LOCAL=true; DO_EVAL_API=true
+            DO_CLASSIFY=true; DO_DASHBOARD=true ;;
+        train)
+            DO_TRAIN_LOCAL=true; DO_TRAIN_API=true
+            DO_EVAL_LOCAL=true; DO_EVAL_API=true
+            DO_CLASSIFY=true; DO_DASHBOARD=true ;;
+        train-local)
+            DO_TRAIN_LOCAL=true
+            DO_EVAL_LOCAL=true
+            DO_CLASSIFY=true; DO_DASHBOARD=true ;;
+        train-api)
+            DO_TRAIN_API=true
+            DO_EVAL_API=true
+            DO_CLASSIFY=true; DO_DASHBOARD=true ;;
+        eval)
+            DO_EVAL_LOCAL=true; DO_EVAL_API=true
+            DO_CLASSIFY=true; DO_DASHBOARD=true ;;
+        eval-local)
+            DO_EVAL_LOCAL=true
+            DO_CLASSIFY=true; DO_DASHBOARD=true ;;
+        eval-api)
+            DO_EVAL_API=true
+            DO_CLASSIFY=true; DO_DASHBOARD=true ;;
+        classify)
+            DO_CLASSIFY=true; DO_DASHBOARD=true ;;
+        dashboard)
+            DO_DASHBOARD=true ;;
+        *) echo "Unknown --from stage: $1  (valid: download prepare train train-local train-api eval eval-local eval-api classify dashboard)" >&2; exit 1 ;;
+    esac
+}
+
+if [[ -n "$FROM_STAGE" ]]; then
+    _apply_from_stage "$FROM_STAGE"
+fi
+
 # --cpu suppresses GPU-only steps regardless of what was selected.
 if [[ "$CPU" == true ]]; then
     DO_TRAIN_LOCAL=false
     DO_EVAL_LOCAL=false
 fi
 
-step() { echo; echo "━━━ $* ━━━"; }
+step() { local _tag="$1"; shift; echo; echo "  [${_tag}] ━━━ $* ━━━"; }
+
+# Run a command and prefix every output line with [tag].
+_run_tagged() {
+    local tag="$1"; shift
+    "$@" 2>&1 | while IFS= read -r _line; do printf "  [%s] %s\n" "$tag" "$_line"; done
+}
 
 # Fail fast if API steps require a key that isn't present.
 if [[ "$DO_TRAIN_API" == true ]] || [[ "$DO_EVAL_API" == true ]]; then
-    step "API key check"
+    step "pipeline" "API key check"
     _api_key="${OPENAI_API_KEY:-}"
     if [[ -z "$_api_key" ]] && [[ -f "${REPO_ROOT}/.env" ]]; then
         _api_key=$(grep -E "^OPENAI_API_KEY=" "${REPO_ROOT}/.env" | tail -1 | cut -d= -f2- || true)
     fi
     if [[ -z "$_api_key" ]] || [[ "$_api_key" == "sk-..." ]] || [[ ${#_api_key} -lt 20 ]]; then
-        echo "  FAIL  OPENAI_API_KEY  not set or invalid — add it to ${REPO_ROOT}/.env before running train-api or eval-api" >&2
+        echo "  [pipeline] FAIL  OPENAI_API_KEY  not set or invalid — add it to ${REPO_ROOT}/.env before running train-api or eval-api" >&2
         exit 1
     fi
-    echo "  OK    OPENAI_API_KEY  ${_api_key:0:12}…  (${#_api_key} chars)"
+    echo "  [pipeline] OK    OPENAI_API_KEY  ${_api_key:0:12}…  (${#_api_key} chars)"
     unset _api_key
+fi
+
+if [[ "$DO_EVAL_LOCAL" == true ]]; then
+    _hf_token="${HF_TOKEN:-}"
+    if [[ -z "$_hf_token" ]] && [[ -f "${REPO_ROOT}/.env" ]]; then
+        _hf_token=$(grep -E "^HF_TOKEN=" "${REPO_ROOT}/.env" | tail -1 | cut -d= -f2- || true)
+    fi
+    if [[ -z "$_hf_token" ]]; then
+        echo "  [pipeline] WARN  HF_TOKEN not set — vLLM may hit HuggingFace rate limits. Add HF_TOKEN=hf_... to ${REPO_ROOT}/.env"
+    fi
+    unset _hf_token
 fi
 
 # ---------------------------------------------------------------------------
@@ -199,7 +274,7 @@ clean_paths() {
     for p in "$@"; do
         for hit in $p; do
             if [[ -e "$hit" ]]; then
-                echo "  rm -rf $hit"
+                echo "  [pipeline] rm -rf $hit"
                 rm -rf "$hit"
             fi
         done
@@ -216,15 +291,7 @@ MODEL_G=$(glob "$MODEL")
 # Clean — scoped to the exact stage, model, and task; runs before the pipeline
 # ---------------------------------------------------------------------------
 if [[ "$CLEAN" == true ]]; then
-    step "Cleaning prior outputs  (model=${MODEL}, task=${TASK})"
-
-    if [[ "$DO_SETUP" == true ]]; then
-        eval "$(conda shell.bash hook)"
-        if conda env list 2>/dev/null | grep -qE "^${CONDA_ENV}[[:space:]]"; then
-            echo "  Removing conda env ${CONDA_ENV} (clean setup)..."
-            conda env remove -n "${CONDA_ENV}" -y
-        fi
-    fi
+    step "pipeline" "Cleaning prior outputs  (model=${MODEL}, task=${TASK})"
 
     if [[ "$DO_DOWNLOAD" == true ]]; then
         clean_paths "${REPO_ROOT}/data/raw/${TASK_G}"
@@ -235,11 +302,9 @@ if [[ "$CLEAN" == true ]]; then
     fi
 
     if [[ "$DO_TRAIN_LOCAL" == true ]]; then
-        # Local results
         clean_paths \
             "${REPO_ROOT}/results/adapters/local/${MODEL_G}/${TASK_G}" \
             "${REPO_ROOT}/results/training/local/${MODEL_G}/${TASK_G}"
-        # Workspace checkpoints (remote GPU volume)
         if [[ -d "$NETWORK_VOLUME/checkpoints" ]]; then
             clean_paths "${NETWORK_VOLUME}/checkpoints/${MODEL_G}/${TASK_G}"
         fi
@@ -251,13 +316,13 @@ if [[ "$CLEAN" == true ]]; then
             "${REPO_ROOT}/results/predictions/local/${MODEL_G}/${TASK_G}/*.partial"
     fi
 
+    API_MODEL_G=$(glob "${MODEL_OVERRIDE:-all}")
+
     if [[ "$DO_TRAIN_API" == true ]]; then
-        API_MODEL_G=$(glob "${MODEL_OVERRIDE:-all}")
         clean_paths "${REPO_ROOT}/results/training/api/${API_MODEL_G}/${TASK_G}"
     fi
 
     if [[ "$DO_EVAL_API" == true ]]; then
-        API_MODEL_G=$(glob "${MODEL_OVERRIDE:-all}")
         clean_paths \
             "${REPO_ROOT}/results/predictions/api/${API_MODEL_G}/${TASK_G}" \
             "${REPO_ROOT}/results/predictions/api/${API_MODEL_G}/${TASK_G}/*.partial"
@@ -266,13 +331,31 @@ if [[ "$CLEAN" == true ]]; then
     if [[ "$DO_CLASSIFY" == true ]]; then
         clean_paths \
             "${REPO_ROOT}/results/classified/local/${MODEL_G}/${TASK_G}" \
-            "${REPO_ROOT}/results/classified/api/${MODEL_G}/${TASK_G}" \
+            "${REPO_ROOT}/results/classified/api/${API_MODEL_G}/${TASK_G}" \
             "${REPO_ROOT}/results/summaries/local/${MODEL_G}/${TASK_G}" \
-            "${REPO_ROOT}/results/summaries/api/${MODEL_G}/${TASK_G}"
+            "${REPO_ROOT}/results/summaries/api/${API_MODEL_G}/${TASK_G}"
     fi
 
     if [[ "$DO_DASHBOARD" == true ]]; then
-        clean_paths "${REPO_ROOT}/dashboard-data/results.json"
+        clean_paths \
+            "${REPO_ROOT}/dashboard-data/results.json" \
+            "${REPO_ROOT}/results/snapshots" \
+            "${REPO_ROOT}/results/tables" \
+            "${REPO_ROOT}/results/catalog.jsonl"
+    fi
+
+    if [[ "$ALL_STEPS" == true ]]; then
+        clean_paths \
+            "${REPO_ROOT}/runs" \
+            "${REPO_ROOT}/results/pipeline.log.jsonl"
+    fi
+
+    if [[ "$DO_SETUP" == true ]]; then
+        eval "$(conda shell.bash hook)"
+        if conda env list 2>/dev/null | grep -qE "^${CONDA_ENV}[[:space:]]"; then
+            echo "  [pipeline] Removing conda env ${CONDA_ENV}..."
+            _run_tagged "pipeline" conda env remove -n "${CONDA_ENV}" -y
+        fi
     fi
 fi
 
@@ -280,8 +363,8 @@ fi
 # Translate step flags → stages list, then delegate to Python DAG runner
 # ---------------------------------------------------------------------------
 if [[ "$DO_SETUP" == true ]]; then
-    step "Setup"
-    bash "${SCRIPTS}/setup.sh"
+    step "pipeline" "Setup"
+    _run_tagged "pipeline" bash "${SCRIPTS}/setup.sh"
     _resolve_python   # env now exists (created or updated by setup.sh)
 fi
 

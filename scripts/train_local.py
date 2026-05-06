@@ -46,11 +46,16 @@ from pipeline.cache import inputs_changed, training_inputs_hash
 from pipeline.config import get_local_models, get_tasks
 from pipeline.log import configure, get_logger
 from pipeline.paths import adapter_path, training_meta_path
+from pipeline.validation import require_jsonl
 from pipeline.versioning import git_sha as _git_sha
 
 _log = get_logger("train-local")
 
 REPO_ROOT = Path(__file__).parent.parent
+
+def _echo(ctx: str, msg: str) -> None:
+    prefix = f"[{ctx}] " if ctx else ""
+    click.echo(f"  {prefix}{msg}")
 ALL_TASKS: list[str] = get_tasks()
 ALL_MODELS: list[str] = [m["id"] for m in get_local_models()]
 GPU_HOURLY = 0.49  # Default GPU hourly rate — override via pricing.yaml
@@ -126,7 +131,7 @@ def _resolve_prepared(task_id: str, filename: str) -> Optional[Path]:
     return nv if nv.exists() else None
 
 
-def get_or_create_cap(data_dir: Path, n: int) -> Path:
+def get_or_create_cap(data_dir: Path, n: int, ctx: str = "") -> Path:
     """Return path to a fixed random-sample of n rows from train.jsonl, creating it if needed."""
     cap_path = data_dir / f"train_cap{n}.jsonl"
     if cap_path.exists():
@@ -136,7 +141,7 @@ def get_or_create_cap(data_dir: Path, n: int) -> Path:
         rows = [json.loads(line) for line in f]
     sample = random.Random(42).sample(rows, min(n, len(rows)))
     write_jsonl(sample, cap_path)
-    click.echo(f"  Cap: wrote {len(sample)} rows to {cap_path.name}")
+    _echo(ctx, f"Cap: wrote {len(sample)} rows to {cap_path.name}")
     return cap_path
 
 
@@ -206,12 +211,14 @@ def run_training_task(
     log_dir: Path,
     smoke_test: bool,
     input_hash: str = "",
+    ctx: str = "",
 ) -> dict:
     """Load model, train, save adapter. Returns metadata dict.
 
     All heavy objects (model, trainer) are deleted before returning so the GC
     can reclaim memory before the next task starts.
     """
+    echo = lambda msg: _echo(ctx, msg)
     # Heavy GPU libs imported here so the module is importable on CPU for tests
     import unsloth  # noqa: F401 — must come before transformers/peft
     from unsloth import FastModel
@@ -223,9 +230,9 @@ def run_training_task(
     model_id = model_cfg.model_id
     substituted = False
 
-    click.echo(f"  Loading {model_id} on {hw_cfg.device.upper()}...")
-    click.echo(f"  Config: load_in_4bit={hw_cfg.load_in_4bit} dtype={hw_cfg.load_dtype} grad_ckpt={hw_cfg.use_grad_ckpt}")
-    click.echo(f"  SFT overrides: {hw_cfg.sft_extra or '(none)'}")
+    echo(f"Loading {model_id} on {hw_cfg.device.upper()}...")
+    echo(f"Config: load_in_4bit={hw_cfg.load_in_4bit} dtype={hw_cfg.load_dtype} grad_ckpt={hw_cfg.use_grad_ckpt}")
+    echo(f"SFT overrides: {hw_cfg.sft_extra or '(none)'}")
 
     def _load_model(mid: str):
         return FastModel.from_pretrained(
@@ -240,14 +247,14 @@ def run_training_task(
         model, tokenizer = _load_model(model_id)
     except Exception as exc:
         if model_cfg.fallback_model_id:
-            click.echo(f"  WARNING: {model_id} failed ({exc}). Falling back to {model_cfg.fallback_model_id}")
+            echo(f"WARNING: {model_id} failed ({exc}). Falling back to {model_cfg.fallback_model_id}")
             model_id = model_cfg.fallback_model_id
             substituted = True
             model, tokenizer = _load_model(model_id)
         else:
             raise
 
-    click.echo("  Applying LoRA adapters...")
+    echo("Applying LoRA adapters...")
     model = FastModel.get_peft_model(
         model,
         finetune_language_layers=True,
@@ -266,11 +273,11 @@ def run_training_task(
             self.gpu_util_samples: list[float] = []
 
         def on_train_begin(self, args, state, control, **kwargs):
-            click.echo(f"  Training started: {state.max_steps} steps")
+            echo(f"Training started: {state.max_steps} steps")
 
         def on_step_end(self, args, state, control, **kwargs):
             if state.global_step == 1 and state.log_history:
-                click.echo(f"  Step 1 complete — loss={state.log_history[-1].get('loss', '?'):.4f}")
+                echo(f"Step 1 complete — loss={state.log_history[-1].get('loss', '?'):.4f}")
 
         def on_log(self, args, state, control, logs=None, **kwargs):
             try:
@@ -286,7 +293,7 @@ def run_training_task(
                     parts.append(f"loss={loss:.4f}")
                 if lr is not None:
                     parts.append(f"lr={lr:.2e}")
-                click.echo("  " + " | ".join(parts))
+                echo(" | ".join(parts))
 
         def on_save(self, args, state, control, **kwargs):
             save_train_state(model_cfg.model_short, task_id, CONDITION, {
@@ -297,10 +304,10 @@ def run_training_task(
                 "best_model_checkpoint": state.best_model_checkpoint,
             })
 
-    click.echo(f"  Loading dataset from {data_path} ...")
+    echo(f"Loading dataset from {data_path} ...")
     with open(data_path) as f:
         rows = [json.loads(line) for line in f]
-    click.echo(f"  {len(rows)} examples loaded")
+    echo(f"{len(rows)} examples loaded")
     train_ds = hf_datasets.Dataset.from_list(rows)
 
     # Pre-apply the chat template so trl tokenizes a plain "text" field.
@@ -309,7 +316,7 @@ def run_training_task(
     if model_cfg.enable_thinking is False:
         template_kwargs["enable_thinking"] = False
 
-    click.echo("  Applying chat template...")
+    echo("Applying chat template...")
     def apply_template(example):
         return {"text": tokenizer.apply_chat_template(
             example["messages"],
@@ -318,7 +325,7 @@ def run_training_task(
             **template_kwargs,
         )}
     train_ds = train_ds.map(apply_template)
-    click.echo(f"  Dataset ready: {len(train_ds)} rows")
+    echo(f"Dataset ready: {len(train_ds)} rows")
 
     training_cfg = model_cfg.training
     sft_kwargs = dict(
@@ -346,8 +353,8 @@ def run_training_task(
         packing=False,
     )
     sft_kwargs.update(hw_cfg.sft_extra)
-    click.echo(
-        f"  SFTConfig: epochs={sft_kwargs['num_train_epochs']}"
+    echo(
+        f"SFTConfig: epochs={sft_kwargs['num_train_epochs']}"
         f" batch={sft_kwargs['per_device_train_batch_size']}"
         f" accum={sft_kwargs['gradient_accumulation_steps']}"
         f" lr={sft_kwargs['learning_rate']:.2e}"
@@ -355,7 +362,7 @@ def run_training_task(
     )
     sft_config = SFTConfig(**sft_kwargs)
 
-    click.echo("  Building trainer...")
+    echo("Building trainer...")
     callback = _CheckpointCallback()
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -364,7 +371,7 @@ def run_training_task(
         callbacks=[callback],
     )
 
-    click.echo("  Starting trainer.train()...")
+    echo("Starting trainer.train()...")
     t0 = time.time()
     result = trainer.train(
         resume_from_checkpoint=str(resume_ckpt) if resume_ckpt else None
@@ -418,7 +425,7 @@ def run_training_task(
     loss_display = eval_loss if eval_loss is not None else train_loss
     mem_str = f", peak_mem={peak_gpu_mem_mb}MB" if peak_gpu_mem_mb is not None else ""
     util_str = f", gpu_util={avg_gpu_util_pct}%" if avg_gpu_util_pct is not None else ""
-    click.echo(f"  Done: {elapsed_min:.1f} min ({gpu_hours:.4f} GPU-h), ${training_cost:.3f}, loss={loss_display}{mem_str}{util_str}")
+    echo(f"Done: {elapsed_min:.1f} min ({gpu_hours:.4f} GPU-h), ${training_cost:.3f}, loss={loss_display}{mem_str}{util_str}")
 
     rss_before = _rss_mb()
     del trainer, model, tokenizer, train_ds, result
@@ -431,7 +438,7 @@ def run_training_task(
     if _libc:
         _libc.malloc_trim(0)
     rss_after = _rss_mb()
-    click.echo(f"  Memory released after {task_id}/{CONDITION}: {rss_before - rss_after} MB freed (RSS {rss_before}→{rss_after} MB).")
+    echo(f"Memory released: {rss_before - rss_after} MB freed (RSS {rss_before}→{rss_after} MB).")
 
     return meta
 
@@ -447,8 +454,10 @@ def train_one(
     dry_run: bool,
     auto_upload: bool = False,
     smoke_test: bool = False,
+    ctx: str = "",
 ) -> dict:
     """Orchestrate a single model/task run. Returns metadata dict."""
+    echo = lambda msg: _echo(ctx, msg)
     task_id = task_cfg.task_id
     n_train = count_jsonl(data_path)
     hw_cfg = ConfigFactory.build(model_cfg, task_cfg, smoke_test)
@@ -461,7 +470,7 @@ def train_one(
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     epochs = 1 if smoke_test else get_epochs(n_train)
-    click.echo(f"  [{model_cfg.model_short}/{task_id}/{CONDITION}] n={n_train}, epochs={epochs}, seq_len={hw_cfg.seq_len}")
+    echo(f"n={n_train}, epochs={epochs}, seq_len={hw_cfg.seq_len}")
 
     input_hash = training_inputs_hash(data_path, {
         "epochs": epochs,
@@ -476,17 +485,17 @@ def train_one(
     prior_state = load_train_state(model_cfg.model_short, task_id, CONDITION)
     if prior_state and prior_state.get("status") == "complete":
         if not inputs_changed(input_hash, meta_path):
-            click.echo(f"  SKIP [{model_cfg.model_short}/{task_id}/{CONDITION}]: already complete")
+            echo("SKIP: already complete")
             _log.info("training skip", model=model_cfg.model_short, task=task_id, condition=CONDITION,
                       event="stage_skip")
             if meta_path.exists():
                 with open(meta_path) as f:
                     return json.load(f)
             return {}
-        click.echo(f"  RETRAIN [{model_cfg.model_short}/{task_id}/{CONDITION}]: inputs changed")
+        echo("RETRAIN: inputs changed")
 
     if dry_run:
-        click.echo(f"  [dry-run] Would train {model_cfg.model_id} on {data_path.name}")
+        echo(f"[dry-run] Would train {model_cfg.model_id} on {data_path.name}")
         meta = {
             "model_id": model_cfg.model_short, "task_id": task_id, "condition": CONDITION,
             "train_data_path": str(data_path),
@@ -499,7 +508,7 @@ def train_one(
 
     resume_ckpt = find_hf_resume_checkpoint(model_cfg.model_short, task_id, CONDITION)
     if resume_ckpt:
-        click.echo(f"  Resuming from checkpoint: {resume_ckpt.name}")
+        echo(f"Resuming from checkpoint: {resume_ckpt.name}")
     save_train_state(model_cfg.model_short, task_id, CONDITION, {
         "status": "in_progress",
         "epoch": 0,
@@ -520,6 +529,7 @@ def train_one(
             log_dir=log_dir,
             smoke_test=smoke_test,
             input_hash=input_hash,
+            ctx=ctx,
         )
 
     _log.info("training complete", model=model_cfg.model_short, task=task_id, condition=CONDITION,
@@ -529,21 +539,21 @@ def train_one(
               eval_loss=meta.get("eval_loss"), n_train=meta.get("n_train"))
 
     if auto_upload:
-        _upload_adapter(model_cfg.model_short, task_id, CONDITION)
+        _upload_adapter(model_cfg.model_short, task_id, CONDITION, ctx=ctx)
 
     return meta
 
 
-def _upload_adapter(model_short: str, task_id: str, condition: str) -> None:
+def _upload_adapter(model_short: str, task_id: str, condition: str, ctx: str = "") -> None:
     import subprocess
-    click.echo(f"  Auto-uploading {model_short}/{task_id}/{condition} to HuggingFace...")
+    _echo(ctx, "Auto-uploading to HuggingFace...")
     result = subprocess.run(
         ["python", str(REPO_ROOT / "scripts" / "upload_artifacts.py"),
          "--model", model_short, "--task", task_id, "--condition", condition],
         capture_output=False,
     )
     if result.returncode != 0:
-        click.echo(f"  WARNING: upload failed (exit {result.returncode})", err=True)
+        _echo(ctx, f"WARNING: upload failed (exit {result.returncode})")
 
 
 @click.command()
@@ -571,20 +581,28 @@ def main(model: Optional[str], task: str, cap: Optional[int], auto_upload: bool,
         model_cfg = load_model_config(mid)
         for tid in task_ids:
             task_cfg = load_task_config(tid)
+            ctx = f"{mid}/{tid}"
 
             src_name = "smoke_train.jsonl" if smoke_test else "train.jsonl"
             src = _resolve_prepared(tid, src_name)
             if src is None:
-                click.echo(f"  SKIP [{mid}/{tid}]: {src_name} not found", err=True)
+                click.echo(f"  [{ctx}] SKIP: {src_name} not found", err=True)
                 if not dry_run:
                     failures.append((f"{mid}/{tid}", "data file missing"))
                 continue
-            data_file = get_or_create_cap(src.parent, cap) if cap is not None and not smoke_test else src
+            data_file = get_or_create_cap(src.parent, cap, ctx=ctx) if cap is not None and not smoke_test else src
+            if not dry_run:
+                try:
+                    require_jsonl(data_file, min_rows=1, check_chat_format=True)
+                except Exception as exc:
+                    click.echo(f"  [{ctx}] ERROR: input validation failed: {exc}", err=True)
+                    failures.append((f"{mid}/{tid}", str(exc)))
+                    continue
 
             try:
-                train_one(model_cfg, task_cfg, data_file, dry_run, auto_upload=auto_upload, smoke_test=smoke_test)
+                train_one(model_cfg, task_cfg, data_file, dry_run, auto_upload=auto_upload, smoke_test=smoke_test, ctx=ctx)
             except Exception as exc:
-                click.echo(f"  ERROR [{mid}/{tid}]: {exc}", err=True)
+                click.echo(f"  [{ctx}] ERROR: {exc}", err=True)
                 traceback.print_exc()
                 _log.error(f"training failed: {type(exc).__name__}: {exc}",
                            model=mid, task=tid, condition=CONDITION,

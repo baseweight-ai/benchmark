@@ -132,12 +132,23 @@ class _Tee:
 
     def write(self, data):
         for s in self._s:
-            s.write(data)
-        self.flush()
+            try:
+                if getattr(s, "closed", False):
+                    continue
+                s.write(data)
+            except (ValueError, OSError):
+                pass
+        if "\n" in data:
+            self.flush()
 
     def flush(self):
         for s in self._s:
-            s.flush()
+            try:
+                if getattr(s, "closed", False):
+                    continue
+                s.flush()
+            except (ValueError, OSError):
+                pass
 
     def isatty(self):
         return False  # suppress ANSI escape codes and progress bars from tqdm/rich/click

@@ -166,3 +166,85 @@ def test_save_train_state_adds_timestamp(tmp_network_volume):
     save_train_state("qwen3-8b", "fpb", "lora-500", {"status": "in_progress"})
     state = load_train_state("qwen3-8b", "fpb", "lora-500")
     assert state["saved_at"] >= t_before
+
+
+# ── _Tee ───────────────────────────────────────────────────────────────────────
+
+from checkpoint_utils import _Tee
+from io import StringIO
+from unittest.mock import MagicMock
+
+
+class TestTee:
+    def test_writes_to_all_streams(self):
+        a, b = StringIO(), StringIO()
+        tee = _Tee(a, b)
+        tee.write("hello\n")
+        assert a.getvalue() == "hello\n"
+        assert b.getvalue() == "hello\n"
+
+    def test_skips_closed_stream(self):
+        live = StringIO()
+        dead = StringIO()
+        dead.close()
+        tee = _Tee(dead, live)
+        tee.write("hi\n")
+        assert live.getvalue() == "hi\n"
+
+    def test_tolerates_value_error_on_write(self):
+        bad = MagicMock()
+        bad.closed = False
+        bad.write.side_effect = ValueError("I/O operation on closed file")
+        good = StringIO()
+        tee = _Tee(bad, good)
+        tee.write("msg\n")  # must not raise
+        assert good.getvalue() == "msg\n"
+
+    def test_tolerates_os_error_on_write(self):
+        bad = MagicMock()
+        bad.closed = False
+        bad.write.side_effect = OSError("broken pipe")
+        good = StringIO()
+        tee = _Tee(bad, good)
+        tee.write("msg\n")  # must not raise
+        assert good.getvalue() == "msg\n"
+
+    def test_flush_only_on_newline(self):
+        s = MagicMock()
+        s.closed = False
+        tee = _Tee(s)
+        tee.write("no newline here")
+        s.flush.assert_not_called()
+        tee.write("has\nnewline")
+        s.flush.assert_called()
+
+    def test_flush_skips_closed_stream(self):
+        dead = StringIO()
+        dead.close()
+        live = MagicMock()
+        live.closed = False
+        tee = _Tee(dead, live)
+        tee.flush()  # must not raise
+        live.flush.assert_called_once()
+
+    def test_tolerates_value_error_on_flush(self):
+        bad = MagicMock()
+        bad.closed = False
+        bad.flush.side_effect = ValueError("closed")
+        tee = _Tee(bad)
+        tee.flush()  # must not raise
+
+    def test_isatty_returns_false(self):
+        tee = _Tee(StringIO())
+        assert tee.isatty() is False
+
+    def test_training_log_tees_to_file(self, tmp_path):
+        import sys
+        from checkpoint_utils import training_log
+        ckpt_dir = tmp_path / "ckpt"
+        stdout_before = sys.stdout
+        with training_log(ckpt_dir) as log_path:
+            print("logged line")
+        assert log_path.exists()
+        assert "logged line" in log_path.read_text()
+        assert sys.stdout is stdout_before

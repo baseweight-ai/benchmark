@@ -27,6 +27,7 @@ from pipeline.config import get_local_models, get_tasks
 from pipeline.log import configure, get_logger
 from pipeline.paths import adapter_path, pred_path
 from pipeline.providers import call_vllm  # noqa: F401  # re-exported for test patching
+from pipeline.validation import require_jsonl
 
 _log = get_logger("eval-local")
 
@@ -140,9 +141,26 @@ def get_few_shot(task_id: str, model_short: str, smoke_test: bool) -> list[dict]
 
 
 
+_HF_NOISE = ("429 Client Error", "rate limit", "Too Many Requests", "We had to rate limit")
+_ALWAYS_SUPPRESS = ("ProcessGroupNCCL.cpp", "process group has NOT been destroyed", "destroy_process_group")
+
+
 def _stream_vllm_output(proc: subprocess.Popen) -> None:
+    in_atexit_tb = False
     for line in proc.stdout:
-        click.echo(f"  [vllm] {line.decode(errors='replace').rstrip()}")
+        text = line.decode(errors='replace').rstrip()
+        if any(p in text for p in _HF_NOISE):
+            continue
+        if any(p in text for p in _ALWAYS_SUPPRESS):
+            continue
+        if "Exception ignored in" in text:
+            in_atexit_tb = True
+            continue
+        if in_atexit_tb:
+            if "KeyboardInterrupt: MQLLMEngine terminated" in text:
+                in_atexit_tb = False
+            continue
+        click.echo(f"  [vllm] {text}")
 
 
 def _check_vllm_package() -> None:
@@ -178,8 +196,9 @@ def start_vllm_server(
 
     env = os.environ.copy()
     env["VLLM_LOGGING_LEVEL"] = "DEBUG"
+    env["TRANSFORMERS_VERBOSITY"] = "error"
 
-    dtype = "float32" if smoke_test else "bfloat16"
+    dtype = "bfloat16"
     gpu_mem_util = "0.2" if smoke_test else "0.9"
 
     _check_vllm_package()
@@ -275,6 +294,7 @@ async def run_eval(
 
     if not test_path.exists():
         raise FileNotFoundError(f"test data not found: {test_path}")
+    require_jsonl(test_path, min_rows=1, check_chat_format=True, require_assistant_completion=False)
 
     test_rows = load_test_rows(task_id, smoke_test, eval_seed)
 

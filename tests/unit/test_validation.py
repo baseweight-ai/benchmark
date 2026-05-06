@@ -1,9 +1,133 @@
 """Unit tests for pipeline.validation."""
+import json
+
 import pytest
 
-from pipeline.validation import check_contamination, validate_chat_row, validate_dataset
+from pipeline.validation import (
+    InputValidationError,
+    check_contamination,
+    require_dir,
+    require_jsonl,
+    validate_chat_row,
+    validate_dataset,
+)
 
 pytestmark = pytest.mark.unit
+
+
+# ── require_jsonl ──────────────────────────────────────────────────────────────
+
+def _write_jsonl(path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+
+
+def _chat_row(user="q", assistant="a"):
+    return {"messages": [{"role": "user", "content": user}, {"role": "assistant", "content": assistant}]}
+
+
+class TestRequireJsonl:
+    def test_missing_file_raises(self, tmp_path):
+        with pytest.raises(InputValidationError, match="not found"):
+            require_jsonl(tmp_path / "missing.jsonl")
+
+    def test_valid_file_returns_count(self, tmp_path):
+        p = tmp_path / "data.jsonl"
+        _write_jsonl(p, [{"x": i} for i in range(10)])
+        assert require_jsonl(p, min_rows=10) == 10
+
+    def test_too_few_rows_raises(self, tmp_path):
+        p = tmp_path / "data.jsonl"
+        _write_jsonl(p, [{"x": 1}])
+        with pytest.raises(InputValidationError, match="Expected >= 5"):
+            require_jsonl(p, min_rows=5)
+
+    def test_invalid_json_raises(self, tmp_path):
+        p = tmp_path / "data.jsonl"
+        p.write_text('{"ok": true}\nNOT JSON\n')
+        with pytest.raises(InputValidationError, match="Invalid JSON on line 2"):
+            require_jsonl(p, min_rows=1)
+
+    def test_chat_format_check_passes(self, tmp_path):
+        p = tmp_path / "train.jsonl"
+        _write_jsonl(p, [_chat_row() for _ in range(3)])
+        assert require_jsonl(p, min_rows=3, check_chat_format=True) == 3
+
+    def test_chat_format_check_fails_on_bad_row(self, tmp_path):
+        p = tmp_path / "train.jsonl"
+        bad = {"messages": [{"role": "user", "content": "q"}]}  # no assistant
+        _write_jsonl(p, [bad])
+        with pytest.raises(InputValidationError, match="chat-format check"):
+            require_jsonl(p, min_rows=1, check_chat_format=True)
+
+    def test_require_assistant_false_accepts_user_last(self, tmp_path):
+        p = tmp_path / "test.jsonl"
+        test_row = {"messages": [{"role": "user", "content": "q"}]}
+        _write_jsonl(p, [test_row])
+        assert require_jsonl(p, min_rows=1, check_chat_format=True, require_assistant_completion=False) == 1
+
+    def test_lazy_counts_large_file(self, tmp_path):
+        p = tmp_path / "big.jsonl"
+        n = 200
+        _write_jsonl(p, [{"i": i} for i in range(n)])
+        assert require_jsonl(p, min_rows=n, sample_size=5) == n
+
+    def test_blank_lines_ignored(self, tmp_path):
+        p = tmp_path / "data.jsonl"
+        p.write_text('\n{"x":1}\n\n{"x":2}\n\n')
+        assert require_jsonl(p, min_rows=2) == 2
+
+    def test_sample_size_default_five(self, tmp_path):
+        p = tmp_path / "data.jsonl"
+        _write_jsonl(p, [_chat_row() for _ in range(3)])
+        # 3 rows < default sample_size=5, but min_rows=1 — should still pass
+        assert require_jsonl(p, min_rows=1, check_chat_format=True) == 3
+
+
+# ── require_dir ────────────────────────────────────────────────────────────────
+
+class TestRequireDir:
+    def test_missing_dir_raises(self, tmp_path):
+        with pytest.raises(InputValidationError, match="not found"):
+            require_dir(tmp_path / "nonexistent")
+
+    def test_file_where_dir_expected_raises(self, tmp_path):
+        f = tmp_path / "file.txt"
+        f.write_text("hi")
+        with pytest.raises(InputValidationError, match="Expected a directory"):
+            require_dir(f)
+
+    def test_empty_dir_raises(self, tmp_path):
+        d = tmp_path / "empty"
+        d.mkdir()
+        with pytest.raises(InputValidationError, match="directory is empty"):
+            require_dir(d)
+
+    def test_nonempty_dir_returns_one(self, tmp_path):
+        d = tmp_path / "data"
+        d.mkdir()
+        (d / "file.txt").write_text("x")
+        assert require_dir(d) == 1
+
+    def test_min_files_satisfied(self, tmp_path):
+        d = tmp_path / "data"
+        d.mkdir()
+        for i in range(3):
+            (d / f"f{i}.txt").write_text("x")
+        assert require_dir(d, min_files=3) == 3
+
+    def test_min_files_not_satisfied_raises(self, tmp_path):
+        d = tmp_path / "data"
+        d.mkdir()
+        (d / "one.txt").write_text("x")
+        with pytest.raises(InputValidationError, match="Expected >= 3"):
+            require_dir(d, min_files=3)
+
+    def test_desc_appears_in_error(self, tmp_path):
+        with pytest.raises(InputValidationError, match="raw data for toy"):
+            require_dir(tmp_path / "nonexistent", desc="raw data for toy")
 
 
 def _row(*role_content_pairs):

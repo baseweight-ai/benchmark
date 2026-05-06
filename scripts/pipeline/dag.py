@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import concurrent.futures
 import subprocess
+import sys
+import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -20,6 +22,8 @@ from pathlib import Path
 from typing import Callable, Literal
 
 from pipeline.log import get_logger
+
+_stdout_lock = threading.Lock()
 
 _log = get_logger("dag")
 
@@ -56,6 +60,8 @@ class Stage:
     depends_on: list[str]
     compute: Literal["cpu", "gpu", "cloud"]
     timeout_s: int | None = None
+    requires_all_deps: bool = False  # if True, skip if any dep failed/skipped
+    description: str = ""
 
 
 class DAGRunner:
@@ -130,28 +136,70 @@ class DAGRunner:
 
     def _run_stage(self, stage: Stage) -> StageResult:
         t0 = time.monotonic()
+        with _stdout_lock:
+            timeout_str = f"  timeout: {stage.timeout_s}s" if stage.timeout_s else ""
+            meta = f"  (compute: {stage.compute}{timeout_str})"
+            desc = f"  {stage.description}" if stage.description else ""
+            print(f"\n  [{stage.id}] ━━━{desc}{meta} ━━━\n", flush=True)
         _log.info("stage start", stage=stage.id, event="stage_start")
+        prefix = f"[{stage.id}] "
         try:
-            subprocess.run(
+            proc = subprocess.Popen(
                 stage.cmd,
                 cwd=self._repo_root,
-                timeout=stage.timeout_s,
-                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
             )
+
+            def _emit(raw: bytes) -> None:
+                line = raw.decode(errors="replace")
+                # Simulate terminal \r overwrite: keep only the last segment
+                if "\r" in line:
+                    line = line.rsplit("\r", 1)[-1]
+                line = line.rstrip()
+                if line:
+                    with _stdout_lock:
+                        print(f"  {prefix}{line}", flush=True)
+
+            def _stream() -> None:
+                buf = b""
+                while True:
+                    chunk = proc.stdout.read(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        raw_line, buf = buf.split(b"\n", 1)
+                        _emit(raw_line)
+                if buf:
+                    _emit(buf)
+
+            reader = threading.Thread(target=_stream, daemon=True)
+            reader.start()
+
+            timed_out = False
+            try:
+                proc.wait(timeout=stage.timeout_s)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                proc.kill()
+
+            reader.join()
             elapsed = time.monotonic() - t0
+
+            if timed_out:
+                msg = f"timeout after {stage.timeout_s}s"
+                _log.error("stage timeout", stage=stage.id, wall_time_s=round(elapsed, 1), exc=msg)
+                return StageResult(stage.id, StageStatus.FAILED, elapsed_s=elapsed, error=msg)
+
+            if proc.returncode != 0:
+                msg = f"exit code {proc.returncode}"
+                _log.error("stage failed", stage=stage.id, wall_time_s=round(elapsed, 1), exc=msg)
+                return StageResult(stage.id, StageStatus.FAILED, elapsed_s=elapsed, error=msg)
+
             _log.info("stage complete", stage=stage.id, wall_time_s=round(elapsed, 1),
                       event="stage_complete")
             return StageResult(stage.id, StageStatus.DONE, elapsed_s=elapsed)
-        except subprocess.TimeoutExpired:
-            elapsed = time.monotonic() - t0
-            msg = f"timeout after {stage.timeout_s}s"
-            _log.error("stage timeout", stage=stage.id, wall_time_s=round(elapsed, 1), exc=msg)
-            return StageResult(stage.id, StageStatus.FAILED, elapsed_s=elapsed, error=msg)
-        except subprocess.CalledProcessError as e:
-            elapsed = time.monotonic() - t0
-            msg = f"exit code {e.returncode}"
-            _log.error("stage failed", stage=stage.id, wall_time_s=round(elapsed, 1), exc=msg)
-            return StageResult(stage.id, StageStatus.FAILED, elapsed_s=elapsed, error=msg)
         except Exception as e:
             elapsed = time.monotonic() - t0
             _log.error("stage error", stage=stage.id, wall_time_s=round(elapsed, 1), exc=str(e))
@@ -168,7 +216,14 @@ class DAGRunner:
         if self._abort:
             return True
         active = [d for d in stage.depends_on if d in self._status]
-        return bool(active) and all(
+        if not active:
+            return False
+        if stage.requires_all_deps:
+            return any(
+                self._status[d] in (StageStatus.FAILED, StageStatus.SKIPPED)
+                for d in active
+            )
+        return all(
             self._status[d] in (StageStatus.FAILED, StageStatus.SKIPPED)
             for d in active
         )

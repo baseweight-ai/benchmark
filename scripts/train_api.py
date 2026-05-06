@@ -19,6 +19,7 @@ from checkpoint_utils import atomic_write_json
 from pipeline.config import get_sft_base_models, get_tasks
 from pipeline.log import configure, get_logger
 from pipeline.paths import training_meta_path
+from pipeline.validation import require_jsonl
 from pipeline.versioning import git_sha as _git_sha
 
 _log = get_logger("train-api")
@@ -33,6 +34,7 @@ _TERMINAL_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
 SFT_BASE_MODELS: dict[str, str] = get_sft_base_models()
 
 ALL_SFT_MODELS = list(SFT_BASE_MODELS.keys())
+SMOKE_SFT_MODELS = ["gpt-4.1-nano"]
 
 _SFT_SUFFIX_MAX_LEN = 18
 
@@ -101,8 +103,7 @@ def run_sft_train(
     base_model = SFT_BASE_MODELS[model_id]
     mp = meta_path(model_id, task_id)
 
-    if not sft_path.exists():
-        raise FileNotFoundError(f"SFT training data not found: {sft_path}")
+    require_jsonl(sft_path, min_rows=1, check_chat_format=True)
 
     if dry_run:
         if mp.exists() and not force:
@@ -129,7 +130,7 @@ def run_sft_train(
     from openai import OpenAI
     client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-    job = _find_existing_sft_job(client, model_id, task_id, smoke_test)
+    job = None if force else _find_existing_sft_job(client, model_id, task_id, smoke_test)
     if job and job.status == "succeeded":
         click.echo(f"  Found completed job {job.id} on OpenAI → {job.fine_tuned_model}")
         meta = _write_sft_metadata(job, sft_path, model_id, mp)
@@ -223,7 +224,8 @@ def main(model: str, task: str, dry_run: bool, smoke_test: bool, force: bool, su
     then the process exits. eval_api.py will wait for completion when it reaches api-sft.
     """
     configure(REPO_ROOT)
-    model_ids = ALL_SFT_MODELS if model == "all" else [model]
+    default_sft_models = SMOKE_SFT_MODELS if smoke_test else ALL_SFT_MODELS
+    model_ids = default_sft_models if model == "all" else [model]
     task_ids = ALL_TASKS if task == "all" else [task]
 
     if not dry_run and not os.environ.get("OPENAI_API_KEY"):

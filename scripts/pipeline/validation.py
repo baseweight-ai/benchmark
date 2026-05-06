@@ -1,8 +1,87 @@
 """Chat schema validation and training data contamination checks."""
 from __future__ import annotations
 
+import json
 import re
+from pathlib import Path
 from typing import Optional
+
+
+# ── File-level input guards ────────────────────────────────────────────────────
+
+class InputValidationError(RuntimeError):
+    pass
+
+
+def require_jsonl(
+    path: Path,
+    min_rows: int = 1,
+    check_chat_format: bool = False,
+    require_assistant_completion: bool = True,
+    sample_size: int = 5,
+) -> int:
+    """Assert path exists, contains >= min_rows valid JSON lines, and optionally passes chat-format checks.
+
+    Returns the total row count. Raises InputValidationError on any failure.
+    Reads lazily: parses only the first max(min_rows, sample_size) rows, then
+    counts remaining lines without parsing to keep large-file overhead minimal.
+    """
+    if not path.exists():
+        raise InputValidationError(f"Required input file not found: {path}")
+    stop_at = max(min_rows, sample_size)
+    sample: list[dict] = []
+    count = 0
+    with open(path) as fh:
+        for lineno, raw in enumerate(fh, 1):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                row = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise InputValidationError(
+                    f"Invalid JSON on line {lineno} of {path}: {exc}"
+                ) from exc
+            count += 1
+            if len(sample) < sample_size:
+                sample.append(row)
+            if count >= stop_at:
+                count += sum(1 for line in fh if line.strip())
+                break
+    if count < min_rows:
+        raise InputValidationError(
+            f"Expected >= {min_rows} rows in {path}, found {count}"
+        )
+    if check_chat_format:
+        for i, row in enumerate(sample):
+            err = validate_chat_row(row, require_assistant_completion=require_assistant_completion)
+            if err:
+                raise InputValidationError(
+                    f"Row {i} of {path} failed chat-format check: {err}"
+                )
+    return count
+
+
+def require_dir(path: Path, min_files: int = 1, desc: str = "") -> int:
+    """Assert directory exists and contains >= min_files entries.
+
+    Returns the file count (exact when min_files > 1, otherwise 1). Raises InputValidationError on failure.
+    """
+    label = desc or str(path)
+    if not path.exists():
+        raise InputValidationError(f"Required directory not found: {label} ({path})")
+    if not path.is_dir():
+        raise InputValidationError(f"Expected a directory, got a file: {path}")
+    if min_files <= 1:
+        if next(path.iterdir(), None) is None:
+            raise InputValidationError(f"Expected >= 1 file in {label}, directory is empty")
+        return 1
+    files = list(path.iterdir())
+    if len(files) < min_files:
+        raise InputValidationError(
+            f"Expected >= {min_files} file(s) in {label}, found {len(files)}"
+        )
+    return len(files)
 
 _VALID_ROLES = frozenset({"system", "user", "assistant"})
 
