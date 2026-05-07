@@ -60,19 +60,22 @@ def _hub_load(path: str, **kwargs):
     The datasets library silently falls back to local cache when the Hub is
     unreachable, emitting a log message instead of raising.  We pre-check Hub
     reachability via HfApi so any failure is explicit before load_dataset runs.
+    When `revision` is already in kwargs the caller already confirmed reachability
+    (by fetching dataset_info to obtain the SHA), so we skip the check.
     """
     from datasets import load_dataset
     from huggingface_hub import HfApi
 
-    token = kwargs.get("token")
-    try:
-        HfApi(token=token).dataset_info(path)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Hugging Face Hub is unreachable for '{path}'. "
-            f"Cannot proceed — load_dataset would silently fall back to local cache.\n"
-            f"Check network connection and HF_TOKEN.\nDetail: {exc}"
-        ) from exc
+    if "revision" not in kwargs:
+        token = kwargs.get("token")
+        try:
+            HfApi(token=token).dataset_info(path)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Hugging Face Hub is unreachable for '{path}'. "
+                f"Cannot proceed — load_dataset would silently fall back to local cache.\n"
+                f"Check network connection and HF_TOKEN.\nDetail: {exc}"
+            ) from exc
 
     return load_dataset(path, **kwargs)
 
@@ -93,10 +96,13 @@ def download_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> N
     # Record the exact Hub commit so every experiment is traceable to a specific version.
     ds_info = HfApi(token=hf_token).dataset_info(cfg.dataset_path)
 
+    sha = getattr(ds_info, "sha", None)
     load_kwargs: dict = {
         "token": hf_token,
         "download_mode": DownloadMode.FORCE_REDOWNLOAD,
     }
+    if sha:
+        load_kwargs["revision"] = sha
     if cfg.dataset_config:
         load_kwargs["name"] = cfg.dataset_config
 

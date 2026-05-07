@@ -139,6 +139,21 @@ def validate_dataset(
     return valid, invalid
 
 
+def reject_test_path(path: Path) -> None:
+    """Raise InputValidationError if path matches a test/eval split filename pattern.
+
+    Blocks filenames starting with 'test' or 'smoke_test', which are the
+    prepared-data conventions for evaluation splits. Call before opening any
+    file that will be used as training data.
+    """
+    if re.match(r"(smoke_)?test", path.name):
+        raise InputValidationError(
+            f"Refusing to use '{path.name}' as training data — filename matches the "
+            "test-split pattern (test*.jsonl / smoke_test*.jsonl). Training on test "
+            "data invalidates all evaluation metrics."
+        )
+
+
 def _normalize_prompt(messages: list[dict]) -> str:
     for msg in messages:
         if msg.get("role") == "user":

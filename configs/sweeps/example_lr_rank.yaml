@@ -1,0 +1,21 @@
+# Example: 2-param grid sweep (6 trials) using the smoke model + smoke data.
+# Run: python scripts/run_sweep.py --config configs/sweeps/example_lr_rank.yaml
+# Dry-run (print plan only): add --dry-run
+#
+# Param routing:
+#   lora_rank, lora_alpha, lora_dropout  →  model_cfg.lora
+#   everything else                      →  model_cfg.training
+#
+name: lr_rank_smoke
+model: qwen2.5-0.5b
+task: fpb
+smoke_test: true   # use smoke_train.jsonl for fast iteration (~minutes per trial)
+
+search: grid       # grid: all combinations; random: sample n_trials
+# search: random
+# n_trials: 5     # (random search only)
+# seed: 42        # (random search only)
+
+params:
+  learning_rate: [1.0e-4, 2.0e-4, 5.0e-4]
+  lora_rank: [4, 8]

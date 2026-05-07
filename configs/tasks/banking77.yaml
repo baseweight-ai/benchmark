@@ -6,8 +6,12 @@ task_type: classification
 num_classes: 77
 metric_id: weighted_f1
 metric_label: "Weighted F1"
+# per_class_weighted: each of 77 classes contributes to F1 weighted by its support (sample
+# count in the test set). Appropriate because test sampling mirrors real query distribution
+# (stratified, total_cap=500), so majority-class performance gets proportional influence.
+metric_granularity: per_class_weighted
 max_output_tokens: 32
-lm_eval_task_id: null
+lm_eval_task_id: banking77
 train_sampling:
   strategy: balanced
   stratify_by: label

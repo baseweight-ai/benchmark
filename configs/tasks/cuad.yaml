@@ -5,6 +5,11 @@ dataset_config: null
 task_type: extraction
 metric_id: token_f1
 metric_label: "Token F1"
+# per_example: arithmetic mean of per-document token-level F1 (SQuAD-style). Each
+# contract clause question is equally weighted regardless of span length or clause type.
+# An alternative is per_class_macro averaging over clause types, but per-document
+# averaging is standard for extraction benchmarks.
+metric_granularity: per_example
 max_output_tokens: 512
 lm_eval_task_id: null
 train_sampling:

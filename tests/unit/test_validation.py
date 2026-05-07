@@ -6,6 +6,7 @@ import pytest
 from pipeline.validation import (
     InputValidationError,
     check_contamination,
+    reject_test_path,
     require_dir,
     require_jsonl,
     validate_chat_row,
@@ -223,3 +224,36 @@ class TestCheckContamination:
         test = [self._test("shared")]
         hits = check_contamination(train, test)
         assert len(hits) == 2
+
+
+# ── reject_test_path ───────────────────────────────────────────────────────────
+
+class TestRejectTestPath:
+    def test_blocks_test_jsonl(self, tmp_path):
+        p = tmp_path / "test.jsonl"
+        with pytest.raises(InputValidationError, match="test-split pattern"):
+            reject_test_path(p)
+
+    def test_blocks_test_labels(self, tmp_path):
+        p = tmp_path / "test_labels.jsonl"
+        with pytest.raises(InputValidationError, match="test-split pattern"):
+            reject_test_path(p)
+
+    def test_blocks_smoke_test(self, tmp_path):
+        p = tmp_path / "smoke_test.jsonl"
+        with pytest.raises(InputValidationError, match="test-split pattern"):
+            reject_test_path(p)
+
+    def test_blocks_test_full(self, tmp_path):
+        p = tmp_path / "test_full.jsonl"
+        with pytest.raises(InputValidationError, match="test-split pattern"):
+            reject_test_path(p)
+
+    def test_allows_train_jsonl(self, tmp_path):
+        reject_test_path(tmp_path / "train.jsonl")  # must not raise
+
+    def test_allows_smoke_train(self, tmp_path):
+        reject_test_path(tmp_path / "smoke_train.jsonl")  # must not raise
+
+    def test_allows_train_cap(self, tmp_path):
+        reject_test_path(tmp_path / "train_cap500.jsonl")  # must not raise

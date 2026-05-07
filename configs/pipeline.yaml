@@ -17,7 +17,7 @@ models:
       conditions: [zero-shot, 5-shot, api-sft]
       sft_base_model: gpt-4.1-nano-2025-04-14
     - id: gpt-4.1-mini
-      pinned_version: gpt-4.1-mini
+      pinned_version: gpt-4.1-mini-2025-04-14
       conditions: [zero-shot, api-sft]
       sft_base_model: gpt-4.1-mini-2025-04-14
     - id: gpt-5.5
@@ -60,6 +60,14 @@ stages:
     outputs:
       - results/training/api/{model_id}/{task_id}/api-sft/metadata.json
 
+  - id: eval-lm-harness
+    script: scripts/eval_lm_harness.py
+    optional: true
+    depends_on: []
+    inputs: []
+    outputs:
+      - results/predictions/lm_eval/{model_short}/{task_id}/zero-shot.jsonl
+
   - id: eval-local
     script: scripts/eval_local.py
     depends_on: [train-local]
@@ -92,7 +100,7 @@ stages:
     inputs:
       - results/summaries
     outputs:
-      - results/final/results.json
+      - dashboard-data/results.json
 
 nondeterminism:
   seeded:
@@ -112,3 +120,5 @@ nondeterminism:
       reason: temperature=0 but GPU floating-point non-determinism at kernel level
     - component: OpenAI API inference (eval_api.py)
       reason: temperature=0 but server-side non-determinism
+    - component: gpt-5.5 model version
+      reason: No dated snapshot available; pinned_version is an alias that may resolve to a newer model

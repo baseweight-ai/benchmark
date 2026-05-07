@@ -6,6 +6,11 @@ task_type: classification
 num_classes: 3
 metric_id: weighted_f1
 metric_label: "Weighted F1"
+# per_class_weighted: FPB class distribution is highly skewed (~59% positive, 28% neutral,
+# 13% negative). Test uses stratified sampling to mirror this, so weighted F1 reflects real-
+# world performance rather than artificially equalising rare classes. Use macro_f1 instead
+# if equal per-class recall is the priority (e.g. auditing for minority-class errors).
+metric_granularity: per_class_weighted
 max_output_tokens: 32
 lm_eval_task_id: null
 train_sampling:
@@ -14,9 +19,10 @@ train_sampling:
   per_group_cap: 200
   seed: 42
 test_sampling:
-  strategy: balanced
+  strategy: stratified
   stratify_by: label
-  per_group_cap: 50
+  total_cap: 150
+  min_per_group: 10
   seed: 42
 eval_axes: [accuracy, cost, latency, instruction_following]
 prompt_file: "prompts/fpb.json"
@@ -24,7 +30,7 @@ text_field: sentence
 label_field: label
 label_type: integer_mapped
 custom_label_names: ["negative", "neutral", "positive"]
-split_ratios: [0.70, 0.15, 0.15]
+split_ratios: [0.85, 0.15]
 split_seed: 42
 epochs_by_size:
   small: 10

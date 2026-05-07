@@ -77,10 +77,38 @@ def compute_axis_scores(
     return scores
 
 
+# Maps metric_id → the metric_granularity it implies.
+# Used to catch silent mismatches between metric_id and the declared granularity.
+_EXPECTED_GRANULARITY: dict[str, str] = {
+    "macro_f1":    "per_class_macro",
+    "weighted_f1": "per_class_weighted",
+    "accuracy":    "per_example",
+    "token_f1":    "per_example",
+}
+
+# Maps per-example error_category → broad semantic failure type.
+# Allows coarser cross-task analysis ("how often does the model confuse facts?"
+# vs "how often does it refuse or ignore instructions?") without rerunning classify.
+_SEMANTIC_ERROR_TYPE: dict[str, str] = {
+    "correct":          "correct",
+    "not_applicable":   "correct",            # model correctly identified no answer
+    "empty":            "instruction_following_failure",
+    "format_violation": "instruction_following_failure",
+    "refusal":          "safety_or_alignment_refusal",
+    "wrong_class":      "factual_error",
+    "hallucinated":     "factual_error",
+    "partial":          "extraction_mismatch",
+}
+
+
 class TaskConfig(BaseModel):
     task_id: str
     task_type: str
     metric_id: str
+    # Declared aggregation level for the primary metric. Must be consistent with
+    # metric_id — mismatches are flagged because they silently change what is measured.
+    # Values: per_class_weighted | per_class_macro | per_example
+    metric_granularity: str = "per_example"
     eval_axes: list[str] = []
 
 
@@ -231,6 +259,10 @@ def aggregate_seed_summaries(summaries: list[dict]) -> dict:
     for s in summaries:
         for k, v in s.get("error_counts", {}).items():
             all_counts[k] += v
+    all_semantic_counts: dict[str, int] = defaultdict(int)
+    for s in summaries:
+        for k, v in s.get("semantic_error_counts", {}).items():
+            all_semantic_counts[k] += v
     base = summaries[0]  # representative row for metadata
 
     eval_axes = base.get("eval_axes", [])
@@ -246,6 +278,11 @@ def aggregate_seed_summaries(summaries: list[dict]) -> dict:
             higher = axis_defs.get(axis, {}).get("higher_is_better", True)
             agg_axis_scores[axis] = {"value": round(sum(vals) / len(vals), 4), "higher_is_better": higher}
 
+    # Coefficient of variation = std/mean: how stable the metric is across evaluation
+    # seeds. A stability measure, not an effect size. High CV (>0.05) suggests the
+    # metric is sensitive to test-set sampling, weakening per-seed comparisons.
+    metric_cv = round(std / mean, 4) if mean != 0 else None
+
     return {
         "model": base.get("model"),
         "task_id": base.get("task_id"),
@@ -253,13 +290,16 @@ def aggregate_seed_summaries(summaries: list[dict]) -> dict:
         "n_seeds": n,
         "seed_metric_values": metric_values,
         "metric_id": base.get("metric_id"),
+        "metric_granularity": base.get("metric_granularity"),
         "metric_value": round(mean, 4),    # mean used as the primary value
         "metric_mean": round(mean, 4),
         "metric_std": round(std, 4),
+        "metric_cv": metric_cv,
         "metric_ci_lo": round(ci_lo, 4),
         "metric_ci_hi": round(ci_hi, 4),
         "n_predictions": sum(s.get("n_predictions", 0) for s in summaries),
         "error_counts": dict(all_counts),
+        "semantic_error_counts": dict(all_semantic_counts),
         "prompt_sha": base.get("prompt_sha"),
         "few_shot_hash": base.get("few_shot_hash"),
         "eval_axes": eval_axes,
@@ -327,6 +367,7 @@ def classify_predictions(
             cat = "unknown"
             enriched["error_category"] = cat
 
+        enriched["semantic_error_type"] = _SEMANTIC_ERROR_TYPE.get(cat, "unknown")
         counts[cat] += 1
         classified.append(enriched)
 
@@ -367,6 +408,19 @@ def process_model_task_condition(
     classified_out = classified_path(REPO_ROOT, source, model_short, task_id, condition)
     _write_jsonl(classified, classified_out)
 
+    # Enforce consistency between metric_id and the declared metric_granularity.
+    # A mismatch means the config says one thing but the computation does another,
+    # which silently changes what is being measured across runs or comparisons.
+    expected_gran = _EXPECTED_GRANULARITY.get(task_cfg.metric_id)
+    if expected_gran and task_cfg.metric_granularity != expected_gran:
+        click.echo(
+            f"  WARNING [{task_id}]: metric_id={task_cfg.metric_id!r} implies "
+            f"granularity {expected_gran!r} but config declares "
+            f"metric_granularity={task_cfg.metric_granularity!r}. "
+            "These measure different things — fix the task config.",
+            err=True,
+        )
+
     metric_value = compute_metric(task_cfg, classified)
 
     latencies = [r["latency_ms"] for r in predictions if r.get("latency_ms", 0) > 0]
@@ -395,6 +449,11 @@ def process_model_task_condition(
             elapsed = (_parse(max(timestamps)) - _parse(min(timestamps))).total_seconds()
             rounded = round(elapsed, 1)
             eval_wall_time_s = rounded if rounded > 0 else None
+
+    # Aggregate error categories into semantic failure types for coarser cross-task reporting
+    semantic_counts: dict[str, int] = defaultdict(int)
+    for row in classified:
+        semantic_counts[row.get("semantic_error_type", "unknown")] += 1
 
     n = len(predictions)
     # Derived compliance/error rates
@@ -440,8 +499,10 @@ def process_model_task_condition(
         "few_shot_hash": few_shot_hash,
         "n_predictions": n,
         "metric_id": task_cfg.metric_id,
+        "metric_granularity": task_cfg.metric_granularity,
         "metric_value": round(metric_value, 4) if metric_value is not None else None,
         "error_counts": counts,
+        "semantic_error_counts": dict(semantic_counts),
         "format_compliance_rate": format_compliance_rate,
         "refusal_rate": refusal_rate,
         "empty_rate": empty_rate,
@@ -463,6 +524,10 @@ def process_model_task_condition(
     atomic_write_json(summary, summary_out)
     metric_str = f"{metric_value:.4f}" if metric_value is not None else "N/A"
     click.echo(f"  [{label}] {task_cfg.metric_id}={metric_str} counts={counts}")
+    # Surface semantic failure breakdown when anything other than "correct" is present.
+    semantic_failures = {k: v for k, v in semantic_counts.items() if k != "correct"}
+    if semantic_failures:
+        click.echo(f"  [{label}] semantic failures: {dict(semantic_failures)}")
     return summary
 
 
@@ -478,6 +543,24 @@ def get_valid_labels(task_id: str) -> Optional[list[str]]:
     return label_map.get(task_id)
 
 
+def _print_classify_summary(summaries: list[dict]) -> None:
+    """Print a cross-task summary table after classify_errors finishes."""
+    sep = "  " + "─" * 70
+    click.echo(f"\n  Classification Summary  ({len(summaries)} run(s))")
+    click.echo(sep)
+    click.echo(f"  {'run':<40}  {'metric':>7}  {'n':>5}  issues")
+    click.echo(sep)
+    for s in sorted(summaries, key=lambda x: (x.get("task_id", ""), x.get("condition", ""), x.get("model", ""))):
+        label = f"{s.get('model','?')}/{s.get('task_id','?')}/{s.get('condition','?')}"[:40]
+        mv = s.get("metric_value")
+        metric_str = f"{mv:.4f}" if mv is not None else "   n/a"
+        n = s.get("n_predictions", 0)
+        ec = s.get("error_counts", {})
+        issues = " ".join(f"{k}={v}" for k, v in sorted(ec.items()) if k != "correct" and v > 0)
+        click.echo(f"  {label:<40}  {metric_str:>7}  {n:>5}  {issues}")
+    click.echo(sep)
+
+
 @click.command()
 @click.option("--model", default="all", help="Model short name or 'all' (ignored for api source)")
 @click.option("--task", default="all", help="Task ID or 'all'")
@@ -487,7 +570,7 @@ def get_valid_labels(task_id: str) -> Optional[list[str]]:
 def main(model: str, task: str, condition: str, source: str, dry_run: bool) -> None:
     """Classify prediction errors and compute primary metrics."""
     pred_root = REPO_ROOT / "results" / "predictions"
-    sources = ["local", "api"] if source == "all" else [source]
+    sources = ["local", "api", "lm_eval"] if source == "all" else [source]
 
     task_ids = ALL_TASKS if task == "all" else [task]
 
@@ -498,6 +581,7 @@ def main(model: str, task: str, condition: str, source: str, dry_run: bool) -> N
 
     failures = []
     processed = 0
+    all_summaries: list[dict] = []
 
     for src in sources:
         src_root = pred_root / src
@@ -538,6 +622,7 @@ def main(model: str, task: str, condition: str, source: str, dry_run: bool) -> N
                         )
                         if result is not None:
                             processed += 1
+                            all_summaries.append(result)
                             # Collect seed summaries for aggregation
                             base_cond = cond.split("_seed")[0] if "_seed" in cond else None
                             if base_cond:
@@ -574,7 +659,11 @@ def main(model: str, task: str, condition: str, source: str, dry_run: bool) -> N
     if processed == 0:
         click.echo("ERROR: no prediction files found — nothing was classified.", err=True)
         sys.exit(1)
-    click.echo(f"\nClassified {processed} prediction file(s).")
+
+    if all_summaries and not dry_run:
+        _print_classify_summary(all_summaries)
+
+    click.echo(f"Classified {processed} prediction file(s).")
 
 
 if __name__ == "__main__":

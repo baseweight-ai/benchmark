@@ -6,8 +6,12 @@ task_type: classification
 num_classes: 100
 metric_id: weighted_f1
 metric_label: "Weighted F1"
+# per_class_weighted: 100 provision types with a power-law frequency distribution. Weighted
+# F1 reflects performance proportional to how often each provision appears. If equal
+# per-class detection mattered (e.g. rare-but-critical clauses), switch to macro_f1.
+metric_granularity: per_class_weighted
 max_output_tokens: 32
-lm_eval_task_id: lex_glue_ledgar
+lm_eval_task_id: ledgar
 train_sampling:
   strategy: balanced
   stratify_by: label

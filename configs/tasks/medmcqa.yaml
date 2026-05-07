@@ -6,6 +6,11 @@ task_type: classification
 num_classes: 4
 metric_id: accuracy
 metric_label: "Accuracy"
+# per_example: MCQ answer choices (A/B/C/D) are balanced across questions by construction,
+# so per-example accuracy is equivalent to micro-F1 and macro-F1 here. Each question
+# is weighted equally regardless of medical subject. Use weighted_f1 if you need to
+# account for imbalanced subject-area sampling in the test set.
+metric_granularity: per_example
 max_output_tokens: 8
 test_split: validation
 lm_eval_task_id: medmcqa

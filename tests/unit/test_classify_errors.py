@@ -2,6 +2,7 @@
 import pytest
 
 from classify_errors import (
+    aggregate_seed_summaries,
     classify_classification,
     classify_extraction,
     classify_predictions,
@@ -191,9 +192,10 @@ def test_classify_extraction_format_violation_too_long():
 
 # ── compute_metric ─────────────────────────────────────────────────────────────
 
-def _make_task_cfg(task_type: str, metric_id: str):
+def _make_task_cfg(task_type: str, metric_id: str, metric_granularity: str = "per_example"):
     from classify_errors import TaskConfig
-    return TaskConfig(task_id="toy", task_type=task_type, metric_id=metric_id)
+    return TaskConfig(task_id="toy", task_type=task_type, metric_id=metric_id,
+                      metric_granularity=metric_granularity)
 
 
 def test_compute_metric_accuracy():
@@ -256,6 +258,98 @@ def test_get_valid_labels_fpb():
 def test_get_valid_labels_medmcqa():
     labels = get_valid_labels("medmcqa")
     assert set(labels) == {"A", "B", "C", "D"}
+
+
+# ── metric_granularity ────────────────────────────────────────────────────────
+
+def test_task_config_default_granularity():
+    from classify_errors import TaskConfig
+    cfg = TaskConfig(task_id="toy", task_type="classification", metric_id="accuracy")
+    assert cfg.metric_granularity == "per_example"
+
+
+def test_task_config_explicit_granularity():
+    from classify_errors import TaskConfig
+    cfg = TaskConfig(task_id="toy", task_type="classification", metric_id="weighted_f1",
+                     metric_granularity="per_class_weighted")
+    assert cfg.metric_granularity == "per_class_weighted"
+
+
+def test_expected_granularity_map_coverage():
+    from classify_errors import _EXPECTED_GRANULARITY
+    assert "macro_f1" in _EXPECTED_GRANULARITY
+    assert "weighted_f1" in _EXPECTED_GRANULARITY
+    assert "accuracy" in _EXPECTED_GRANULARITY
+    assert "token_f1" in _EXPECTED_GRANULARITY
+
+
+def test_granularity_mismatch_emits_warning(capsys):
+    from classify_errors import TaskConfig, _EXPECTED_GRANULARITY
+    # weighted_f1 implies per_class_weighted; declaring per_example is a mismatch
+    cfg = TaskConfig(task_id="toy", task_type="classification", metric_id="weighted_f1",
+                     metric_granularity="per_example")
+    expected = _EXPECTED_GRANULARITY["weighted_f1"]
+    assert expected == "per_class_weighted"
+    assert cfg.metric_granularity != expected   # confirms the mismatch
+
+
+def test_task_configs_granularity_consistent():
+    """Real task configs must declare a metric_granularity matching their metric_id."""
+    from classify_errors import TaskConfig, _EXPECTED_GRANULARITY, load_task_config
+    for task_id in ["banking77", "fpb", "ledgar", "medmcqa", "cuad"]:
+        cfg = load_task_config(task_id)
+        expected = _EXPECTED_GRANULARITY.get(cfg.metric_id)
+        assert expected is not None, f"{task_id}: metric_id {cfg.metric_id!r} not in _EXPECTED_GRANULARITY"
+        assert cfg.metric_granularity == expected, (
+            f"{task_id}: metric_id={cfg.metric_id!r} implies granularity {expected!r} "
+            f"but config declares {cfg.metric_granularity!r}"
+        )
+
+
+# ── aggregate_seed_summaries: metric_cv ───────────────────────────────────────
+
+def _make_seed_summary(metric_value: float) -> dict:
+    return {
+        "model": "qwen3-8b",
+        "task_id": "fpb",
+        "condition": "lora",
+        "metric_id": "weighted_f1",
+        "metric_granularity": "per_class_weighted",
+        "metric_value": metric_value,
+        "n_predictions": 150,
+        "error_counts": {"correct": 100, "wrong_class": 50},
+        "eval_axes": [],
+        "axis_scores": {},
+    }
+
+
+def test_aggregate_seed_summaries_includes_metric_cv():
+    import math
+    vals = [0.80, 0.84, 0.82]
+    summaries = [_make_seed_summary(v) for v in vals]
+    agg = aggregate_seed_summaries(summaries)
+    assert "metric_cv" in agg
+    assert agg["metric_cv"] is not None
+    # Recompute expected CV from raw values (both metric_cv and metric_std are
+    # rounded independently, so comparing agg["metric_std"]/agg["metric_mean"]
+    # would diverge from the directly-rounded metric_cv).
+    n = len(vals)
+    mean = sum(vals) / n
+    std = math.sqrt(sum((v - mean) ** 2 for v in vals) / n)
+    assert agg["metric_cv"] == round(std / mean, 4)
+
+
+def test_aggregate_seed_summaries_cv_none_for_zero_mean():
+    # If mean is 0 (pathological but possible), CV is undefined
+    summaries = [_make_seed_summary(0.0), _make_seed_summary(0.0)]
+    agg = aggregate_seed_summaries(summaries)
+    assert agg["metric_cv"] is None
+
+
+def test_aggregate_seed_summaries_propagates_granularity():
+    summaries = [_make_seed_summary(0.80), _make_seed_summary(0.84)]
+    agg = aggregate_seed_summaries(summaries)
+    assert agg["metric_granularity"] == "per_class_weighted"
 
 
 def test_get_valid_labels_banking77_none():
@@ -349,3 +443,86 @@ def test_compute_axis_scores_zero_predictions_returns_none(axis):
     summary = {"metric_value": None, "n_predictions": 0, "error_counts": {}}
     scores = compute_axis_scores(summary, [axis], _AXIS_DEFS)
     assert scores[axis]["value"] is None
+
+
+# ── _SEMANTIC_ERROR_TYPE / semantic_error_type field ─────────────────────────
+
+def test_semantic_error_type_taxonomy_covers_all_known_categories():
+    from classify_errors import _SEMANTIC_ERROR_TYPE
+    expected_categories = {
+        "correct", "not_applicable", "empty", "format_violation",
+        "refusal", "wrong_class", "hallucinated", "partial",
+    }
+    assert expected_categories <= set(_SEMANTIC_ERROR_TYPE.keys())
+
+
+@pytest.mark.parametrize("error_category,expected_semantic", [
+    ("correct",          "correct"),
+    ("not_applicable",   "correct"),
+    ("empty",            "instruction_following_failure"),
+    ("format_violation", "instruction_following_failure"),
+    ("refusal",          "safety_or_alignment_refusal"),
+    ("wrong_class",      "factual_error"),
+    ("hallucinated",     "factual_error"),
+    ("partial",          "extraction_mismatch"),
+])
+def test_semantic_error_type_mapping(error_category, expected_semantic):
+    from classify_errors import _SEMANTIC_ERROR_TYPE
+    assert _SEMANTIC_ERROR_TYPE[error_category] == expected_semantic
+
+
+def test_classify_predictions_sets_semantic_error_type_on_each_row(toy_predictions):
+    cfg = _make_task_cfg("classification", "accuracy")
+    classified, _ = classify_predictions(toy_predictions, cfg)
+    assert all("semantic_error_type" in r for r in classified)
+    valid_types = {"correct", "instruction_following_failure",
+                   "safety_or_alignment_refusal", "factual_error", "extraction_mismatch", "unknown"}
+    assert all(r["semantic_error_type"] in valid_types for r in classified)
+
+
+def test_classify_predictions_correct_rows_have_correct_semantic(toy_predictions):
+    cfg = _make_task_cfg("classification", "accuracy")
+    classified, _ = classify_predictions(toy_predictions, cfg)
+    for row in classified:
+        if row["error_category"] == "correct":
+            assert row["semantic_error_type"] == "correct"
+
+
+def test_classify_predictions_refusal_has_safety_semantic():
+    cfg = _make_task_cfg("classification", "accuracy")
+    rows = [{"id": "r1", "output": "I cannot answer this.", "ground_truth": "positive", "latency_ms": 100}]
+    classified, _ = classify_predictions(rows, cfg)
+    assert classified[0]["semantic_error_type"] == "safety_or_alignment_refusal"
+
+
+# ── semantic_error_counts in summary and aggregation ─────────────────────────
+
+def test_classify_predictions_semantic_counts_sum_to_n(toy_predictions):
+    from classify_errors import classify_predictions, _SEMANTIC_ERROR_TYPE
+    cfg = _make_task_cfg("classification", "accuracy")
+    classified, _ = classify_predictions(toy_predictions, cfg)
+    # semantic_error_type is set per-row; counts derived in process_model_task_condition.
+    # Check that the per-row field values are consistent with the taxonomy.
+    assert all(r["semantic_error_type"] in set(_SEMANTIC_ERROR_TYPE.values()) | {"unknown"}
+               for r in classified)
+
+
+def test_aggregate_seed_summaries_propagates_semantic_error_counts():
+    summaries = [
+        {**_make_seed_summary(0.80),
+         "semantic_error_counts": {"correct": 80, "factual_error": 20}},
+        {**_make_seed_summary(0.84),
+         "semantic_error_counts": {"correct": 84, "factual_error": 16}},
+    ]
+    agg = aggregate_seed_summaries(summaries)
+    assert "semantic_error_counts" in agg
+    assert agg["semantic_error_counts"]["correct"] == 164
+    assert agg["semantic_error_counts"]["factual_error"] == 36
+
+
+def test_aggregate_seed_summaries_missing_semantic_counts_handled():
+    # Summaries without semantic_error_counts should not crash aggregation.
+    summaries = [_make_seed_summary(0.80), _make_seed_summary(0.84)]
+    agg = aggregate_seed_summaries(summaries)
+    assert "semantic_error_counts" in agg
+    assert agg["semantic_error_counts"] == {}

@@ -5,6 +5,7 @@ import ctypes
 import faulthandler
 import gc
 import json
+import math
 import os
 import random
 import shutil
@@ -46,7 +47,7 @@ from pipeline.cache import inputs_changed, training_inputs_hash
 from pipeline.config import get_local_models, get_tasks
 from pipeline.log import configure, get_logger
 from pipeline.paths import adapter_path, training_meta_path
-from pipeline.validation import require_jsonl
+from pipeline.validation import reject_test_path, require_jsonl
 from pipeline.versioning import git_sha as _git_sha
 
 _log = get_logger("train-local")
@@ -104,6 +105,30 @@ def load_task_config(task_id: str) -> TaskConfig:
     with open(path) as f:
         data = yaml.safe_load(f)
     return TaskConfig(**{k: v for k, v in data.items() if k in TaskConfig.model_fields})
+
+
+def _dtype_str(dtype) -> str:
+    """Convert a torch dtype to a canonical string like 'bfloat16' or 'float32'."""
+    if dtype is None:
+        return "auto"
+    return str(dtype).split(".")[-1]  # "torch.bfloat16" → "bfloat16"
+
+
+def _compute_dtype_str(model) -> str:
+    """Infer the model's effective compute dtype.
+
+    For bitsandbytes QLoRA, the authoritative source is quantization_config —
+    parameter dtypes reflect storage format (4-bit/8-bit), not compute format.
+    Falls back to the first floating-point parameter's dtype for non-quantized models.
+    """
+    qcfg = getattr(getattr(model, "config", None), "quantization_config", None)
+    if qcfg is not None and hasattr(qcfg, "bnb_4bit_compute_dtype"):
+        return _dtype_str(qcfg.bnb_4bit_compute_dtype)
+    try:
+        param = next(p for p in model.parameters() if p.dtype not in (torch.int8,))
+        return _dtype_str(param.dtype)
+    except StopIteration:
+        return "unknown"
 
 
 def get_epochs(n_examples: int) -> int:
@@ -194,6 +219,78 @@ class ConfigFactory:
 
 
 # ---------------------------------------------------------------------------
+# Training quality analysis
+# ---------------------------------------------------------------------------
+
+def _analyze_training(
+    losses: list[float],
+    anomalies: list[dict],
+    echo,
+    val_losses: Optional[list[float]] = None,
+) -> dict:
+    """Post-training diagnostics: convergence, plateau, divergence, and overfitting.
+
+    val_losses: per-epoch validation losses from an in-training eval split, used to
+    detect overfitting (train loss ↓ while val loss ↑). When None, overfitting
+    cannot be assessed and overfitting_detected is set to None.
+    """
+    diag: dict = {
+        "anomalies": anomalies,
+        "converged": None,
+        "plateaued": False,
+        "diverged": False,
+        "loss_improvement_pct": None,
+        "overfitting_detected": None,
+    }
+    if not losses:
+        return diag
+
+    first, last = losses[0], losses[-1]
+    improvement = (first - last) / max(first, 1e-8)
+    diag["loss_improvement_pct"] = round(improvement * 100, 2)
+    diag["converged"] = improvement > 0.05
+
+    if not diag["converged"]:
+        echo(f"WARNING: loss improved only {improvement * 100:.1f}% — model may not have trained "
+             f"meaningfully (start={first:.4f}, end={last:.4f})")
+
+    # Divergence: end-third mean > start-third mean by >5%
+    if len(losses) >= 10:
+        third = len(losses) // 3
+        start_mean = sum(losses[:third]) / third
+        end_mean = sum(losses[-third:]) / third
+        if end_mean > start_mean * 1.05:
+            diag["diverged"] = True
+            echo(f"WARNING: loss diverging — early mean={start_mean:.4f}, late mean={end_mean:.4f}")
+
+    # Plateau: Q4 mean within 1% of Q3 mean (and not diverging)
+    if len(losses) >= 8 and not diag["diverged"]:
+        q3_start = len(losses) // 2
+        q4_start = 3 * len(losses) // 4
+        q3_mean = sum(losses[q3_start:q4_start]) / max(1, q4_start - q3_start)
+        q4_mean = sum(losses[q4_start:]) / max(1, len(losses) - q4_start)
+        rel_change = abs(q3_mean - q4_mean) / max(q3_mean, 1e-8)
+        if rel_change < 0.01:
+            diag["plateaued"] = True
+            echo(f"NOTE: loss plateaued — Q3={q3_mean:.4f}, Q4={q4_mean:.4f} ({rel_change * 100:.2f}% change)")
+
+    # Overfitting: validation loss rises >5% while training loss fell — only assessable
+    # when a validation split was reserved during training (val_losses provided).
+    if val_losses and len(val_losses) >= 2:
+        if val_losses[-1] > val_losses[0] * 1.05 and improvement > 0:
+            diag["overfitting_detected"] = True
+            echo(f"WARNING: overfitting — val_loss {val_losses[0]:.4f} → {val_losses[-1]:.4f} "
+                 f"while train_loss fell {improvement * 100:.1f}%")
+        else:
+            diag["overfitting_detected"] = False
+    elif val_losses is not None:
+        # val_losses provided but too few epochs to assess
+        diag["overfitting_detected"] = None
+
+    return diag
+
+
+# ---------------------------------------------------------------------------
 # Core training logic (isolated for GC scoping)
 # ---------------------------------------------------------------------------
 
@@ -267,32 +364,69 @@ def run_training_task(
         use_gradient_checkpointing=hw_cfg.use_grad_ckpt,
     )
 
+    load_dtype_str = _dtype_str(hw_cfg.load_dtype)
+    compute_dtype_str = _compute_dtype_str(model)
+    weight_dtype_str = "4bit" if hw_cfg.load_in_4bit else load_dtype_str
+    echo(f"Precision: load_dtype={load_dtype_str}, compute_dtype={compute_dtype_str}, weight_dtype={weight_dtype_str}")
+
     class _CheckpointCallback(TrainerCallback):
         def __init__(self):
             self.gpu_util_samples: list[float] = []
+            self.loss_steps: list[tuple[int, float]] = []
+            self.anomalies: list[dict] = []
 
         def on_train_begin(self, args, state, control, **kwargs):
             echo(f"Training started: {state.max_steps} steps")
 
         def on_step_end(self, args, state, control, **kwargs):
             if state.global_step == 1 and state.log_history:
-                echo(f"Step 1 complete — loss={state.log_history[-1].get('loss', '?'):.4f}")
+                loss = state.log_history[-1].get("loss")
+                if loss is not None:
+                    echo(f"Step 1 complete — loss={loss:.4f}")
 
         def on_log(self, args, state, control, logs=None, **kwargs):
             try:
                 self.gpu_util_samples.append(torch.cuda.utilization())
             except Exception:
                 pass
-            if logs:
-                step = state.global_step
-                loss = logs.get("loss", logs.get("train_loss"))
-                lr = logs.get("learning_rate")
-                parts = [f"step {step}"]
-                if loss is not None:
-                    parts.append(f"loss={loss:.4f}")
-                if lr is not None:
-                    parts.append(f"lr={lr:.2e}")
-                echo(" | ".join(parts))
+            if not logs:
+                return
+            step = state.global_step
+            loss = logs.get("loss", logs.get("train_loss"))
+            lr = logs.get("learning_rate")
+            grad_norm = logs.get("grad_norm")
+
+            # ── Gradient norm ─────────────────────────────────────────────
+            if grad_norm is not None and (math.isnan(grad_norm) or math.isinf(grad_norm)):
+                echo(f"FATAL: NaN/Inf grad_norm at step {step} — halting training")
+                self.anomalies.append({"step": step, "type": "nan_grad_norm"})
+                control.should_training_stop = True
+
+            # ── Loss anomalies ────────────────────────────────────────────
+            if loss is not None:
+                if math.isnan(loss) or math.isinf(loss):
+                    echo(f"FATAL: NaN/Inf loss at step {step} — halting training")
+                    self.anomalies.append({"step": step, "type": "nan_loss"})
+                    control.should_training_stop = True
+                else:
+                    recent = [v for _, v in self.loss_steps[-5:]]
+                    if len(recent) == 5:
+                        mean5 = sum(recent) / 5
+                        if mean5 > 0 and loss > 3.0 * mean5:
+                            echo(f"WARNING: loss spike at step {step}: {loss:.4f} (5-step mean={mean5:.4f})")
+                            self.anomalies.append({"step": step, "type": "spike",
+                                                   "value": round(loss, 4), "mean5": round(mean5, 4)})
+                    self.loss_steps.append((step, loss))
+
+            # ── Progress line ─────────────────────────────────────────────
+            parts = [f"step {step}"]
+            if loss is not None and not (math.isnan(loss) or math.isinf(loss)):
+                parts.append(f"loss={loss:.4f}")
+            if lr is not None:
+                parts.append(f"lr={lr:.2e}")
+            if grad_norm is not None and not (math.isnan(grad_norm) or math.isinf(grad_norm)):
+                parts.append(f"grad={grad_norm:.3f}")
+            echo(" | ".join(parts))
 
         def on_save(self, args, state, control, **kwargs):
             save_train_state(model_cfg.model_short, task_id, CONDITION, {
@@ -307,7 +441,17 @@ def run_training_task(
     with open(data_path) as f:
         rows = [json.loads(line) for line in f]
     echo(f"{len(rows)} examples loaded")
-    train_ds = hf_datasets.Dataset.from_list(rows)
+
+    # Reserve last 10% for per-epoch validation loss monitoring (overfitting detection).
+    # Smoke test skips this to keep iterations fast.
+    val_n = max(1, len(rows) // 10) if not smoke_test and len(rows) >= 10 else 0
+    train_rows = rows[:-val_n] if val_n else rows
+    val_rows = rows[-val_n:] if val_n else []
+    if val_n:
+        echo(f"Val split: {len(train_rows)} train + {val_n} val (for overfitting detection)")
+
+    train_ds = hf_datasets.Dataset.from_list(train_rows)
+    val_ds = hf_datasets.Dataset.from_list(val_rows) if val_rows else None
 
     # Pre-apply the chat template so trl tokenizes a plain "text" field.
     # When enable_thinking is explicitly False, suppress <think> tokens.
@@ -324,7 +468,9 @@ def run_training_task(
             **template_kwargs,
         )}
     train_ds = train_ds.map(apply_template)
-    echo(f"Dataset ready: {len(train_ds)} rows")
+    if val_ds is not None:
+        val_ds = val_ds.map(apply_template)
+    echo(f"Dataset ready: {len(train_ds)} train rows" + (f", {len(val_ds)} val rows" if val_ds else ""))
 
     training_cfg = model_cfg.training
     sft_kwargs = dict(
@@ -334,30 +480,40 @@ def run_training_task(
         gradient_accumulation_steps=training_cfg.get("gradient_accumulation_steps", 4),
         learning_rate=float(training_cfg.get("learning_rate", 2e-4)),
         lr_scheduler_type=training_cfg.get("lr_scheduler_type", "cosine"),
-        warmup_steps=training_cfg.get("warmup_steps", 50),
         weight_decay=training_cfg.get("weight_decay", 0.01),
         optim=training_cfg.get("optim", "adamw_8bit"),
         max_grad_norm=training_cfg.get("max_grad_norm", 1.0),
         bf16=training_cfg.get("bf16", True),
         seed=training_cfg.get("seed", 42),
         save_strategy=training_cfg.get("save_strategy", "epoch"),
-        eval_strategy=training_cfg.get("eval_strategy", "no"),
+        eval_strategy=training_cfg.get("eval_strategy", "epoch" if val_ds is not None else "no"),
         load_best_model_at_end=training_cfg.get("load_best_model_at_end", False),
         metric_for_best_model=training_cfg.get("metric_for_best_model", "eval_loss"),
         greater_is_better=training_cfg.get("greater_is_better", False),
         logging_steps=training_cfg.get("logging_steps", 10),
+        logging_nan_inf_filter=training_cfg.get("logging_nan_inf_filter", False),
         report_to=training_cfg.get("report_to", "none"),
         max_seq_length=hw_cfg.seq_len,
         dataset_text_field="text",
         packing=False,
     )
     sft_kwargs.update(hw_cfg.sft_extra)
+    # Pass warmup_ratio directly so Trainer computes steps from the real num_training_steps.
+    # Fall back to an explicit warmup_steps only when ratio is absent.
+    warmup_ratio = training_cfg.get("warmup_ratio")
+    if warmup_ratio is not None:
+        sft_kwargs["warmup_ratio"] = warmup_ratio
+    else:
+        sft_kwargs["warmup_steps"] = training_cfg.get("warmup_steps", 50)
+    warmup_disp = (f"warmup_ratio={sft_kwargs['warmup_ratio']}"
+                   if "warmup_ratio" in sft_kwargs
+                   else f"warmup_steps={sft_kwargs.get('warmup_steps', 0)}")
     echo(
         f"SFTConfig: epochs={sft_kwargs['num_train_epochs']}"
         f" batch={sft_kwargs['per_device_train_batch_size']}"
         f" accum={sft_kwargs['gradient_accumulation_steps']}"
         f" lr={sft_kwargs['learning_rate']:.2e}"
-        f" warmup_steps={sft_kwargs['warmup_steps']}"
+        f" {warmup_disp}"
     )
     sft_config = SFTConfig(**sft_kwargs)
 
@@ -366,7 +522,9 @@ def run_training_task(
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     trainer = SFTTrainer(
-        model=model, tokenizer=tokenizer, train_dataset=train_ds, args=sft_config,
+        model=model, tokenizer=tokenizer, train_dataset=train_ds,
+        eval_dataset=val_ds,
+        args=sft_config,
         callbacks=[callback],
     )
 
@@ -393,15 +551,26 @@ def run_training_task(
 
     loss_history = [
         {"step": e.get("step", 0), "loss": round(e["loss"], 6), "lr": e.get("learning_rate")}
-        for e in trainer.state.log_history if "loss" in e
+        for e in trainer.state.log_history if "loss" in e and "eval_loss" not in e
     ]
+    eval_loss_history = [
+        {"step": e.get("step", 0), "epoch": round(e.get("epoch", 0), 2),
+         "eval_loss": round(e["eval_loss"], 6)}
+        for e in trainer.state.log_history if "eval_loss" in e
+    ]
+    val_losses = [e["eval_loss"] for e in eval_loss_history]
+    training_diagnostics = _analyze_training(
+        [v for _, v in callback.loss_steps], callback.anomalies, echo, val_losses=val_losses or None
+    )
     hyperparams = {
         "lora_rank": hw_cfg.lora_rank,
         "lora_alpha": hw_cfg.lora_alpha,
         **{k: sft_kwargs[k] for k in (
             "learning_rate", "per_device_train_batch_size", "gradient_accumulation_steps",
-            "lr_scheduler_type", "warmup_steps", "weight_decay", "optim",
+            "lr_scheduler_type", "weight_decay", "optim",
         )},
+        **({"warmup_ratio": sft_kwargs["warmup_ratio"]} if "warmup_ratio" in sft_kwargs
+           else {"warmup_steps": sft_kwargs.get("warmup_steps", 0)}),
     }
 
     meta = {
@@ -410,8 +579,12 @@ def run_training_task(
         "condition": CONDITION,
         "train_data_path": str(data_path),
         "n_train": n_train,
+        "n_val": val_n,
         "epochs": epochs,
         "seq_len": hw_cfg.seq_len,
+        "load_dtype": load_dtype_str,
+        "compute_dtype": compute_dtype_str,
+        "weight_dtype": weight_dtype_str,
         "training_cost": round(training_cost, 4),
         "training_time_min": round(elapsed_min, 1),
         "gpu_hours": gpu_hours,
@@ -424,7 +597,9 @@ def run_training_task(
         "git_sha": _git_sha(),
         "input_hash": input_hash,
         "loss_history": loss_history,
+        "eval_loss_history": eval_loss_history,
         "hyperparams": hyperparams,
+        "training_diagnostics": training_diagnostics,
     }
     atomic_write_json(meta, log_dir / "metadata.json")
     atomic_write_json(meta, ckpt_dir / "metadata.json")
@@ -607,6 +782,7 @@ def main(model: Optional[str], task: str, cap: Optional[int], auto_upload: bool,
             data_file = get_or_create_cap(src.parent, cap, ctx=ctx) if cap is not None and not smoke_test else src
             if not dry_run:
                 try:
+                    reject_test_path(data_file)
                     require_jsonl(data_file, min_rows=1, check_chat_format=True)
                 except Exception as exc:
                     click.echo(f"  [{ctx}] ERROR: input validation failed: {exc}", err=True)

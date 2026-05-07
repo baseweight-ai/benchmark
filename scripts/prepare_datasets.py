@@ -22,7 +22,7 @@ from checkpoint_utils import atomic_write_json, nv_prepared_dir
 from pipeline.cache import rows_sha
 from pipeline.config import get_tasks
 from pipeline.paths import prompt_path
-from pipeline.validation import check_contamination, require_dir, validate_dataset
+from pipeline.validation import check_contamination, reject_test_path, require_dir, validate_dataset
 
 REPO_ROOT = Path(__file__).parent.parent
 ALL_TASKS: list[str] = get_tasks()
@@ -208,6 +208,20 @@ def write_jsonl(rows: list[dict], path: Path) -> None:
     click.echo(f"  Written {len(rows)} rows to {path.relative_to(REPO_ROOT)}")
 
 
+def _log_distribution(rows: list[dict], key: str, label: str) -> None:
+    counts: dict[str, int] = {}
+    for r in rows:
+        k = str(r.get(key, "?"))
+        counts[k] = counts.get(k, 0) + 1
+    n = len(rows)
+    if len(counts) <= 10:
+        parts = " | ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+        click.echo(f"    {label}: {parts}  (n={n})")
+    else:
+        mn, mx = min(counts.values()), max(counts.values())
+        click.echo(f"    {label}: {len(counts)} groups, n={n}, min={mn}, max={mx}")
+
+
 # ── Per-task preprocessing ─────────────────────────────────────────────────
 
 def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> None:
@@ -242,10 +256,9 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
             click.echo(f"  FPB smoke split: train={len(train_rows)}, test={len(test_rows)}")
         else:
             n = len(all_rows)
-            n_train = int(n * 0.70)
-            n_val = int(n * 0.15)
-            train_rows = all_rows[:n_train]
-            test_rows = all_rows[n_train + n_val:]  # skip the val slice (n_train:n_train+n_val)
+            n_test = int(n * 0.15)
+            train_rows = all_rows[:-n_test]  # 85% train
+            test_rows = all_rows[-n_test:]
             click.echo(f"  FPB split: train={len(train_rows)}, test={len(test_rows)}")
     else:
         label_names = None
@@ -290,17 +303,64 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
             return out
         train_rows = flatten_squad(train_rows)
         test_rows = flatten_squad(test_rows)
+        all_cuad = train_rows + test_rows
+        unknown_count = sum(1 for r in all_cuad if r.get("clause_type") == "unknown")
+        if all_cuad and unknown_count / len(all_cuad) > 0.05:
+            click.echo(
+                f"  WARNING [cuad]: {unknown_count}/{len(all_cuad)} rows "
+                f"({unknown_count / len(all_cuad):.1%}) have unknown clause_type — check _CUAD_CLAUSE_RE",
+                err=True,
+            )
+
+    # ── Data quality: raw counts + filtering ──────────────────────────────
+    from pipeline.data_quality import (  # lazy — only needed at prepare time
+        find_exact_dupes, flag_extreme_length, cross_split_near_dupes,
+        analyze_split, cross_split_stats, print_quality_summary,
+    )
+    quality_report: dict[str, Any] = {"task_id": cfg.task_id}
+    raw_train_texts = [format_user(prompt, r) for r in train_rows]
+    raw_test_texts  = [format_user(prompt, r) for r in test_rows]
+    quality_report["raw"] = {"train_n": len(train_rows), "test_n": len(test_rows)}
+
+    extreme = flag_extreme_length(raw_train_texts)
+    drop    = set(extreme["too_short"] + extreme["too_long"])
+    if drop:
+        train_rows      = [r for i, r in enumerate(train_rows)      if i not in drop]
+        raw_train_texts = [t for i, t in enumerate(raw_train_texts) if i not in drop]
+
+    train_exact = set(find_exact_dupes(raw_train_texts))
+    if train_exact:
+        train_rows      = [r for i, r in enumerate(train_rows)      if i not in train_exact]
+        raw_train_texts = [t for i, t in enumerate(raw_train_texts) if i not in train_exact]
+
+    test_exact = set(find_exact_dupes(raw_test_texts))
+    if test_exact:
+        test_rows      = [r for i, r in enumerate(test_rows)      if i not in test_exact]
+        raw_test_texts = [t for i, t in enumerate(raw_test_texts) if i not in test_exact]
+
+    cross_res  = cross_split_near_dupes(raw_train_texts, raw_test_texts, threshold=0.9)
+    cross_drop = set(cross_res["train_indices_to_filter"])
+    if cross_drop:
+        train_rows = [r for i, r in enumerate(train_rows) if i not in cross_drop]
+
+    quality_report["filtering"] = {
+        "extreme_too_short":         len(extreme["too_short"]),
+        "extreme_too_long":          len(extreme["too_long"]),
+        "train_exact_dupes_removed": len(train_exact),
+        "test_exact_dupes_removed":  len(test_exact),
+        "cross_split_removed":       len(cross_drop),
+    }
 
     # ── Sampling (non-smoke only) ──────────────────────────────────────────
     test_rows_full: Optional[list[dict]] = None
     if not smoke_test:
         if cfg.train_sampling:
             train_rows = sample(train_rows, **cfg.train_sampling.model_dump())
-            click.echo(f"  Train: {len(train_rows)} rows ({cfg.train_sampling.strategy}, {cfg.train_sampling.stratify_by})")
+            _log_distribution(train_rows, cfg.train_sampling.stratify_by, f"Train ({cfg.train_sampling.strategy})")
         if cfg.test_sampling:
             test_rows_full = test_rows
             test_rows = sample(test_rows, **cfg.test_sampling.model_dump())
-            click.echo(f"  Test:  {len(test_rows)} rows ({cfg.test_sampling.strategy}, {cfg.test_sampling.stratify_by})")
+            _log_distribution(test_rows, cfg.test_sampling.stratify_by, f"Test ({cfg.test_sampling.strategy})")
 
     # ── FPB: assert no overlap between train and test ─────────────────────
     if cfg.task_id == "fpb" and not smoke_test:
@@ -353,9 +413,17 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
 
     contam_hits = check_contamination(fmt_train, fmt_test)
     if contam_hits:
-        click.echo(f"  WARNING [{cfg.task_id}]: {len(contam_hits)} training examples overlap test set", err=True)
+        click.echo(f"  WARNING [{cfg.task_id}]: {len(contam_hits)} training example(s) overlap test set", err=True)
         for hit in contam_hits[:3]:
             click.echo(f"    {hit}", err=True)
+        if not smoke_test:
+            # The quality pipeline should have eliminated all exact overlap before this point.
+            # A hit here means the pipeline has a bug — abort rather than silently produce
+            # a contaminated dataset that invalidates all downstream eval metrics.
+            raise RuntimeError(
+                f"[{cfg.task_id}] Train/test contamination detected after quality filtering "
+                f"({len(contam_hits)} example(s)). Re-check data_quality.py integration."
+            )
 
     write_jsonl(fmt_train, out_dir / f"{prefix}train.jsonl")
     write_jsonl(fmt_test,  out_dir / f"{prefix}test.jsonl")
@@ -365,6 +433,30 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
     if test_rows_full is not None and len(test_rows_full) > len(src_test):
         write_jsonl(fmt_test_prompts(test_rows_full), out_dir / "test_full.jsonl")
         write_jsonl(fmt_labels(test_rows_full),       out_dir / "test_full_labels.jsonl")
+
+    # ── Quality report: prepared-data stats ───────────────────────────────
+    prep_train_texts = [
+        m["content"] for r in fmt_train for m in r["messages"] if m["role"] == "user"
+    ]
+    prep_test_texts = [
+        m["content"] for r in fmt_test for m in r["messages"] if m["role"] == "user"
+    ]
+    train_labels_prep = [
+        m["content"] for r in fmt_train for m in r["messages"] if m["role"] == "assistant"
+    ]
+    test_labels_prep = [r["label"] for r in fmt_labs]
+
+    quality_report["prepared"] = {
+        "train": analyze_split(prep_train_texts, train_labels_prep or None),
+        "test":  analyze_split(prep_test_texts,  test_labels_prep or None),
+        "cross_split": cross_split_stats(
+            prep_train_texts, prep_test_texts,
+            train_labels_prep or None, test_labels_prep or None,
+        ),
+    }
+    if not smoke_test:
+        atomic_write_json(quality_report, out_dir / "quality_report.json")
+    print_quality_summary(quality_report)
 
     if smoke_test:
         click.echo(f"  [{cfg.task_id}] Done — {len(src_test)} smoke_test, {len(src_train)} smoke_train")

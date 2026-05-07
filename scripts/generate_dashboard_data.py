@@ -17,6 +17,8 @@ import litellm
 import yaml
 from pydantic import BaseModel
 
+from checkpoint_utils import atomic_write_json
+
 litellm.suppress_debug_info = True
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -254,6 +256,11 @@ def build_result(
     ttft_p50 = summary.get("ttft_p50_ms") if summary else None
     ttft_p95 = summary.get("ttft_p95_ms") if summary else None
     error_counts = summary.get("error_counts", {}) if summary else {}
+    semantic_error_counts = summary.get("semantic_error_counts", {}) if summary else {}
+    format_compliance_rate = summary.get("format_compliance_rate") if summary else None
+    refusal_rate = summary.get("refusal_rate") if summary else None
+    empty_rate = summary.get("empty_rate") if summary else None
+    partial_rate = summary.get("partial_rate") if summary else None
 
     training_cost = training_meta.get("training_cost") if training_meta else None
     training_time_min = training_meta.get("training_time_min") if training_meta else None
@@ -263,6 +270,8 @@ def build_result(
     avg_gpu_util_pct = training_meta.get("avg_gpu_util_pct") if training_meta else None
     loss_history = training_meta.get("loss_history") if training_meta else None
     hyperparams = training_meta.get("hyperparams") if training_meta else None
+    training_diagnostics = training_meta.get("training_diagnostics") if training_meta else None
+    compute_dtype = training_meta.get("compute_dtype") if training_meta else None
     per_class_metrics = summary.get("per_class_metrics") if summary else None
 
     # Decomposed cost inputs — stored so the site can recalculate or display assumptions.
@@ -283,9 +292,11 @@ def build_result(
     tco_12mo = compute_tco_12mo(model_id, training_cost, cost_per_query or 0, daily_volume, pricing, eval_wall_time_s, n_predictions) if cost_per_query is not None else None
 
     metric_std = summary.get("metric_std") if summary else None
+    metric_cv = summary.get("metric_cv") if summary else None
     metric_ci_lo = summary.get("metric_ci_lo") if summary else None
     metric_ci_hi = summary.get("metric_ci_hi") if summary else None
     n_seeds = summary.get("n_seeds") if summary else None
+    metric_granularity = summary.get("metric_granularity") if summary else None
 
     # Per-axis scores: start from what classify_errors.py computed, then add cost.
     eval_axes: list[str] = summary.get("eval_axes", []) if summary else []
@@ -302,8 +313,10 @@ def build_result(
         "condition": _condition_label(condition),
         # Accuracy (mean when multi-seed, single value otherwise)
         "metric_id": summary["metric_id"] if summary else None,
+        "metric_granularity": metric_granularity,
         "metric_value": metric_value,
         "metric_std": round(metric_std, 4) if metric_std is not None else None,
+        "metric_cv": round(metric_cv, 4) if metric_cv is not None else None,
         "metric_ci_lo": round(metric_ci_lo, 4) if metric_ci_lo is not None else None,
         "metric_ci_hi": round(metric_ci_hi, 4) if metric_ci_hi is not None else None,
         "n_seeds": n_seeds,
@@ -327,10 +340,19 @@ def build_result(
         "axis_scores": axis_scores or None,
         # Error breakdown
         "error_counts": error_counts,
+        "semantic_error_counts": semantic_error_counts or None,
         "per_class_metrics": per_class_metrics,
+        # Pre-computed compliance rates (derivable from error_counts / n_predictions,
+        # included here so dashboard consumers don't need to recompute)
+        "format_compliance_rate": format_compliance_rate,
+        "refusal_rate": refusal_rate,
+        "empty_rate": empty_rate,
+        "partial_rate": partial_rate,
         # Training details
         "loss_history": loss_history,
         "hyperparams": hyperparams,
+        "training_diagnostics": training_diagnostics,
+        "compute_dtype": compute_dtype,
         # Cost inputs (decomposed for transparency / recalculation)
         "total_input_tokens": total_input if summary else None,
         "total_output_tokens": total_output if summary else None,
@@ -342,6 +364,48 @@ def build_result(
         "eval_wall_time_s": eval_wall_time_s,
     }
 
+
+
+def _cohens_dz(deltas: list[float]) -> Optional[float]:
+    """Cohen's d_z (paired effect size) with Hedge's small-sample correction.
+
+    Measures how large the mean gain is relative to the cross-task spread, in
+    units of the sample standard deviation. The Hedge's correction factor
+    J = 1 - 3/(4*(n-1)-1) de-biases Cohen's d for small n; at n=5 it is ~0.80,
+    so the correction is substantial. Returns None for n < 2 or zero variance.
+
+    Interpretation (Cohen 1988): |d_z| < 0.2 negligible, 0.2–0.5 small,
+    0.5–0.8 medium, > 0.8 large.
+    """
+    n = len(deltas)
+    if n < 3:
+        # For n=2, Hedge's J = 1 - 3/(4×1-1) = 0, which collapses d to 0.
+        # With fewer than 3 tasks the estimate is not interpretable.
+        return None
+    mean = sum(deltas) / n
+    variance = sum((x - mean) ** 2 for x in deltas) / (n - 1)
+    if variance == 0:
+        return None
+    std = math.sqrt(variance)
+    if std < 1e-10:  # near-zero std: all deltas identical, effect size undefined
+        return None
+    d = mean / std
+    j = 1.0 - 3.0 / (4.0 * (n - 1) - 1.0)
+    return round(d * j, 4)
+
+
+def _effect_label(g: Optional[float]) -> Optional[str]:
+    """Map |Cohen's d_z| to a Cohen-convention interpretation label."""
+    if g is None:
+        return None
+    abs_g = abs(g)
+    if abs_g < 0.2:
+        return "negligible"
+    if abs_g < 0.5:
+        return "small"
+    if abs_g < 0.8:
+        return "medium"
+    return "large"
 
 
 def _sign_flip_p_value(gains: list[float], n_perm: int = 5000) -> Optional[float]:
@@ -405,6 +469,11 @@ def _comparison(results: list[dict], fine_family: str, fine_cond: str, base_fami
         return s[m] if len(s) % 2 else (s[m - 1] + s[m]) / 2
 
     p_value = _sign_flip_p_value(acc_deltas) if acc_deltas else None
+    # Cohen's d_z: standardised effect size on per-task accuracy gains.
+    # Complements the sign-flip p-value — p-value answers "is the gain real?",
+    # d_z answers "how large is it relative to cross-task variability?"
+    # Note: with n≤5 tasks, both statistics have wide CIs; interpret directionally.
+    dz = _cohens_dz(acc_deltas) if acc_deltas else None
     return {
         "tasks_won": tasks_won,
         "tasks_total": len(shared_tasks),
@@ -412,6 +481,8 @@ def _comparison(results: list[dict], fine_family: str, fine_cond: str, base_fami
         "avg_accuracy_gain_pp": round(_mean(acc_deltas) * 100, 1) if acc_deltas else None,
         "median_accuracy_gain_pp": round(_median(acc_deltas) * 100, 1) if acc_deltas else None,
         "p_value_gain": p_value,
+        "effect_size_dz": dz,
+        "effect_size_label": _effect_label(dz),
         "per_task": {
             t: {
                 "fine_metric": round(best_fine[t], 4),
@@ -450,6 +521,20 @@ def compute_stats(results: list[dict]) -> dict:
         cond: round(sum(v) / len(v), 8) for cond, v in cpq_by_cond.items()
     }
 
+    # Precision mismatch warnings: comparing LoRA runs trained at different compute_dtype
+    # can introduce systematic differences unrelated to the task (e.g. bfloat16 vs float32
+    # produce slightly different weight updates, affecting convergence and final accuracy).
+    dtype_warnings: list[str] = []
+    lora_dtypes: dict[str, str] = {}
+    for r in results:
+        if r.get("condition") == "LoRA" and r.get("compute_dtype"):
+            lora_dtypes[r["model_id"]] = r["compute_dtype"]
+    if len(set(lora_dtypes.values())) > 1:
+        dtype_warnings.append(
+            "Comparing LoRA runs with mixed compute_dtype: "
+            + ", ".join(f"{m}={d}" for m, d in sorted(lora_dtypes.items()))
+        )
+
     headline = lora_vs_5shot  # the primary comparison
 
     return {
@@ -481,13 +566,122 @@ def compute_stats(results: list[dict]) -> dict:
             "avg_n_train": round(sum(n_trains) / len(n_trains)) if n_trains else None,
             "avg_cost_per_query_by_condition": avg_cost_per_query_by_condition,
         },
+        # Non-empty when runs being compared used different precisions — a confound
+        # that can produce systematic accuracy differences unrelated to the task.
+        "dtype_warnings": dtype_warnings,
     }
+
+
+def _print_run_report(data: dict) -> None:
+    """Print a human-readable benchmark summary after dashboard generation."""
+    sep = "  " + "─" * 64
+    scope = data.get("scope", {})
+    comps = data.get("comparisons", {})
+    cost_sum = data.get("cost_summary", {})
+
+    click.echo(
+        f"\n  Benchmark Report  "
+        f"({scope.get('n_tasks', '?')} tasks | "
+        f"{scope.get('n_models', '?')} models | "
+        f"{scope.get('n_conditions', '?')} conditions)"
+    )
+    click.echo(sep)
+
+    comp_labels = [
+        ("lora_vs_5shot",       "LoRA vs 5-shot"),
+        ("lora_vs_zero_shot",   "LoRA vs zero-shot"),
+        ("api_sft_vs_5shot",    "API SFT vs 5-shot"),
+        ("api_sft_vs_zero_shot","API SFT vs zero-shot"),
+    ]
+    for key, label in comp_labels:
+        c = comps.get(key, {})
+        if not c or not c.get("tasks_total"):
+            continue
+        won, total = c["tasks_won"], c["tasks_total"]
+        gain    = c.get("avg_accuracy_gain_pp")
+        dz      = c.get("effect_size_dz")
+        dz_lbl  = c.get("effect_size_label", "")
+        p       = c.get("p_value_gain")
+        ratio   = c.get("cost_per_correct_ratio")
+
+        gain_str  = f"{gain:+.1f}pp" if gain is not None else "n/a"
+        dz_str    = f"d_z={dz:.2f} ({dz_lbl})" if dz is not None else ""
+        p_str     = f"p={p:.3f}" if p is not None else ""
+        ratio_str = f"  cost_ratio={ratio:.1f}x" if ratio is not None else ""
+        stats     = "  ".join(s for s in [dz_str, p_str] if s)
+
+        click.echo(f"  {label:<26} {won}/{total} tasks  {gain_str:<10}  {stats}{ratio_str}")
+        for tid, t in sorted(c.get("per_task", {}).items()):
+            sign = "+" if t["accuracy_gain_pp"] >= 0 else ""
+            click.echo(
+                f"    {tid:<22}  {t['fine_metric']:.3f} vs {t['base_metric']:.3f}"
+                f"  {sign}{t['accuracy_gain_pp']:.1f}pp"
+            )
+
+    # ── Baseline reference ─────────────────────────────────────────────────
+    task_baselines = data.get("task_baselines", {})
+    if task_baselines:
+        click.echo(sep)
+        click.echo("  Reference baselines (for contextualising absolute scores):")
+        for tid in sorted(task_baselines):
+            b = task_baselines[tid]
+            rc  = b.get("random_chance")
+            mjr = b.get("majority_class_accuracy")
+            mde = b.get("min_detectable_effect_pp")
+            parts = []
+            if rc is not None:
+                parts.append(f"random={rc:.3f}")
+            if mjr is not None:
+                parts.append(f"majority={mjr:.3f}")
+            if mde is not None:
+                parts.append(f"MDE≈±{mde:.1f}pp")
+            if parts:
+                click.echo(f"    {tid:<20}  {' '.join(parts)}")
+
+    # ── Non-converged training warnings ───────────────────────────────────
+    non_converged = [
+        r for r in data.get("results", [])
+        if (r.get("training_diagnostics") or {}).get("converged") is False
+    ]
+    if non_converged:
+        click.echo(sep)
+        click.echo(f"  WARNING: {len(non_converged)} run(s) did not converge during training "
+                   f"(loss improved <5%) — eval metrics may reflect an undertrained model:")
+        for r in non_converged:
+            diag = r.get("training_diagnostics", {})
+            imp = diag.get("loss_improvement_pct")
+            imp_str = f"{imp:.1f}%" if imp is not None else "?"
+            click.echo(f"    {r['model_id']}/{r['task_id']}/{r['condition']}  "
+                       f"loss_improvement={imp_str}")
+
+    # ── Overfitting warnings ───────────────────────────────────────────────
+    overfitting = [
+        r for r in data.get("results", [])
+        if (r.get("training_diagnostics") or {}).get("overfitting_detected") is True
+    ]
+    if overfitting:
+        click.echo(sep)
+        click.echo(f"  WARNING: {len(overfitting)} run(s) showed overfitting "
+                   f"(val_loss rose while train_loss fell):")
+        for r in overfitting:
+            click.echo(f"    {r['model_id']}/{r['task_id']}/{r['condition']}")
+
+    click.echo(sep)
+
+    cpq = cost_sum.get("avg_cost_per_query_by_condition", {})
+    if cpq:
+        cost_parts = "  ".join(f"{cond}=${v:.6f}" for cond, v in sorted(cpq.items()))
+        click.echo(f"  Avg cost/query:     {cost_parts}")
+    total_tc = cost_sum.get("total_training_cost")
+    if total_tc is not None:
+        click.echo(f"  Total training cost:  ${total_tc:.4f}")
+
+    click.echo(sep)
 
 
 def _write_snapshot(data: dict, repo_root: Path, run_id: str) -> Path:
     """Write an immutable snapshot of results.json for this run."""
     from pipeline.paths import snapshot_path
-    from checkpoint_utils import atomic_write_json
     snap = snapshot_path(repo_root, run_id)
     snap.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(data, snap)
@@ -535,6 +729,51 @@ def _export_tables(results: list[dict], out_dir: Path) -> None:
     click.echo(f"  Tables written to {out_dir}")
 
 
+def _load_task_baselines() -> dict[str, dict]:
+    """Compute per-task reference baselines from quality reports.
+
+    Returns a dict keyed by task_id with:
+      random_chance: 1/n_classes (accuracy of uniform random predictor)
+      majority_class_accuracy: accuracy of always-predicting-the-most-common-class
+      min_detectable_effect_pp: approximate MDE (pp) at α=0.05, 80% power for two-proportion z-test
+      n_test: number of test examples used for evaluation
+      n_classes: number of distinct classes
+    """
+    baselines: dict[str, dict] = {}
+    for task_id in ALL_TASKS:
+        qr_path = REPO_ROOT / "data" / "prepared" / task_id / "quality_report.json"
+        try:
+            with open(qr_path) as f:
+                qr = json.load(f)
+        except FileNotFoundError:
+            continue
+
+        test_dist = (qr.get("prepared", {}).get("test", {}) or {}).get("label_distribution", {})
+        if not test_dist:
+            continue
+
+        total = sum(v["count"] for v in test_dist.values())
+        if total == 0:
+            continue
+
+        n_classes = len(test_dist)
+        majority_count = max(v["count"] for v in test_dist.values())
+
+        # Minimum detectable effect (pp) for a two-proportion z-test:
+        # MDE ≈ 2.8 × sqrt(p(1-p)/n) where p ≈ 0.5 (most sensitive near 50%)
+        # This is an approximation; the true MDE depends on baseline rate.
+        mde_pp = round(2.8 * math.sqrt(0.25 / total) * 100, 1) if total > 0 else None
+
+        baselines[task_id] = {
+            "random_chance": round(1.0 / n_classes, 4),
+            "majority_class_accuracy": round(majority_count / total, 4),
+            "min_detectable_effect_pp": mde_pp,
+            "n_test": total,
+            "n_classes": n_classes,
+        }
+    return baselines
+
+
 def merge_results(fresh: list[dict], existing_path: Path) -> list[dict]:
     """Merge fresh results with existing ones.
 
@@ -576,10 +815,12 @@ def build_dashboard_data(daily_volume: int = 10000) -> dict:
         results.append(result)
 
     stats = compute_stats(results)
+    task_baselines = _load_task_baselines()
 
     return {
         "generated_at": None,  # filled at write time
         **stats,
+        "task_baselines": task_baselines,
         "results": results,
     }
 
@@ -605,6 +846,9 @@ def main(
     from datetime import datetime, timezone
     data = build_dashboard_data(daily_volume)
 
+    for w in data.get("dtype_warnings", []):
+        click.echo(f"  WARNING: {w}", err=True)
+
     # Default output: the site's data/benchmark/results.json
     site_root = REPO_ROOT.parent / "baseweight-site"
     default_out = site_root / "data" / "benchmark" / "results.json"
@@ -618,11 +862,16 @@ def main(
         if n_preserved:
             click.echo(f"  Merge: preserved {n_preserved} existing result(s) with no new data")
         data["results"] = merged
-        data.update(compute_stats(merged))
+        merged_stats = compute_stats(merged)
+        data.update(merged_stats)
+        for w in merged_stats.get("dtype_warnings", []):
+            click.echo(f"  WARNING: {w}", err=True)
 
     data["generated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     if run_id:
         data["run_id"] = run_id
+
+    _print_run_report(data)
 
     if dry_run:
         n_results = len(data["results"])
@@ -632,22 +881,17 @@ def main(
             click.echo(f"  [dry-run] Would write snapshot for run {run_id}")
         return
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w") as f:
-        json.dump(data, f, indent=2)
+    atomic_write_json(data, out_path)
     click.echo(f"  Written to {out_path}")
 
     # Always attempt to write to the site repo; skip silently if it doesn't exist.
     if out_path != default_out and default_out.parent.exists():
-        with open(default_out, "w") as f:
-            json.dump(data, f, indent=2)
+        atomic_write_json(data, default_out)
         click.echo(f"  Also written to {default_out}")
 
     if also_benchmark_repo:
         repo_out = REPO_ROOT / "dashboard-data" / "results.json"
-        repo_out.parent.mkdir(parents=True, exist_ok=True)
-        with open(repo_out, "w") as f:
-            json.dump(data, f, indent=2)
+        atomic_write_json(data, repo_out)
         click.echo(f"  Also written to {repo_out}")
 
     if run_id:

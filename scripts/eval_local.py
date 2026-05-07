@@ -27,7 +27,7 @@ from pipeline.config import get_local_models, get_tasks
 from pipeline.log import configure, get_logger
 from pipeline.paths import adapter_path, pred_path
 from pipeline.providers import call_vllm  # noqa: F401  # re-exported for test patching
-from pipeline.validation import require_jsonl
+from pipeline.validation import reject_test_path, require_jsonl
 
 _log = get_logger("eval-local")
 
@@ -130,6 +130,7 @@ def get_few_shot(task_id: str, model_short: str, smoke_test: bool) -> list[dict]
                 train_path = Path(override)
     if not train_path.exists():
         return []
+    reject_test_path(train_path)
     rows = []
     with open(train_path) as f:
         for line in f:
@@ -378,7 +379,15 @@ async def run_eval(
     wall_path = out_path.with_suffix(".wall.json")
     atomic_write_json({"eval_wall_time_s": eval_wall_time_s}, wall_path)
 
-    click.echo(f"  Saved {len(test_rows)} predictions to {out_path.relative_to(REPO_ROOT)}")
+    total_toks = totals[0] + totals[1]
+    tok_per_s = round(total_toks / eval_wall_time_s) if eval_wall_time_s and total_toks else None
+    ms_per_row = round(eval_wall_time_s * 1000 / len(test_rows), 1) if eval_wall_time_s and test_rows else None
+    stats_str = ""
+    if ms_per_row is not None:
+        stats_str += f"  ~{ms_per_row}ms/row"
+    if tok_per_s is not None:
+        stats_str += f"  {tok_per_s} tok/s"
+    click.echo(f"  Saved {len(test_rows)} predictions to {out_path.relative_to(REPO_ROOT)}{stats_str}")
     _log.info("eval complete", model=model_cfg.model_short, task=task_id, condition=condition,
               event="stage_complete", n_rows=len(test_rows),
               total_input_tokens=totals[0], total_output_tokens=totals[1])
