@@ -1,24 +1,37 @@
+# Secrets
 .env
-data/raw/
-data/prepared/
-results/
-dashboard-data/results.json
+
+# OS
+.DS_Store
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
-.DS_Store
 *.egg-info/
-dist/
 build/
+dist/
 .venv/
 venv/
+
+# Conda / env setup
+.setup_stamp
+environment.lock.yml
+condaenv.*.requirements.txt
+unsloth_compiled_cache/
+
+# Data & artifacts
+data/
+results/
+dashboard-data/results.json
+workspace/
+runs/
+!runs/.gitkeep
+
+# Local-only docs
 docs/
 PLAYBOOK.md
 TESTING.md
-workspace/
-unsloth_compiled_cache/
-.setup_stamp
-environment.lock.yml
-runs/*
-!runs/.gitkeep
-condaenv.*.requirements.txt
+
+# Agent files (per-dev symlink)
+CLAUDE.md
