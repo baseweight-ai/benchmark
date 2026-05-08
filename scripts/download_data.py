@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import sys
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -171,16 +173,25 @@ def main(task: str, dry_run: bool, smoke_test: bool) -> None:
     """
     if task is None:
         raise click.UsageError("--task is required. Pass a task ID or 'all' to download every task.")
-    task_ids = ALL_TASKS if task == "all" else [task]
+    task_ids = ALL_TASKS if task == "all" else [t.strip() for t in task.split(",")]
     configs = load_task_configs(task_ids)
+    failures: list[tuple[str, str]] = []
 
-    failures = []
-    for cfg in configs:
-        try:
-            download_task(cfg, dry_run, smoke_test=smoke_test)
-        except Exception as exc:
-            click.echo(f"  ERROR: {exc}", err=True)
-            failures.append((cfg.task_id, str(exc)))
+    max_workers = min(len(configs), os.cpu_count() or 4, 4)
+    if len(configs) > 1:
+        click.echo(f"  Downloading {len(configs)} tasks with {max_workers} workers (output may interleave)")
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        fut_to_cfg = {
+            pool.submit(download_task, cfg, dry_run, smoke_test=smoke_test): cfg
+            for cfg in configs
+        }
+        for fut in as_completed(fut_to_cfg):
+            cfg = fut_to_cfg[fut]
+            try:
+                fut.result()
+            except Exception as exc:
+                click.echo(f"  ERROR [{cfg.task_id}]: {exc}", err=True)
+                failures.append((cfg.task_id, str(exc)))
 
     if failures:
         click.echo(f"\n{'='*50}")

@@ -45,7 +45,12 @@ def _build_stages(cfg: RunConfig, selected_ids: list[str], run_id: str | None = 
     dry = ["--dry-run"] if cfg.dry_run else []
     force = ["--force"] if cfg.force else []
     resolved_tasks = cfg.resolved_tasks()
-    task_arg = resolved_tasks[0] if len(resolved_tasks) == 1 else "all"
+    if "all" in cfg.tasks:
+        task_arg = "all"
+    elif len(resolved_tasks) == 1:
+        task_arg = resolved_tasks[0]
+    else:
+        task_arg = ",".join(resolved_tasks)
     task = ["--task", task_arg]
 
     local_model = cfg.effective_local_model() or "all"
@@ -246,7 +251,7 @@ def main(
         if val:
             setattr(cfg, attr, True)
     if task and task != "all":
-        cfg.tasks = [task]
+        cfg.tasks = [t.strip() for t in task.split(",")]
     if local_model:
         cfg.local_models = [local_model]
     if api_model and api_model != "all":

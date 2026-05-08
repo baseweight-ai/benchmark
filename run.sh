@@ -382,9 +382,15 @@ _add_stage() { STAGES="${STAGES:+${STAGES},}${1}"; }
 [[ "$DO_CLASSIFY" == true ]]    && _add_stage "classify"
 [[ "$DO_DASHBOARD" == true ]]   && _add_stage "dashboard"
 
+mkdir -p "${REPO_ROOT}/runs"
+LOG_FILE="${REPO_ROOT}/runs/pipeline-$(date +%Y%m%d-%H%M%S).log"
+echo "  [pipeline] Logging output to: ${LOG_FILE}"
+echo "             Tail from another terminal: tail -f ${LOG_FILE}"
+echo "             Tip: run inside tmux/screen to survive disconnections"
+
 if [[ "$TEST_SAMPLING" == true ]]; then
     RUN_ARGS=("--test-sampling" "--task" "$TASK")
-    $PYTHON "${SCRIPTS}/run.py" "${RUN_ARGS[@]}"
+    $PYTHON "${SCRIPTS}/run.py" "${RUN_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"
 elif [[ -n "$STAGES" ]]; then
     RUN_ARGS=(
         "--stages" "$STAGES"
@@ -396,5 +402,5 @@ elif [[ -n "$STAGES" ]]; then
     [[ -n "$DRY_FLAG" ]]        && RUN_ARGS+=("$DRY_FLAG")
     [[ -n "$FORCE_FLAG" ]]      && RUN_ARGS+=("$FORCE_FLAG")
 
-    $PYTHON "${SCRIPTS}/run.py" "${RUN_ARGS[@]}"
+    $PYTHON "${SCRIPTS}/run.py" "${RUN_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"
 fi

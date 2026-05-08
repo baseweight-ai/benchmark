@@ -8,8 +8,8 @@ from pydantic import BaseModel, Field
 
 
 class Timeouts(BaseModel):
-    download_s: int = 1800
-    prepare_s: int = 1800
+    download_s: int = 3600
+    prepare_s: int = 3600
     train_local_s: int = 43200   # 12 h
     train_api_s: int = 43200     # 12 h
     eval_local_s: int = 7200     # 2 h

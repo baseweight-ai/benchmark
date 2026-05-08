@@ -9,7 +9,10 @@ import random
 import re
 import shutil
 import sys
+import threading
+import traceback
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -17,6 +20,11 @@ from typing import Any, Optional
 import click
 import yaml
 from pydantic import BaseModel
+
+# load_from_disk (via HuggingFace datasets) calls tqdm's thread_map internally,
+# which modifies tqdm class-level lock state in a non-thread-safe way.
+# Serializing calls with this lock prevents the AttributeError on concurrent loads.
+_load_from_disk_lock = threading.Lock()
 
 from checkpoint_utils import atomic_write_json, nv_prepared_dir
 from pipeline.cache import rows_sha
@@ -240,7 +248,10 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
     require_dir(raw_dir, min_files=1, desc=f"raw data for {cfg.task_id}")
     prompt, prompt_sha = load_prompt(cfg.task_id)
     system = prompt["system"]
-    ds = load_from_disk(str(raw_dir))
+    click.echo(f"  [{cfg.task_id}] Loading dataset from disk...")
+    with _load_from_disk_lock:
+        ds = load_from_disk(str(raw_dir))
+    click.echo(f"  [{cfg.task_id}] Dataset loaded — splits: {list(ds.keys())}")
 
     # ── Split into train / test ────────────────────────────────────────────
     if cfg.task_id == "fpb":
@@ -284,6 +295,7 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
 
     # ── CUAD: flatten SQuAD format and tag clause_type ────────────────────
     if cfg.task_id == "cuad":
+        click.echo(f"  [{cfg.task_id}] Flattening SQuAD format ({len(train_rows)} train, {len(test_rows)} test rows)...")
         def flatten_squad(rows: list[dict]) -> list[dict]:
             out = []
             for row in rows:
@@ -291,8 +303,11 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
                 answers = row.get("answers", {})
                 texts = answers.get("text", []) if isinstance(answers, dict) else []
                 question = row.get("question", "")
+                # chenghao/cuad_qa: question field IS the clause type name directly.
+                # Fall back to regex for older-format datasets where the question
+                # is a full sentence containing 'related to "Clause Name"'.
                 m = _CUAD_CLAUSE_RE.search(question)
-                clause_type = m.group(1) if m else "unknown"
+                clause_type = m.group(1) if m else (question.strip() or "unknown")
                 out.append({
                     "context": ctx,
                     "question": question,
@@ -312,12 +327,12 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
                 err=True,
             )
 
-    # ── Data quality: raw counts + filtering ──────────────────────────────
     from pipeline.data_quality import (  # lazy — only needed at prepare time
         find_exact_dupes, flag_extreme_length, cross_split_near_dupes,
         analyze_split, cross_split_stats, print_quality_summary,
     )
     quality_report: dict[str, Any] = {"task_id": cfg.task_id}
+    click.echo(f"  [{cfg.task_id}] Quality analysis — {len(train_rows)} train, {len(test_rows)} test rows...")
     raw_train_texts = [format_user(prompt, r) for r in train_rows]
     raw_test_texts  = [format_user(prompt, r) for r in test_rows]
     quality_report["raw"] = {"train_n": len(train_rows), "test_n": len(test_rows)}
@@ -338,6 +353,18 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
         test_rows      = [r for i, r in enumerate(test_rows)      if i not in test_exact]
         raw_test_texts = [t for i, t in enumerate(raw_test_texts) if i not in test_exact]
 
+    # Test is sampled first so cross-split checks against the actual eval rows,
+    # and train sampling then draws from an already-clean pool (no data loss).
+    click.echo(f"  [{cfg.task_id}] Sampling and formatting...")
+    test_rows_full: Optional[list[dict]] = None
+    if not smoke_test:
+        if cfg.test_sampling:
+            test_rows_full = test_rows
+            test_rows = sample(test_rows, **cfg.test_sampling.model_dump())
+            raw_test_texts = [format_user(prompt, r) for r in test_rows]
+            _log_distribution(test_rows, cfg.test_sampling.stratify_by, f"Test ({cfg.test_sampling.strategy})")
+
+    click.echo(f"  [{cfg.task_id}] Cross-split deduplication ({len(train_rows)} train × {len(test_rows)} test)...")
     cross_res  = cross_split_near_dupes(raw_train_texts, raw_test_texts, threshold=0.9)
     cross_drop = set(cross_res["train_indices_to_filter"])
     if cross_drop:
@@ -351,16 +378,10 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
         "cross_split_removed":       len(cross_drop),
     }
 
-    # ── Sampling (non-smoke only) ──────────────────────────────────────────
-    test_rows_full: Optional[list[dict]] = None
     if not smoke_test:
         if cfg.train_sampling:
             train_rows = sample(train_rows, **cfg.train_sampling.model_dump())
             _log_distribution(train_rows, cfg.train_sampling.stratify_by, f"Train ({cfg.train_sampling.strategy})")
-        if cfg.test_sampling:
-            test_rows_full = test_rows
-            test_rows = sample(test_rows, **cfg.test_sampling.model_dump())
-            _log_distribution(test_rows, cfg.test_sampling.stratify_by, f"Test ({cfg.test_sampling.strategy})")
 
     # ── FPB: assert no overlap between train and test ─────────────────────
     if cfg.task_id == "fpb" and not smoke_test:
@@ -500,16 +521,26 @@ def main(task: str, dry_run: bool, smoke_test: bool) -> None:
     """
     if task is None:
         raise click.UsageError("--task is required. Pass a task ID or 'all' to prepare every downloaded task.")
-    task_ids = ALL_TASKS if task == "all" else [task]
-    failures = []
-    for tid in task_ids:
-        try:
-            cfg = load_task_config(tid)
-            process_task(cfg, dry_run, smoke_test=smoke_test)
-        except Exception as exc:
-            click.echo(f"  ERROR [{tid}]: {exc}", err=True)
-            import traceback; traceback.print_exc()
-            failures.append((tid, str(exc)))
+    task_ids = ALL_TASKS if task == "all" else [t.strip() for t in task.split(",")]
+    failures: list[tuple[str, str]] = []
+
+    max_workers = min(len(task_ids), os.cpu_count() or 4, 4)
+    if len(task_ids) > 1:
+        click.echo(f"  Preparing {len(task_ids)} tasks with {max_workers} workers (output may interleave)")
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        fut_to_tid = {
+            pool.submit(process_task, load_task_config(tid), dry_run, smoke_test=smoke_test): tid
+            for tid in task_ids
+        }
+        for fut in as_completed(fut_to_tid):
+            tid = fut_to_tid[fut]
+            try:
+                fut.result()
+            except Exception as exc:
+                click.echo(f"  ERROR [{tid}]: {exc}", err=True)
+                traceback.print_exc()
+                failures.append((tid, str(exc)))
+
     if failures:
         click.echo(f"\nFAILED ({len(failures)}): " + ", ".join(t for t, _ in failures))
         sys.exit(1)
