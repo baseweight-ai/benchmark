@@ -374,15 +374,44 @@ def run_training_task(
             self.gpu_util_samples: list[float] = []
             self.loss_steps: list[tuple[int, float]] = []
             self.anomalies: list[dict] = []
+            self._train_start: float = 0.0
+            self._total_steps: int = 0
+            self._last_heartbeat: float = 0.0
+            self._last_logged_step: int = -1
 
         def on_train_begin(self, args, state, control, **kwargs):
+            now = time.time()
+            self._train_start = now
+            self._last_heartbeat = now
+            self._total_steps = state.max_steps
             echo(f"Training started: {state.max_steps} steps")
 
+        def _eta_str(self, step: int) -> str:
+            if step <= 0 or self._total_steps <= 0:
+                return ""
+            elapsed = time.time() - self._train_start
+            secs_per_step = elapsed / step
+            remaining = (self._total_steps - step) * secs_per_step
+            if remaining < 60:
+                return f"ETA ~{int(remaining)}s"
+            return f"ETA ~{int(remaining / 60)}m"
+
+        def _progress_header(self, step: int) -> list[str]:
+            pct = int(100 * step / self._total_steps) if self._total_steps else 0
+            parts = [f"step {step}/{self._total_steps} ({pct}%)"]
+            eta = self._eta_str(step)
+            if eta:
+                parts.append(eta)
+            return parts
+
         def on_step_end(self, args, state, control, **kwargs):
-            if state.global_step == 1 and state.log_history:
-                loss = state.log_history[-1].get("loss")
-                if loss is not None:
-                    echo(f"Step 1 complete — loss={loss:.4f}")
+            step = state.global_step
+            now = time.time()
+            if now - self._last_heartbeat >= 60 and step != self._last_logged_step:
+                elapsed_min = (now - self._train_start) / 60
+                parts = self._progress_header(step) + [f"elapsed {elapsed_min:.1f}m"]
+                echo("... " + " | ".join(parts))
+                self._last_heartbeat = now
 
         def on_log(self, args, state, control, logs=None, **kwargs):
             try:
@@ -392,6 +421,8 @@ def run_training_task(
             if not logs:
                 return
             step = state.global_step
+            self._last_logged_step = step
+            self._last_heartbeat = time.time()
             loss = logs.get("loss", logs.get("train_loss"))
             lr = logs.get("learning_rate")
             grad_norm = logs.get("grad_norm")
@@ -419,7 +450,7 @@ def run_training_task(
                     self.loss_steps.append((step, loss))
 
             # ── Progress line ─────────────────────────────────────────────
-            parts = [f"step {step}"]
+            parts = self._progress_header(step)
             if loss is not None and not (math.isnan(loss) or math.isinf(loss)):
                 parts.append(f"loss={loss:.4f}")
             if lr is not None:

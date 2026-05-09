@@ -26,7 +26,7 @@ test_sampling:
   seed: 42
 eval_axes: [token_f1, cost, latency]
 prompt_file: "prompts/cuad.json"
-context_max_tokens: 1500
+context_max_tokens: 750
 skip_conditions: [5-shot]
 epochs_by_size:
   small: 10

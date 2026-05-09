@@ -7,8 +7,8 @@ enable_thinking: false
 vllm_task: auto
 fallback_model_id: "Qwen/Qwen2.5-7B-Instruct"
 lora:
-  rank: 32
-  alpha: 64
+  rank: 16
+  alpha: 32
   dropout: 0.05
   target_modules: "all-linear"
   use_rslora: true
