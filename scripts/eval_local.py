@@ -39,7 +39,7 @@ ALL_MODELS: list[str] = [m["id"] for m in get_local_models()]
 
 MAX_CONCURRENCY = 4
 VLLM_HOST = "http://localhost:8000"
-VLLM_HEALTH_TIMEOUT_GPU = 300
+VLLM_HEALTH_TIMEOUT_GPU = 1200
 VLLM_HEALTH_TIMEOUT_SMOKE = 300
 VLLM_HEALTH_INTERVAL = 5
 
@@ -177,7 +177,6 @@ def start_vllm_server(
     base_model: str,
     lora_modules: dict[str, Path],
     max_seq_length: int,
-    enable_thinking: Optional[bool] = None,
     vllm_task: str = "auto",
     smoke_test: bool = False,
 ) -> subprocess.Popen:
@@ -217,8 +216,6 @@ def start_vllm_server(
     ]
     if smoke_test:
         cmd += ["--enforce-eager"]
-    if enable_thinking is False:
-        cmd += ["--default-chat-template-kwargs", '{"enable_thinking": false}']
     if lora_modules:
         cmd += ["--enable-lora", "--max-loras", str(len(lora_modules))]
         for name, path in lora_modules.items():
@@ -330,12 +327,16 @@ async def run_eval(
 
     semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
     totals = [0, 0]  # [input_tokens, output_tokens]
+    chat_template_kwargs = (
+        {"enable_thinking": False} if model_cfg.enable_thinking is False else None
+    )
 
     async def process_row(row: dict, session: "aiohttp.ClientSession") -> None:
         msgs = build_messages(row, few_shot, condition)
         try:
             text, in_tok, out_tok, lat, ttft = await call_vllm(
-                session, model_name, msgs, task_cfg.max_output_tokens, semaphore
+                session, model_name, msgs, task_cfg.max_output_tokens, semaphore,
+                chat_template_kwargs=chat_template_kwargs,
             )
         except Exception as exc:
             text, in_tok, out_tok, lat, ttft = f"ERROR: {exc}", 0, 0, 0.0, 0.0
@@ -486,7 +487,7 @@ def main(model: Optional[str], task: str, condition: str, eval_seed: int, dry_ru
         # Base-model requests use model_cfg.model_id; LoRA requests use adapter_{tid}.
         proc = start_vllm_server(
             model_cfg.model_id, lora_modules, seq_len,
-            model_cfg.enable_thinking, model_cfg.vllm_task, smoke_test,
+            model_cfg.vllm_task, smoke_test,
         )
         try:
             ready = asyncio.run(wait_for_vllm(proc, timeout=_vllm_health_timeout(smoke_test)))

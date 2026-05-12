@@ -108,7 +108,8 @@ async def call_openai(
 # ── vLLM ───────────────────────────────────────────────────────────────────
 
 async def _vllm_once(
-    session, model_name: str, messages: list[dict], max_tokens: int, host: str
+    session, model_name: str, messages: list[dict], max_tokens: int, host: str,
+    chat_template_kwargs: dict | None = None,
 ) -> tuple[str, int, int, float, float]:
     import aiohttp
 
@@ -117,6 +118,8 @@ async def _vllm_once(
         "max_tokens": max_tokens, "stream": True,
         "stream_options": {"include_usage": True},
     }
+    if chat_template_kwargs:
+        payload["chat_template_kwargs"] = chat_template_kwargs
 
     t0 = time.time()
     ttft_ms = 0.0
@@ -157,11 +160,12 @@ async def _vllm_once(
 
 
 async def _vllm_with_retries(
-    session, model_name: str, messages: list[dict], max_tokens: int, host: str
+    session, model_name: str, messages: list[dict], max_tokens: int, host: str,
+    chat_template_kwargs: dict | None = None,
 ) -> tuple[str, int, int, float, float]:
     for attempt in range(MAX_RETRIES_VLLM):
         try:
-            return await _vllm_once(session, model_name, messages, max_tokens, host)
+            return await _vllm_once(session, model_name, messages, max_tokens, host, chat_template_kwargs)
         except Exception as exc:
             if attempt == MAX_RETRIES_VLLM - 1:
                 raise
@@ -185,12 +189,13 @@ async def call_vllm(
     max_tokens: int,
     semaphore: asyncio.Semaphore,
     host: str = VLLM_HOST,
+    chat_template_kwargs: dict | None = None,
 ) -> tuple[str, int, int, float, float]:
     """Stream one vLLM request with retries and circuit-breaker protection."""
     _vllm_cb.raise_if_open()
     async with semaphore:
         return await _vllm_cb.call(
-            _vllm_with_retries(session, model_name, messages, max_tokens, host)
+            _vllm_with_retries(session, model_name, messages, max_tokens, host, chat_template_kwargs)
         )
 
 
@@ -212,14 +217,17 @@ class OpenAIAdapter:
 class VLLMAdapter:
     """InferenceClient that wraps call_vllm."""
 
-    def __init__(self, session, model_name: str, host: str = VLLM_HOST) -> None:
+    def __init__(self, session, model_name: str, host: str = VLLM_HOST,
+                 chat_template_kwargs: dict | None = None) -> None:
         self._session = session
         self._model_name = model_name
         self._host = host
+        self._chat_template_kwargs = chat_template_kwargs
 
     async def complete(
         self, messages: list[dict], max_tokens: int, semaphore: asyncio.Semaphore
     ) -> tuple[str, int, int, float, float]:
         return await call_vllm(
-            self._session, self._model_name, messages, max_tokens, semaphore, self._host
+            self._session, self._model_name, messages, max_tokens, semaphore, self._host,
+            self._chat_template_kwargs,
         )
