@@ -37,6 +37,7 @@ class TaskConfig(BaseModel):
     task_name: str
     dataset_path: str
     dataset_config: Optional[str] = None
+    trust_remote_code: Optional[bool] = None
 
 
 def load_task_configs(task_ids: list[str]) -> list[TaskConfig]:
@@ -107,6 +108,8 @@ def download_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> N
         load_kwargs["revision"] = sha
     if cfg.dataset_config:
         load_kwargs["name"] = cfg.dataset_config
+    if cfg.trust_remote_code:
+        load_kwargs["trust_remote_code"] = True
 
     if smoke_test:
         # Probe for a test split first so we can download 2x train rows upfront for

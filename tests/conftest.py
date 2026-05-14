@@ -98,13 +98,13 @@ def reset_circuit_breakers():
 
 
 @pytest.fixture
-def tmp_network_volume(tmp_path, monkeypatch):
-    """Redirect NETWORK_VOLUME to a temp dir so checkpoint tests don't touch /workspace."""
+def tmp_checkpoints_root(tmp_path, monkeypatch):
+    """Redirect CHECKPOINTS_ROOT to a temp dir so checkpoint tests don't touch real outputs."""
     import checkpoint_utils
-    nv = tmp_path / "workspace"
-    nv.mkdir()
-    monkeypatch.setattr(checkpoint_utils, "NETWORK_VOLUME", nv)
-    return nv
+    root = tmp_path / "checkpoints"
+    root.mkdir()
+    monkeypatch.setattr(checkpoint_utils, "CHECKPOINTS_ROOT", root)
+    return root
 
 
 @pytest.fixture

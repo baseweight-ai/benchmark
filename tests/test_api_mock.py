@@ -52,9 +52,15 @@ def _write_sft_metadata(tmp_path: Path, model_id: str = "gpt-4.1-nano", task_id:
 # ── Mock call_* functions directly ────────────────────────────────────────────
 
 def _mock_call(response_text="positive"):
-    """Return an async mock that behaves like call_openai."""
+    """Return an async mock that behaves like call_openai.
+
+    Tuple shape: (text, input_tokens, output_tokens, reasoning_tokens, latency_ms,
+                  ttft_ms, avg_logprob).
+    reasoning_tokens=0 because the benchmark policy disables reasoning everywhere.
+    avg_logprob=None because mocked calls don't simulate logprobs.
+    """
     async def _fn(*args, **kwargs):
-        return response_text, 100, 10, 150.0, 50.0
+        return response_text, 100, 10, 0, 150.0, 50.0, None
     return _fn
 
 
@@ -90,7 +96,7 @@ def test_run_eval_skips_existing(tmp_path, monkeypatch):
     async def counting_call(*a, **kw):
         nonlocal call_count
         call_count += 1
-        return "positive", 10, 5, 100.0, 50.0
+        return "positive", 10, 5, 0, 100.0, 50.0, None
 
     with patch("eval_api.call_openai", side_effect=counting_call):
         with patch("openai.AsyncOpenAI", return_value=MagicMock()):
@@ -113,7 +119,7 @@ def test_run_eval_resumes_partial(tmp_path, monkeypatch):
     partial.write_text("\n".join(json.dumps(r) for r in already_done) + "\n")
 
     async def tracking_call(*a, **kw):
-        return "negative", 10, 5, 100.0, 50.0
+        return "negative", 10, 5, 0, 100.0, 50.0, None
 
     with patch("eval_api.call_openai", side_effect=tracking_call):
         with patch("openai.AsyncOpenAI", return_value=MagicMock()):
@@ -143,6 +149,71 @@ def test_run_eval_missing_data_raises(tmp_path, monkeypatch):
         asyncio.run(run_eval("gpt-4.1-nano", "fpb", "zero-shot", _task_cfg(), dry_run=False))
 
 
+def test_run_eval_disables_reasoning_for_capable_model(tmp_path, monkeypatch):
+    """Reasoning-capable models (e.g. gpt-5.5) must be sent reasoning_effort=minimal
+    so the benchmark stays apples-to-apples with non-reasoning models."""
+    monkeypatch.setattr(eval_api, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(eval_api, "REASONING_CAPABLE", {"gpt-5.5": True, "gpt-4.1-nano": False})
+    _setup_prepared_dir(tmp_path, n=2)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+    received_effort = []
+
+    async def capture_call(client, model_str, messages, max_tokens, semaphore, **kwargs):
+        received_effort.append(kwargs.get("reasoning_effort"))
+        return "positive", 10, 5, 0, 100.0, 50.0, None
+
+    # gpt-5.5 is reasoning-capable → effort should be "minimal"
+    monkeypatch.setattr(eval_api, "OPENAI_MODELS", {"gpt-5.5": "gpt-5.5", "gpt-4.1-nano": "gpt-4.1-nano-2025-04-14"})
+    with patch("eval_api.call_openai", side_effect=capture_call):
+        with patch("openai.AsyncOpenAI", return_value=MagicMock()):
+            asyncio.run(run_eval("gpt-5.5", "fpb", "zero-shot", _task_cfg(), dry_run=False))
+
+    assert received_effort and all(e == "minimal" for e in received_effort)
+
+
+def test_run_eval_omits_reasoning_for_non_capable_model(tmp_path, monkeypatch):
+    """Non-reasoning models (gpt-4.1) must not receive the reasoning_effort param —
+    OpenAI would 400 on it."""
+    monkeypatch.setattr(eval_api, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(eval_api, "REASONING_CAPABLE", {"gpt-4.1-nano": False})
+    _setup_prepared_dir(tmp_path, n=2)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+    received_effort = []
+
+    async def capture_call(client, model_str, messages, max_tokens, semaphore, **kwargs):
+        received_effort.append(kwargs.get("reasoning_effort"))
+        return "positive", 10, 5, 0, 100.0, 50.0, None
+
+    with patch("eval_api.call_openai", side_effect=capture_call):
+        with patch("openai.AsyncOpenAI", return_value=MagicMock()):
+            asyncio.run(run_eval("gpt-4.1-nano", "fpb", "zero-shot", _task_cfg(), dry_run=False))
+
+    assert received_effort and all(e is None for e in received_effort)
+
+
+def test_run_eval_records_reasoning_tokens_per_row(tmp_path, monkeypatch):
+    """reasoning_tokens must land in every prediction row, even when zero, so
+    the dashboard can always decompose output_tokens."""
+    monkeypatch.setattr(eval_api, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(eval_api, "REASONING_CAPABLE", {"gpt-4.1-nano": False})
+    _setup_prepared_dir(tmp_path, n=3)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+    async def call(client, model_str, messages, max_tokens, semaphore, **kwargs):
+        return "positive", 100, 12, 7, 100.0, 50.0, None  # 7 reasoning tokens
+
+    with patch("eval_api.call_openai", side_effect=call):
+        with patch("openai.AsyncOpenAI", return_value=MagicMock()):
+            asyncio.run(run_eval("gpt-4.1-nano", "fpb", "zero-shot", _task_cfg(), dry_run=False))
+
+    out = tmp_path / "results" / "predictions" / "api" / "gpt-4.1-nano" / "fpb" / "zero-shot.jsonl"
+    rows = [json.loads(l) for l in out.read_text().splitlines()]
+    assert all(r["reasoning_tokens"] == 7 for r in rows)
+    assert all(r["output_tokens"] == 12 for r in rows)
+
+
 def test_run_eval_5shot_builds_messages(tmp_path, monkeypatch):
     """Verify that 5-shot condition actually passes few-shot context."""
     monkeypatch.setattr(eval_api, "REPO_ROOT", tmp_path)
@@ -151,9 +222,9 @@ def test_run_eval_5shot_builds_messages(tmp_path, monkeypatch):
 
     captured_messages = []
 
-    async def capture_call(client, model_str, messages, max_tokens, semaphore):
+    async def capture_call(client, model_str, messages, max_tokens, semaphore, **kw):
         captured_messages.append(messages)
-        return "positive", 10, 5, 100.0, 50.0
+        return "positive", 10, 5, 0, 100.0, 50.0, None
 
     with patch("eval_api.call_openai", side_effect=capture_call):
         with patch("openai.AsyncOpenAI", return_value=MagicMock()):
@@ -175,9 +246,9 @@ def test_run_eval_api_sft_reads_ft_model_from_metadata(tmp_path, monkeypatch):
 
     used_model_strs = []
 
-    async def capture_call(client, model_str, messages, max_tokens, semaphore):
+    async def capture_call(client, model_str, messages, max_tokens, semaphore, **kw):
         used_model_strs.append(model_str)
-        return "positive", 10, 5, 100.0, 50.0
+        return "positive", 10, 5, 0, 100.0, 50.0, None
 
     with patch("eval_api.call_openai", side_effect=capture_call):
         with patch("openai.AsyncOpenAI", return_value=MagicMock()):

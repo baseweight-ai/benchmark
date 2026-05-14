@@ -19,7 +19,7 @@ from typing import Optional
 import click
 from dotenv import load_dotenv
 
-from checkpoint_utils import NETWORK_VOLUME
+from checkpoint_utils import CHECKPOINTS_ROOT
 
 REPO_ROOT = Path(__file__).parent.parent
 load_dotenv(REPO_ROOT / ".env")
@@ -147,9 +147,9 @@ def sync_predictions(api, dry_run: bool) -> int:
 
 
 def sync_checkpoints(api, dry_run: bool) -> int:
-    # Full HF Trainer checkpoints live on the volume and are already persistent;
-    # only train_state.json is uploaded to survive a volume wipe.
-    root = NETWORK_VOLUME / "checkpoints"
+    # Full HF Trainer checkpoints live in the repo and persist with it;
+    # only train_state.json is uploaded as an offsite backup.
+    root = CHECKPOINTS_ROOT
     if not root.exists():
         click.echo("  No checkpoint state found — skipping")
         return 0

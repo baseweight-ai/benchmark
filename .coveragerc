@@ -1,0 +1,41 @@
+[run]
+source = scripts
+branch = false
+# CLI entry points and orchestrators — tested via subprocess (test_smoke_pipeline)
+# or not at all; including them rewards writing pointless CLI mock tests.
+omit =
+    scripts/catalog.py
+    scripts/print_quality_reports.py
+    scripts/run.py
+    scripts/run_manifest_cli.py
+    scripts/run_sweep.py
+    scripts/smoke_train.py
+    scripts/upload_artifacts.py
+    scripts/sync_artifacts.py
+    scripts/eval_lm_harness.py
+    scripts/download_data.py
+    # Unused/registry modules with no logic to test:
+    scripts/pipeline/dag.py
+    scripts/pipeline/registry.py
+    scripts/pipeline/run_config.py
+    scripts/pipeline/trainers.py
+    # Compiled cache, not source:
+    scripts/__pycache__/*
+    scripts/**/__pycache__/*
+
+[report]
+# Regression gate, not a quality bar. Today's coverage is ~64% on the
+# testable library surface, capped by GPU code paths (vLLM streaming,
+# FastModel loading, SFT trainer body) and HF Hub I/O that aren't
+# economically mockable. Set at 60% so a meaningful regression fails CI
+# while leaving headroom; raise when network/GPU mocks land.
+fail_under = 60
+show_missing = true
+skip_covered = false
+exclude_lines =
+    pragma: no cover
+    raise NotImplementedError
+    if __name__ == .__main__.:
+    if TYPE_CHECKING:
+    \.\.\.
+    pass

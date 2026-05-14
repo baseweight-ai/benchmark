@@ -7,8 +7,21 @@ apis:
     training_per_m: 25.00
 
 self_hosted:
-  # Hourly rental rate for the GPU used in production inference.
-  # Adjust to match your target hardware (e.g. A100 ~$2.00, H100 ~$3.50, 4090 ~$0.50).
-  gpu_hourly_rate: 0.49
+  # Hourly rental rate for the GPU the eval is running on.
+  # Update this when the underlying hardware or vendor changes.
+  # Note: this is YOUR cost. The user-facing dashboard can be re-rendered with
+  # an alternative ICP-realistic rate via:
+  #   python scripts/generate_dashboard_data.py --gpu-hourly-rate <usd>
+  gpu_hourly_rate: 0.46
+  gpu_pricing_notes: "RunPod RTX 3090 on-demand, May 2026. ICP deployment cost will differ (e.g. AWS g5.xlarge ~$1.006/hr on-demand, ~$0.30/hr spot for A10G)."
+
+  # GPU allowlist — train_local.py and eval_local.py refuse to start if
+  # torch.cuda.get_device_name(0) is not in this list. Prevents accidentally
+  # publishing latency / throughput / cost numbers from mismatched hardware.
+  # Smoke-test runs bypass the check. To disable enforcement entirely (e.g.
+  # for dev iteration), set to an empty list [].
+  allowed_gpus:
+    - "NVIDIA GeForce RTX 3090"
+
   # Fallback queries-per-hour estimate used only when avg_latency_ms is unavailable.
   queries_per_hour_per_gpu: 2000

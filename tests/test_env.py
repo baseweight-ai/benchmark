@@ -104,7 +104,7 @@ def test_env_example_has_required_keys():
     if not env_example.exists():
         pytest.skip(".env.example not found")
     content = env_example.read_text()
-    for key in ["OPENAI_API_KEY", "HF_TOKEN", "NETWORK_VOLUME"]:
+    for key in ["OPENAI_API_KEY", "HF_TOKEN"]:
         assert key in content, f".env.example missing {key}"
 
 

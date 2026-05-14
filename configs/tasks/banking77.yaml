@@ -1,7 +1,14 @@
 task_id: banking77
 task_name: "Customer Support Routing"
-dataset_path: "legacy-datasets/banking77"
+dataset_path: "PolyAI/banking77"
 dataset_config: null
+# PolyAI/banking77 ships a custom loading script. Without this the Hub
+# download falls back to a stale or empty default and silently breaks
+# prepare_datasets.py. If load_dataset() still rejects the script (e.g.
+# `datasets` was upgraded and dropped script loaders), download the Parquet
+# shards listed in the dataset's loading script directly from GitHub and
+# point dataset_path at them via `load_dataset("parquet", data_files=...)`.
+trust_remote_code: true
 task_type: classification
 num_classes: 77
 metric_id: weighted_f1

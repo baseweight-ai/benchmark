@@ -4,12 +4,14 @@ dataset_path: "coastalcph/lex_glue"
 dataset_config: "ledgar"
 task_type: classification
 num_classes: 100
-metric_id: weighted_f1
-metric_label: "Weighted F1"
-# per_class_weighted: 100 provision types with a power-law frequency distribution. Weighted
-# F1 reflects performance proportional to how often each provision appears. If equal
-# per-class detection mattered (e.g. rare-but-critical clauses), switch to macro_f1.
-metric_granularity: per_class_weighted
+metric_id: macro_f1
+metric_label: "Macro F1"
+# 100 provision types follow a power-law distribution. Macro-F1 equally
+# weights each class regardless of support, which is the rigorous choice
+# when rare-but-critical clauses (e.g. Anti-Corruption Laws, Sanctions,
+# Indemnifications) matter as much as common boilerplate. Switch to
+# weighted_f1 only if reporting throughput-proportional performance.
+metric_granularity: per_class_macro
 max_output_tokens: 32
 lm_eval_task_id: ledgar
 train_sampling:

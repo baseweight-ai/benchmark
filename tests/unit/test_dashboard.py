@@ -5,6 +5,7 @@ import pytest
 
 from generate_dashboard_data import (
     PricingConfig,
+    _export_tables,
     build_result,
     compute_cost_per_query,
     compute_stats,
@@ -24,6 +25,20 @@ def pricing():
         },
         self_hosted={"gpu_hourly_rate": 0.49, "queries_per_hour_per_gpu": 2000},
     )
+
+
+def _summary(**overrides) -> dict:
+    """Default classification-task summary; override any field per test."""
+    base = {
+        "metric_value": 0.9,
+        "metric_id": "accuracy",
+        "n_predictions": 500,
+        "total_input_tokens": 50_000,
+        "total_output_tokens": 5_000,
+        "error_counts": {},
+    }
+    base.update(overrides)
+    return base
 
 
 # ── compute_cost_per_query ─────────────────────────────────────────────────────
@@ -96,6 +111,205 @@ def test_build_result_with_summary(pricing):
     assert result["cost_per_query"] is not None
     assert result["cost_per_1k_correct"] is not None
     assert result["error_counts"]["correct"] == 425
+
+
+def test_build_result_surfaces_classification_metrics(pricing):
+    summary = _summary(
+        metric_value=0.85, metric_id="weighted_f1",
+        exact_match=0.82, macro_f1=0.78, weighted_f1=0.85, hallucination_rate=0.04,
+    )
+    result = build_result("gpt-4.1", "fpb", "zero-shot", summary, None, pricing)
+    assert result["exact_match"] == pytest.approx(0.82)
+    assert result["macro_f1"] == pytest.approx(0.78)
+    assert result["weighted_f1"] == pytest.approx(0.85)
+    assert result["hallucination_rate"] == pytest.approx(0.04)
+
+
+def test_build_result_cost_per_1k_requests_is_cost_per_query_times_1000(pricing):
+    result = build_result("gpt-4.1", "fpb", "zero-shot", _summary(), None, pricing)
+    assert result["cost_per_1k_requests"] == pytest.approx(result["cost_per_query"] * 1000, rel=1e-4)
+
+
+def test_build_result_cost_per_1k_tokens_matches_total_cost_over_total_tokens(pricing):
+    result = build_result("gpt-4.1", "fpb", "zero-shot", _summary(), None, pricing)
+    expected = result["cost_per_query"] * 500 / 55_000 * 1000
+    # 6-decimal rounding in dashboard output.
+    assert result["cost_per_1k_tokens"] == pytest.approx(expected, abs=1e-6)
+
+
+def test_build_result_cost_per_1m_api_uses_billed_rates(pricing):
+    """API models bill input/output separately; pricing fixture has gpt-4.1
+    at input=$2/1M, output=$8/1M."""
+    result = build_result("gpt-4.1", "fpb", "zero-shot", _summary(), None, pricing)
+    assert result["cost_per_1m_input_tokens"] == pytest.approx(2.0, rel=1e-4)
+    assert result["cost_per_1m_output_tokens"] == pytest.approx(8.0, rel=1e-4)
+    assert result["cost_per_1m_input_tokens"] != result["cost_per_1m_output_tokens"]
+
+
+def test_build_result_cost_per_1m_self_hosted_input_equals_output(pricing):
+    """Self-hosted shares wall time between prefill and decode — can't
+    attribute input vs output separately."""
+    result = build_result("qwen3-8b", "fpb", "lora", _summary(), None, pricing)
+    assert result["cost_per_1m_input_tokens"] is not None
+    assert result["cost_per_1m_output_tokens"] is not None
+    assert result["cost_per_1m_input_tokens"] == result["cost_per_1m_output_tokens"]
+
+
+def test_build_result_surfaces_latency_percentiles(pricing):
+    summary = _summary(latency_p50_ms=120.0, latency_p99_ms=450.0)
+    result = build_result("gpt-4.1", "fpb", "zero-shot", summary, None, pricing)
+    assert result["latency_p50_ms"] == 120.0
+    assert result["latency_p99_ms"] == 450.0
+
+
+def test_build_result_computes_throughput_qps(pricing):
+    summary = _summary(eval_wall_time_s=10.0)
+    result = build_result("gpt-4.1", "fpb", "zero-shot", summary, None, pricing)
+    assert result["throughput_qps"] == pytest.approx(50.0)
+
+
+def test_build_result_throughput_none_without_wall_time(pricing):
+    result = build_result("gpt-4.1", "fpb", "zero-shot", _summary(), None, pricing)
+    assert result["throughput_qps"] is None
+
+
+def test_build_result_cost_per_1m_queries_is_cost_per_query_times_1m(pricing):
+    result = build_result("gpt-4.1", "fpb", "zero-shot", _summary(), None, pricing)
+    assert result["cost_per_1m_queries"] == pytest.approx(
+        result["cost_per_query"] * 1_000_000, rel=1e-4
+    )
+
+
+def test_build_result_surfaces_gpu_model(pricing):
+    """eval-time gpu_model overrides training-time."""
+    summary = _summary(n_predictions=100, total_input_tokens=10_000, total_output_tokens=1_000,
+                       gpu_model="NVIDIA L4")
+    training_meta = {"gpu_model": "NVIDIA A10G", "training_cost": 2.5}
+    result = build_result("qwen3-8b", "fpb", "lora", summary, training_meta, pricing)
+    assert result["gpu_model"] == "NVIDIA L4"
+
+
+def test_summarise_hardware_consistent_returns_no_warning():
+    """All local rows on one GPU → no warning."""
+    from generate_dashboard_data import _summarise_hardware
+    results = [
+        {"model_id": "qwen3-8b", "family": "open-source", "gpu_model": "NVIDIA GeForce RTX 3090"},
+        {"model_id": "qwen3-8b", "family": "open-source", "gpu_model": "NVIDIA GeForce RTX 3090"},
+    ]
+    hw = _summarise_hardware(results)
+    assert hw["local_gpus_observed"] == ["NVIDIA GeForce RTX 3090"]
+    assert hw["inconsistent_gpu_models"] == {}
+    assert hw["hardware_warning"] is None
+
+
+def test_summarise_hardware_mixed_gpus_for_one_model_warns():
+    """Same model on 2 different GPUs → warning, latency/cost not comparable."""
+    from generate_dashboard_data import _summarise_hardware
+    results = [
+        {"model_id": "qwen3-8b", "family": "open-source", "gpu_model": "NVIDIA GeForce RTX 3090"},
+        {"model_id": "qwen3-8b", "family": "open-source", "gpu_model": "NVIDIA A10G"},
+    ]
+    hw = _summarise_hardware(results)
+    assert "qwen3-8b" in hw["inconsistent_gpu_models"]
+    assert hw["hardware_warning"] is not None
+    assert "qwen3-8b" in hw["hardware_warning"]
+
+
+def test_summarise_hardware_ignores_api_rows():
+    """API rows have gpu_model=None — they don't trip the consistency check."""
+    from generate_dashboard_data import _summarise_hardware
+    results = [
+        {"model_id": "qwen3-8b", "family": "open-source", "gpu_model": "NVIDIA GeForce RTX 3090"},
+        {"model_id": "gpt-4.1-nano", "family": "frontier", "gpu_model": None},
+    ]
+    hw = _summarise_hardware(results)
+    assert hw["hardware_warning"] is None
+
+
+def test_build_dashboard_data_applies_gpu_hourly_rate_override(tmp_path, monkeypatch):
+    """--gpu-hourly-rate flag changes the rate used for cost computations
+    without touching pricing.yaml on disk."""
+    import generate_dashboard_data as gdd
+
+    # Tmp repo with summaries + pricing.yaml at $1.00/hr
+    monkeypatch.setattr(gdd, "REPO_ROOT", tmp_path)
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "configs" / "pricing.yaml").write_text(
+        "apis: {}\n"
+        "self_hosted:\n"
+        "  gpu_hourly_rate: 1.00\n"
+        "  queries_per_hour_per_gpu: 2000\n"
+    )
+    # qwen3-8b needs a training config file to be recognised as open-source.
+    (tmp_path / "configs" / "training").mkdir()
+    (tmp_path / "configs" / "training" / "qwen3-8b.yaml").write_text(
+        "model_id: Qwen/Qwen3-8B\nmodel_short: qwen3-8b\n"
+    )
+    summary_dir = tmp_path / "results" / "summaries" / "local" / "qwen3-8b" / "fpb"
+    summary_dir.mkdir(parents=True)
+    (summary_dir / "lora.json").write_text(json.dumps({
+        "model": "qwen3-8b", "task_id": "fpb", "condition": "lora",
+        "metric_id": "weighted_f1", "metric_value": 0.85,
+        "n_predictions": 100, "total_input_tokens": 10_000,
+        "total_output_tokens": 1_000, "eval_wall_time_s": 10.0,
+        "error_counts": {},
+    }))
+
+    # Render with override at $0.30/hr
+    data = gdd.build_dashboard_data(daily_volume=1000, gpu_hourly_rate_override=0.30)
+
+    assert data["pricing_provenance"]["gpu_hourly_rate_used"] == 0.30
+    assert data["pricing_provenance"]["gpu_hourly_rate_source"] == "cli_override"
+    # cost_per_query should reflect $0.30/hr not the $1.00 in pricing.yaml
+    row = next(r for r in data["results"] if r["model_id"] == "qwen3-8b")
+    # cost = 0.30 * 10s / 100 / 3600 = 8.33e-6
+    assert row["cost_per_query"] == pytest.approx(0.30 * 10 / 100 / 3600, rel=1e-3)
+
+
+def test_build_dashboard_data_default_uses_pricing_yaml(tmp_path, monkeypatch):
+    """Without override, rate comes from pricing.yaml and provenance reflects it."""
+    import generate_dashboard_data as gdd
+    monkeypatch.setattr(gdd, "REPO_ROOT", tmp_path)
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "configs" / "pricing.yaml").write_text(
+        "apis: {}\n"
+        "self_hosted:\n"
+        "  gpu_hourly_rate: 0.46\n"
+        "  queries_per_hour_per_gpu: 2000\n"
+    )
+    (tmp_path / "results" / "summaries").mkdir(parents=True)
+    data = gdd.build_dashboard_data(daily_volume=1000)
+    assert data["pricing_provenance"]["gpu_hourly_rate_used"] == 0.46
+    assert data["pricing_provenance"]["gpu_hourly_rate_source"] == "pricing.yaml"
+
+
+def test_build_result_gpu_model_falls_back_to_training_meta(pricing):
+    """Summary lacks gpu_model → falls back to training_meta."""
+    summary = _summary(n_predictions=100, total_input_tokens=10_000, total_output_tokens=1_000)
+    training_meta = {"gpu_model": "NVIDIA A10G", "training_cost": 2.5}
+    result = build_result("qwen3-8b", "fpb", "lora", summary, training_meta, pricing)
+    assert result["gpu_model"] == "NVIDIA A10G"
+
+
+def test_build_result_surfaces_logprob_observability(pricing):
+    summary = _summary(n_predictions=100, total_input_tokens=10_000, total_output_tokens=1_000,
+                       avg_logprob=-0.12, p10_logprob=-0.45)
+    result = build_result("gpt-4.1", "fpb", "zero-shot", summary, None, pricing)
+    assert result["avg_logprob"] == pytest.approx(-0.12)
+    assert result["p10_logprob"] == pytest.approx(-0.45)
+
+
+def test_build_result_classification_metrics_null_when_absent(pricing):
+    """Extraction tasks have null classification metrics; pass-through."""
+    summary = _summary(
+        metric_value=0.6, metric_id="token_f1",
+        n_predictions=100, total_input_tokens=10_000, total_output_tokens=1_000,
+        exact_match=None, macro_f1=None, weighted_f1=None, hallucination_rate=None,
+    )
+    result = build_result("gpt-4.1", "cuad", "zero-shot", summary, None, pricing)
+    assert result["exact_match"] is None
+    assert result["macro_f1"] is None
+    assert result["hallucination_rate"] is None
 
 
 def test_build_result_without_summary(pricing):
@@ -352,6 +566,72 @@ def test_effect_label_large():
 def test_effect_label_none_returns_none():
     from generate_dashboard_data import _effect_label
     assert _effect_label(None) is None
+
+
+# ── _export_tables: the four mandated metrics + cost-per-1k in CSV/MD ─────────
+
+def _result_row(model_id, task_id, condition, metric_value=0.85, *, em=0.82,
+                macro=0.78, weighted=0.85, halluc=0.04, cost_per_query=0.001):
+    """Build a dashboard result row with the fields _export_tables consumes."""
+    return {
+        "model_id": model_id, "task_id": task_id, "condition": condition,
+        "metric_id": "weighted_f1", "metric_value": metric_value,
+        "metric_std": None, "metric_ci_lo": None, "metric_ci_hi": None,
+        "exact_match": em, "macro_f1": macro, "weighted_f1": weighted,
+        "hallucination_rate": halluc,
+        "cost_per_query": cost_per_query,
+        "cost_per_1k_requests": round(cost_per_query * 1000, 4),
+        "cost_per_1k_tokens": 0.000125,
+        "cost_per_1m_input_tokens": 0.10,
+        "cost_per_1m_output_tokens": 0.40,
+        "avg_latency_ms": 150.0, "n_predictions": 500,
+    }
+
+
+def test_export_tables_csv_includes_all_four_metrics(tmp_path):
+    """CSV must carry EM, macro_f1, weighted_f1, hallucination_rate per row."""
+    import csv
+    results = [
+        _result_row("qwen3-8b", "banking77", "lora", em=0.78, macro=0.74, weighted=0.80, halluc=0.02),
+        _result_row("gpt-4.1-nano", "banking77", "zero-shot", em=0.55, macro=0.50, weighted=0.58, halluc=0.12),
+    ]
+    _export_tables(results, tmp_path)
+    csv_path = tmp_path / "results.csv"
+    assert csv_path.exists()
+    with csv_path.open() as f:
+        rows = list(csv.DictReader(f))
+    for col in ("exact_match", "macro_f1", "weighted_f1", "hallucination_rate",
+                "cost_per_query", "cost_per_1k_requests", "cost_per_1k_tokens",
+                "cost_per_1m_input_tokens", "cost_per_1m_output_tokens"):
+        assert col in rows[0], f"{col} missing from CSV header"
+    # Spot-check values land in the right rows
+    qwen_row = next(r for r in rows if r["model_id"] == "qwen3-8b")
+    assert qwen_row["exact_match"] == "0.78"
+    assert qwen_row["macro_f1"] == "0.74"
+    assert qwen_row["hallucination_rate"] == "0.02"
+
+
+def test_export_tables_markdown_includes_all_four_metrics(tmp_path):
+    """Markdown leaderboard must surface EM, Macro-F1, Weighted-F1, Halluc, $/1k, $/1M."""
+    results = [
+        _result_row("qwen3-8b", "banking77", "lora", em=0.78, macro=0.74, halluc=0.02),
+    ]
+    _export_tables(results, tmp_path)
+    md_text = (tmp_path / "results.md").read_text()
+    for token in ("EM", "Macro-F1", "Weighted-F1", "Halluc", "$/1k req", "$/1M in", "$/1M out"):
+        assert token in md_text, f"{token} missing from Markdown header"
+    # The values must render too — not just the headers
+    assert "0.7800" in md_text  # EM
+    assert "0.0200" in md_text  # hallucination rate
+
+
+def test_export_tables_renders_null_metrics_as_empty(tmp_path):
+    """Extraction-task rows have null EM/F1/halluc — render as empty, not 'None'."""
+    extraction_row = _result_row("qwen3-8b", "cuad", "lora",
+                                  em=None, macro=None, weighted=None, halluc=None)
+    _export_tables([extraction_row], tmp_path)
+    md_text = (tmp_path / "results.md").read_text()
+    assert "None" not in md_text, "Null metrics leaked as 'None' in Markdown"
 
 
 def test_comparison_includes_effect_size(pricing):

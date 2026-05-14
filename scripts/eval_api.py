@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 
 from checkpoint_utils import append_jsonl, finalize_partial, load_partial_ids, partial_path
 from utils import build_messages, load_jsonl, rows_hash as _rows_hash, read_prompt_sha as _read_prompt_sha, seed_sample as _seed_sample
-from pipeline.config import get_model_conditions, get_openai_models, get_tasks
+from pipeline.config import get_model_conditions, get_openai_models, get_reasoning_capable, get_tasks
 from pipeline.log import configure, get_logger
 from pipeline.paths import pred_path, training_meta_path
 from pipeline.providers import call_openai  # noqa: F401  # re-exported for test patching
@@ -32,6 +32,10 @@ load_dotenv(REPO_ROOT / ".env")
 ALL_TASKS: list[str] = get_tasks()
 OPENAI_MODELS: dict[str, Optional[str]] = get_openai_models()
 MODEL_CONDITIONS: dict[str, list[str]] = get_model_conditions()
+REASONING_CAPABLE: dict[str, bool] = get_reasoning_capable()
+
+# OpenAI's lowest-effort reasoning tier — effectively disables the loop.
+REASONING_EFFORT_OFF = "minimal"
 
 SMOKE_MODELS = ["gpt-4.1-nano"]
 PROD_MODELS  = ["gpt-4.1-mini", "gpt-5.5"]
@@ -158,7 +162,15 @@ async def run_eval(
     for row in test_rows:
         row["label"] = label_map.get(row["id"], "")
 
-    few_shot = load_jsonl(few_shot_path)[:5] if few_shot_path.exists() else []
+    # Prefer the curated few-shot pool emitted by prepare_datasets (covers
+    # distinct labels) over the legacy "first 5 of train.jsonl" fallback.
+    curated_few_shot = prepared / "few_shot.jsonl"
+    if not smoke_test and curated_few_shot.exists():
+        few_shot = load_jsonl(curated_few_shot)
+    elif few_shot_path.exists():
+        few_shot = load_jsonl(few_shot_path)[:5]
+    else:
+        few_shot = []
     prompt_sha = _read_prompt_sha(prepared)
     few_shot_hash = _rows_hash(few_shot) if few_shot else None
 
@@ -205,15 +217,21 @@ async def run_eval(
 
     totals = [0, 0]  # [input_tokens, output_tokens]
 
+    # Non-capable models reject the param entirely — only send when supported.
+    reasoning_effort = REASONING_EFFORT_OFF if REASONING_CAPABLE.get(model_id, False) else None
+
     async def process_row(row: dict) -> None:
         msgs = build_messages(row, few_shot, condition)
         ground_truth = row.get("label", "")
         try:
-            text, in_tok, out_tok, lat, ttft = await call_openai(
-                client, model_str, msgs, task_cfg.max_output_tokens, semaphore
+            text, in_tok, out_tok, reasoning_tok, lat, ttft, avg_logprob = await call_openai(
+                client, model_str, msgs, task_cfg.max_output_tokens, semaphore,
+                reasoning_effort=reasoning_effort,
             )
         except Exception as exc:
-            text, in_tok, out_tok, lat, ttft = f"ERROR: {exc}", 0, 0, 0, 0.0
+            text, in_tok, out_tok, reasoning_tok, lat, ttft, avg_logprob = (
+                f"ERROR: {exc}", 0, 0, 0, 0, 0.0, None
+            )
         totals[0] += in_tok
         totals[1] += out_tok
         result = {
@@ -228,12 +246,18 @@ async def run_eval(
             "ground_truth": ground_truth,
             "input_tokens": in_tok,
             "output_tokens": out_tok,
+            "reasoning_tokens": reasoning_tok,
             "latency_ms": lat,
             "ttft_ms": ttft,
+            "avg_logprob": avg_logprob,
             "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
         append_jsonl(result, pp)
 
+    # No API warmup: TLS handshake elevates TTFT on only the first row out of
+    # the full eval set, which is negligible signal vs. the cost of dummy
+    # billed requests. Local vLLM warmup is different — first ~20 requests
+    # pay JIT + CUDA graph capture, so it's warranted there.
     seed_label = f" seed={eval_seed}" if eval_seed > 0 else ""
     _log.info("evaluating", model=model_id, task=task_id, condition=condition, eval_seed=eval_seed,
               n_rows=len(pending_rows), n_total=len(test_rows))

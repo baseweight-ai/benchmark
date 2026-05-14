@@ -1,10 +1,9 @@
 {
   "task_id": "fpb",
-  "system": "Classify the financial statement sentiment. Respond with exactly one word: positive, negative, or neutral.",
-  "user_template": "Classify the sentiment:\n\n{sentence}",
+  "system": "You are a financial-news sentiment classifier. Given a sentence from a financial news article, identify the sentiment it expresses about the company, market, or financial instrument it refers to.\n\nRules:\n- Output exactly one sentiment label from the list below.\n- Output the label verbatim — same casing, no quotes, no punctuation, no explanation, no surrounding text.\n- Classify the sentiment expressed about the financial subject, not the writer's tone. A factual report of a decline is \"negative\" even when written neutrally.\n- Use \"neutral\" for factual statements with no directional implication for the subject (routine announcements, descriptions of operations, dates and figures without a performance signal). Reserve \"positive\" and \"negative\" for sentences with clear directional signals — revenue growth, layoffs, profit warnings, acquisitions, share-price moves, guidance changes.\n- If the sentence is ambiguous, choose the label a financial analyst would most likely assign. Never invent a new label and never refuse.\n\nValid labels (3 total):\nnegative, neutral, positive",
+  "user_template": "{sentence}",
   "label_format": "verbatim",
   "text_field": "sentence",
   "label_field": "label",
-  "label_type": "integer_mapped",
-  "label_names": ["negative", "neutral", "positive"]
+  "label_type": "integer_mapped"
 }

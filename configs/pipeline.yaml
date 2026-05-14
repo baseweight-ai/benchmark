@@ -12,17 +12,25 @@ models:
       conditions: [zero-shot, 5-shot, lora]
 
   api:
+    # reasoning_capable: whether this model accepts the OpenAI reasoning_effort
+    # parameter. When true, eval_api sends reasoning_effort="minimal" to disable
+    # the reasoning loop — keeps every model on the same compute regime so the
+    # cost/latency comparison is apples-to-apples. When false, the parameter is
+    # not sent (non-reasoning models would 400 on it).
     - id: gpt-4.1-nano
       pinned_version: gpt-4.1-nano-2025-04-14
       conditions: [zero-shot, 5-shot, api-sft]
       sft_base_model: gpt-4.1-nano-2025-04-14
+      reasoning_capable: false
     - id: gpt-4.1-mini
       pinned_version: gpt-4.1-mini-2025-04-14
       conditions: [zero-shot, api-sft]
       sft_base_model: gpt-4.1-mini-2025-04-14
+      reasoning_capable: false
     - id: gpt-5.5
       pinned_version: gpt-5.5
       conditions: [5-shot]
+      reasoning_capable: true
 
 stages:
   - id: download

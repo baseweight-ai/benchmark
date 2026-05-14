@@ -103,15 +103,8 @@ def run_sft_train(
     base_model = SFT_BASE_MODELS[model_id]
     mp = meta_path(model_id, task_id)
 
-    require_jsonl(sft_path, min_rows=1, check_chat_format=True)
-
-    if dry_run:
-        if mp.exists() and not force:
-            click.echo(f"  [dry-run] SKIP [{model_id}/{task_id}]: metadata exists")
-        else:
-            click.echo(f"  [dry-run] Would upload {sft_path} and create {base_model} fine-tuning job")
-        return
-
+    # A completed run is the contract — don't re-validate sft_path, which may
+    # have been mutated or removed since the upload succeeded.
     try:
         cached = json.loads(mp.read_text())
         if not force:
@@ -126,6 +119,12 @@ def run_sft_train(
             return
     except FileNotFoundError:
         pass
+
+    if dry_run:
+        click.echo(f"  [dry-run] Would upload {sft_path} and create {base_model} fine-tuning job")
+        return
+
+    require_jsonl(sft_path, min_rows=1, check_chat_format=True)
 
     from openai import OpenAI
     client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))

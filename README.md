@@ -47,23 +47,46 @@ A configurable pipeline for comparing QLoRA fine-tuned open-source models agains
 
 ## Repository layout
 
+The repo is the persistence boundary — everything the pipeline needs to keep
+across runs lives inside it. Nothing under `/workspace`, `$HOME`, or any
+other host-specific path.
+
 ```
 configs/         Task and model YAML configs, pricing
-data/            Raw and prepared datasets (gitignored)
+data/            Raw and prepared datasets        (gitignored)
 prompts/         Per-task prompt templates
 results/         Predictions, classified outputs, summaries (gitignored)
+checkpoints/     HF Trainer checkpoints, train_state.json   (gitignored)
+.cache/          HF, vLLM, torch_inductor, triton, pip caches (gitignored)
+.conda-envs/     Project conda env                (gitignored)
 scripts/         Pipeline scripts
 site/            Static dashboard (Chart.js)
 ```
+
+The only state outside the repo is `$HOME/miniconda3` (the conda installer
+itself, treated as a system tool). `start.sh` reinstalls it if missing, so a
+fresh container or new machine reaches the same working state with one
+command.
 
 ## Quick start
 
 ```bash
 git clone https://github.com/baseweight/baseweight-benchmark.git
 cd baseweight-benchmark
-pip install -r requirements.txt
-cp .env.example .env  # add OPENAI_API_KEY, GOOGLE_API_KEY, HF_TOKEN
+./start.sh                    # installs miniconda + creates the conda env in-repo
+cp .env.example .env          # add OPENAI_API_KEY, GOOGLE_API_KEY, HF_TOKEN
+conda activate ./.conda-envs/baseweight-benchmark
 ```
+
+`start.sh` is idempotent — safe to re-run any time. It detects what's missing
+(miniconda, conda env, env-vars wiring) and provisions only that. When
+`environment.yml` changes, it runs `conda env update --prune`. Force a clean
+rebuild with `./start.sh --recreate-env`.
+
+The conda env's activate hook auto-exports `HF_HOME`, `VLLM_CACHE_ROOT`,
+`TORCHINDUCTOR_CACHE_DIR`, `TRITON_CACHE_DIR`, and `PIP_CACHE_DIR` into
+`<repo>/.cache/`, so `conda activate` is the only setup step a user has to
+remember.
 
 ### 1. Download and prepare a task
 
@@ -120,7 +143,15 @@ Model training configs live in `configs/training/<model_id>.yaml` and control Lo
 
 API pricing is in `configs/pricing.yaml` and feeds cost-per-query and TCO calculations in the dashboard.
 
-## Artifact persistence (remote GPU)
+## Artifact persistence
+
+Everything the pipeline produces — datasets, prepared splits, training
+checkpoints, adapters, predictions, summaries — lives inside the repo. On a
+RunPod-style host where the repo is cloned onto the persistent volume, that
+volume IS the persistence boundary; no separate "network volume" path is
+involved.
+
+For offsite backup or cross-host sharing, use `sync_artifacts.py`:
 
 ```bash
 # Sync everything to HuggingFace (safe to run any time)

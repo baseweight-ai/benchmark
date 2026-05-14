@@ -1,4 +1,6 @@
 """Unit tests for classify_errors.py."""
+from pathlib import Path
+
 import pytest
 
 from classify_errors import (
@@ -113,8 +115,18 @@ def test_is_format_violation_valid_label():
     assert not is_format_violation("positive", ["positive", "negative", "neutral"])
 
 
-def test_is_format_violation_case_insensitive():
-    assert not is_format_violation("POSITIVE", ["positive", "negative", "neutral"])
+def test_is_format_violation_case_sensitive():
+    """Constrained decoding produces exact label strings — case mismatches are
+    real format violations and must be surfaced, not masked."""
+    assert is_format_violation("POSITIVE", ["positive", "negative", "neutral"])
+    assert is_format_violation("Positive", ["positive", "negative", "neutral"])
+
+
+def test_is_format_violation_whitespace_sensitive():
+    """Trailing newlines / surrounding whitespace also count as violations —
+    they indicate the model didn't follow the exact-string contract."""
+    assert is_format_violation("positive\n", ["positive", "negative", "neutral"])
+    assert is_format_violation(" positive", ["positive", "negative", "neutral"])
 
 
 def test_is_format_violation_no_labels():
@@ -146,6 +158,36 @@ def test_classify_classification_format_violation():
 
 def test_classify_classification_priority_empty_beats_refusal():
     assert classify_classification("", "positive", ["positive"]) == "empty"
+
+
+def test_classify_classification_case_mismatch_is_format_violation_not_correct():
+    """A case-mismatched label is a format violation, not a correct answer.
+    Constrained generation should prevent this, but if it slips through, it
+    surfaces as a violation rather than silently passing."""
+    result = classify_classification("POSITIVE", "positive", ["positive", "negative", "neutral"])
+    assert result == "format_violation"
+
+
+def test_classify_classification_case_mismatch_without_label_set_is_wrong():
+    """Without a label set we can't classify it as a format_violation, but
+    strict matching still requires exact equality — case mismatch → wrong."""
+    assert classify_classification("POSITIVE", "positive") == "wrong_class"
+
+
+def test_classify_classification_trailing_whitespace_is_format_violation():
+    """Trailing whitespace from API models without guided_choice → violation."""
+    result = classify_classification("positive\n", "positive", ["positive", "negative"])
+    assert result == "format_violation"
+
+
+def test_classify_classification_banking77_exact_match():
+    """The canonical PolyAI/banking77 label uses mixed case for some intents
+    (e.g. 'Refund_not_showing_up'). Strict matching must respect that."""
+    labels = ["Refund_not_showing_up", "card_arrival"]
+    # Exact match: correct
+    assert classify_classification("Refund_not_showing_up", "Refund_not_showing_up", labels) == "correct"
+    # Lowercased: format_violation (not in the labels list literally)
+    assert classify_classification("refund_not_showing_up", "Refund_not_showing_up", labels) == "format_violation"
 
 
 # ── classify_extraction ────────────────────────────────────────────────────────
@@ -192,10 +234,35 @@ def test_classify_extraction_format_violation_too_long():
 
 # ── compute_metric ─────────────────────────────────────────────────────────────
 
-def _make_task_cfg(task_type: str, metric_id: str, metric_granularity: str = "per_example"):
+def _make_task_cfg(task_type: str, metric_id: str, metric_granularity: str = "per_example",
+                    task_id: str = "toy"):
     from classify_errors import TaskConfig
-    return TaskConfig(task_id="toy", task_type=task_type, metric_id=metric_id,
+    return TaskConfig(task_id=task_id, task_type=task_type, metric_id=metric_id,
                       metric_granularity=metric_granularity)
+
+
+@pytest.fixture
+def summary_from_predictions(tmp_path, monkeypatch):
+    """Write toy prediction rows then run classify and return the summary dict.
+
+    Usage: summary = summary_from_predictions(rows, valid_labels=["positive"])
+    """
+    import classify_errors as ce
+
+    def _build(rows: list[dict], valid_labels: list[str] | None = None) -> dict:
+        import json as _json
+        pred_dir = tmp_path / "results" / "predictions" / "local" / "m" / "fpb"
+        pred_dir.mkdir(parents=True, exist_ok=True)
+        (pred_dir / "lora.jsonl").write_text(
+            "\n".join(_json.dumps(r) for r in rows) + "\n"
+        )
+        monkeypatch.setattr(ce, "REPO_ROOT", tmp_path)
+        cfg = _make_task_cfg("classification", "accuracy", task_id="fpb")
+        return ce.process_model_task_condition(
+            "m", "fpb", "lora", cfg, valid_labels, dry_run=False, source="local"
+        )
+
+    return _build
 
 
 def test_compute_metric_accuracy():
@@ -218,6 +285,140 @@ def test_compute_metric_token_f1():
 def test_compute_metric_empty_rows():
     cfg = _make_task_cfg("classification", "accuracy")
     assert compute_metric(cfg, []) == pytest.approx(0.0)
+
+
+def test_compute_metric_weighted_f1_strict_match():
+    """F1 must compare raw labels — no normalisation. Mixed-case labels from
+    PolyAI/banking77 (e.g. 'Refund_not_showing_up') stay intact through the
+    sklearn call, so a lowercased prediction is correctly counted as wrong."""
+    cfg = _make_task_cfg("classification", "weighted_f1", "per_class_weighted")
+    rows = [
+        {"ground_truth": "Refund_not_showing_up", "predicted_clean": "Refund_not_showing_up"},
+        {"ground_truth": "Refund_not_showing_up", "predicted_clean": "refund_not_showing_up"},
+        {"ground_truth": "card_arrival", "predicted_clean": "card_arrival"},
+    ]
+    # 2 of 3 correct → weighted F1 should be 0.8 (perfect on majority class,
+    # zero on the lowercased mismatch).
+    score = compute_metric(cfg, rows)
+    assert score is not None
+    assert 0.5 < score < 0.9
+
+
+def test_compute_classification_metrics_perfect():
+    """All-correct → EM=1.0, both F1s=1.0, hallucination=0."""
+    from classify_errors import compute_classification_metrics
+    rows = [
+        {"error_category": "correct", "ground_truth": "positive", "predicted_clean": "positive"},
+        {"error_category": "correct", "ground_truth": "negative", "predicted_clean": "negative"},
+        {"error_category": "correct", "ground_truth": "neutral", "predicted_clean": "neutral"},
+    ]
+    out = compute_classification_metrics(rows, ["positive", "negative", "neutral"])
+    assert out["exact_match"] == 1.0
+    assert out["macro_f1"] == 1.0
+    assert out["weighted_f1"] == 1.0
+    assert out["hallucination_rate"] == 0.0
+
+
+def test_compute_classification_metrics_hallucination_is_format_violation_only():
+    """Hallucination_rate is the standard ML definition: only format_violation,
+    not empty / refusal. Those are tracked separately as empty_rate / refusal_rate.
+
+    A hallucination is the model confidently producing something outside the
+    valid label set — refusals and empty outputs are different failure modes."""
+    from classify_errors import compute_classification_metrics
+    rows = [
+        {"error_category": "correct", "ground_truth": "positive", "predicted_clean": "positive"},
+        {"error_category": "empty", "ground_truth": "negative", "predicted_clean": "__INVALID__"},
+        {"error_category": "refusal", "ground_truth": "neutral", "predicted_clean": "__INVALID__"},
+        {"error_category": "format_violation", "ground_truth": "negative", "predicted_clean": "__INVALID__"},
+        {"error_category": "format_violation", "ground_truth": "positive", "predicted_clean": "__INVALID__"},
+        {"error_category": "wrong_class", "ground_truth": "positive", "predicted_clean": "negative"},
+    ]
+    out = compute_classification_metrics(rows, ["positive", "negative", "neutral"])
+    # 2 of 6 are format_violations (not the broader 4 of 6 that includes empty + refusal)
+    assert out["hallucination_rate"] == pytest.approx(2 / 6, abs=1e-4)
+
+
+def test_compute_classification_metrics_no_valid_labels_returns_none_hallucination():
+    """Extraction-style tasks have no closed label list → hallucination_rate is None."""
+    from classify_errors import compute_classification_metrics
+    rows = [{"error_category": "correct", "ground_truth": "x", "predicted_clean": "x"}]
+    out = compute_classification_metrics(rows, None)
+    assert out["hallucination_rate"] is None
+    # EM and F1 still computable
+    assert out["exact_match"] == 1.0
+
+
+def test_compute_classification_metrics_empty_rows_returns_nones():
+    from classify_errors import compute_classification_metrics
+    out = compute_classification_metrics([], ["a", "b"])
+    assert all(v is None for v in out.values())
+
+
+def test_compute_classification_metrics_macro_vs_weighted_diverge_on_imbalanced():
+    """Macro and weighted F1 should differ when classes are imbalanced and the
+    model performs differently on rare vs common classes."""
+    from classify_errors import compute_classification_metrics
+    # "positive" is 4/5 of the data; model is perfect on positive, fails on negative.
+    rows = (
+        [{"error_category": "correct", "ground_truth": "positive", "predicted_clean": "positive"}] * 4
+        + [{"error_category": "wrong_class", "ground_truth": "negative", "predicted_clean": "positive"}]
+    )
+    out = compute_classification_metrics(rows, ["positive", "negative"])
+    # Weighted-F1 is dominated by the majority class → high. Macro-F1 averages
+    # the per-class scores equally → much lower (negative-class F1 is 0).
+    assert out["weighted_f1"] > out["macro_f1"]
+
+
+def _pred_row(**overrides) -> dict:
+    base = {
+        "id": "r0", "model": "m", "condition": "lora",
+        "output": "positive", "ground_truth": "positive",
+        "input_tokens": 10, "output_tokens": 1, "reasoning_tokens": 0,
+        "latency_ms": 100.0, "ttft_ms": 0.0,
+        "timestamp": "2026-01-01T00:00:00Z",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_summary_includes_latency_p50_p99_from_predictions(summary_from_predictions):
+    """Per-row latency_ms aggregates into p50 / p99 percentile fields."""
+    rows = [_pred_row(id=f"r{i}", latency_ms=float(i + 1)) for i in range(100)]
+    r = summary_from_predictions(rows, valid_labels=["positive"])
+    # linear-interpolation percentile: 50th of 1..100 → 50.5; 99th → 99.01.
+    assert r["latency_p50_ms"] == 50.5
+    assert r["latency_p99_ms"] == 99.0
+
+
+def test_summary_aggregates_avg_logprob(summary_from_predictions):
+    """avg_logprob aggregates into summary mean + p10."""
+    rows = [_pred_row(id=f"r{i}", avg_logprob=-1.0 + i * 0.1) for i in range(10)]
+    r = summary_from_predictions(rows, valid_labels=["positive"])
+    # Mean of -1.0 .. -0.1 step 0.1 = -0.55; p10 is the worst-confidence bucket.
+    assert r["avg_logprob"] == pytest.approx(-0.55, abs=1e-3)
+    assert r["p10_logprob"] is not None
+    assert r["p10_logprob"] <= r["avg_logprob"]
+
+
+def test_summary_handles_missing_logprob_gracefully(summary_from_predictions):
+    """No prediction row has avg_logprob → summary fields stay None, not 0."""
+    r = summary_from_predictions([_pred_row()], valid_labels=["positive"])
+    assert r["avg_logprob"] is None
+    assert r["p10_logprob"] is None
+
+
+def test_compute_metric_weighted_f1_invalid_sentinel_counts_as_wrong():
+    """Empty/refusal/format_violation rows are mapped to '__INVALID__' so they
+    don't accidentally match any real label — they cleanly count as wrong."""
+    cfg = _make_task_cfg("classification", "weighted_f1", "per_class_weighted")
+    rows = [
+        {"ground_truth": "positive", "predicted_clean": "positive"},
+        {"ground_truth": "negative", "predicted_clean": "__INVALID__"},
+    ]
+    score = compute_metric(cfg, rows)
+    # One correct, one wrong → F1 < 1.0
+    assert score is not None and score < 1.0
 
 
 # ── classify_predictions (full pipeline) ──────────────────────────────────────
@@ -250,12 +451,21 @@ def test_classify_predictions_extraction():
 
 # ── get_valid_labels ───────────────────────────────────────────────────────────
 
-def test_get_valid_labels_fpb():
+def _write_label_set(repo_root, task_id: str, labels: list[str]) -> None:
+    import json
+    d = repo_root / "data" / "prepared" / task_id
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "labels.json").write_text(json.dumps(labels))
+
+
+def test_get_valid_labels_fpb(tmp_repo_root):
+    _write_label_set(tmp_repo_root, "fpb", ["negative", "neutral", "positive"])
     labels = get_valid_labels("fpb")
     assert set(labels) == {"positive", "negative", "neutral"}
 
 
-def test_get_valid_labels_medmcqa():
+def test_get_valid_labels_medmcqa(tmp_repo_root):
+    _write_label_set(tmp_repo_root, "medmcqa", ["A", "B", "C", "D"])
     labels = get_valid_labels("medmcqa")
     assert set(labels) == {"A", "B", "C", "D"}
 
@@ -346,18 +556,80 @@ def test_aggregate_seed_summaries_cv_none_for_zero_mean():
     assert agg["metric_cv"] is None
 
 
+def test_aggregate_seed_summaries_sums_reasoning_and_answer_tokens():
+    """Token decomposition must be summed across seeds, mirroring single-seed schema."""
+    summaries = [
+        {**_make_seed_summary(0.80), "total_reasoning_tokens": 0, "total_answer_tokens": 1500},
+        {**_make_seed_summary(0.82), "total_reasoning_tokens": 50, "total_answer_tokens": 1450},
+    ]
+    agg = aggregate_seed_summaries(summaries)
+    assert agg["total_reasoning_tokens"] == 50
+    assert agg["total_answer_tokens"] == 2950
+
+
+def test_aggregate_seed_summaries_averages_classification_metrics():
+    """EM, macro_f1, weighted_f1, hallucination_rate are averaged across seeds."""
+    summaries = [
+        {**_make_seed_summary(0.80),
+         "exact_match": 0.78, "macro_f1": 0.75, "weighted_f1": 0.80, "hallucination_rate": 0.05},
+        {**_make_seed_summary(0.82),
+         "exact_match": 0.82, "macro_f1": 0.79, "weighted_f1": 0.82, "hallucination_rate": 0.03},
+    ]
+    agg = aggregate_seed_summaries(summaries)
+    assert agg["exact_match"] == pytest.approx(0.80, abs=1e-4)
+    assert agg["macro_f1"] == pytest.approx(0.77, abs=1e-4)
+    assert agg["weighted_f1"] == pytest.approx(0.81, abs=1e-4)
+    assert agg["hallucination_rate"] == pytest.approx(0.04, abs=1e-4)
+
+
+def test_aggregate_seed_summaries_missing_classification_metrics_returns_none():
+    """Seeds that pre-date the new fields → averaged value is None, not 0."""
+    summaries = [_make_seed_summary(0.80), _make_seed_summary(0.82)]
+    agg = aggregate_seed_summaries(summaries)
+    assert agg["exact_match"] is None
+    assert agg["macro_f1"] is None
+    assert agg["weighted_f1"] is None
+    assert agg["hallucination_rate"] is None
+
+
+def test_aggregate_seed_summaries_handles_missing_reasoning_fields():
+    """Legacy summaries without reasoning fields default to 0 — backwards compat."""
+    summaries = [_make_seed_summary(0.80), _make_seed_summary(0.82)]
+    agg = aggregate_seed_summaries(summaries)
+    assert agg["total_reasoning_tokens"] == 0
+    assert agg["total_answer_tokens"] == 0
+
+
 def test_aggregate_seed_summaries_propagates_granularity():
     summaries = [_make_seed_summary(0.80), _make_seed_summary(0.84)]
     agg = aggregate_seed_summaries(summaries)
     assert agg["metric_granularity"] == "per_class_weighted"
 
 
-def test_get_valid_labels_banking77_none():
-    assert get_valid_labels("banking77") is None
+def test_get_valid_labels_reads_sidecar(tmp_repo_root):
+    """labels.json content is returned verbatim when present."""
+    import json
+    task_dir = tmp_repo_root / "data" / "prepared" / "banking77"
+    task_dir.mkdir(parents=True, exist_ok=True)
+    labels = ["activate_my_card", "card_arrival", "lost_or_stolen_card"]
+    (task_dir / "labels.json").write_text(json.dumps(labels))
+    assert get_valid_labels("banking77") == labels
 
 
-def test_get_valid_labels_cuad_none():
+def test_get_valid_labels_missing_sidecar_none(tmp_repo_root):
+    """Free-form tasks (no labels.json) → None, signalling no format check."""
+    (tmp_repo_root / "data" / "prepared" / "cuad").mkdir(parents=True, exist_ok=True)
     assert get_valid_labels("cuad") is None
+
+
+def test_get_valid_labels_malformed_sidecar_none(tmp_repo_root):
+    """Defensive: a corrupt sidecar (not a non-empty list) is treated as absent."""
+    task_dir = tmp_repo_root / "data" / "prepared" / "task"
+    task_dir.mkdir(parents=True, exist_ok=True)
+    (task_dir / "labels.json").write_text("[]")
+    assert get_valid_labels("task") is None
+    (task_dir / "labels.json").write_text('{"not": "a list"}')
+    assert get_valid_labels("task") is None
 
 
 # ── compute_axis_scores ────────────────────────────────────────────────────────

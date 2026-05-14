@@ -121,23 +121,23 @@ def test_load_partial_ids_skips_empty_id(tmp_path):
 
 # ── checkpoint_dir / find_hf_resume_checkpoint ────────────────────────────────
 
-def test_checkpoint_dir_path(tmp_network_volume):
+def test_checkpoint_dir_path(tmp_checkpoints_root):
     d = checkpoint_dir("qwen3-8b", "banking77", "lora-500")
-    assert d == tmp_network_volume / "checkpoints" / "qwen3-8b" / "banking77" / "lora-500"
+    assert d == tmp_checkpoints_root / "qwen3-8b" / "banking77" / "lora-500"
 
 
-def test_find_hf_resume_checkpoint_no_dir(tmp_network_volume):
+def test_find_hf_resume_checkpoint_no_dir(tmp_checkpoints_root):
     result = find_hf_resume_checkpoint("qwen3-8b", "banking77", "lora-500")
     assert result is None
 
 
-def test_find_hf_resume_checkpoint_empty_dir(tmp_network_volume):
+def test_find_hf_resume_checkpoint_empty_dir(tmp_checkpoints_root):
     ckpt_dir = checkpoint_dir("qwen3-8b", "banking77", "lora-500")
     ckpt_dir.mkdir(parents=True)
     assert find_hf_resume_checkpoint("qwen3-8b", "banking77", "lora-500") is None
 
 
-def test_find_hf_resume_checkpoint_returns_latest(tmp_network_volume):
+def test_find_hf_resume_checkpoint_returns_latest(tmp_checkpoints_root):
     ckpt_dir = checkpoint_dir("qwen3-8b", "banking77", "lora-500")
     for n in [1, 5, 3]:
         (ckpt_dir / f"checkpoint-{n}").mkdir(parents=True)
@@ -148,7 +148,7 @@ def test_find_hf_resume_checkpoint_returns_latest(tmp_network_volume):
 
 # ── save_train_state / load_train_state ───────────────────────────────────────
 
-def test_save_load_train_state_roundtrip(tmp_network_volume):
+def test_save_load_train_state_roundtrip(tmp_checkpoints_root):
     save_train_state("qwen3-8b", "fpb", "lora-500", {"status": "complete", "eval_loss": 0.42})
     state = load_train_state("qwen3-8b", "fpb", "lora-500")
     assert state is not None
@@ -157,11 +157,11 @@ def test_save_load_train_state_roundtrip(tmp_network_volume):
     assert "saved_at" in state
 
 
-def test_load_train_state_missing(tmp_network_volume):
+def test_load_train_state_missing(tmp_checkpoints_root):
     assert load_train_state("qwen3-8b", "fpb", "lora-500") is None
 
 
-def test_save_train_state_adds_timestamp(tmp_network_volume):
+def test_save_train_state_adds_timestamp(tmp_checkpoints_root):
     t_before = time.time()
     save_train_state("qwen3-8b", "fpb", "lora-500", {"status": "in_progress"})
     state = load_train_state("qwen3-8b", "fpb", "lora-500")

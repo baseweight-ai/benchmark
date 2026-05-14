@@ -207,35 +207,32 @@ def main():
 
         # ── train_state.json integration ──────────────────────────────────────
         print("\n[bonus] Verifying checkpoint_utils state management...")
+        import checkpoint_utils
         from checkpoint_utils import (
-            checkpoint_dir as ckpt_dir_fn,
             find_hf_resume_checkpoint,
             load_train_state,
             save_train_state,
         )
-        import os
-        os.environ["NETWORK_VOLUME"] = tmpdir
+        orig_ckpt_root = checkpoint_utils.CHECKPOINTS_ROOT
+        checkpoint_utils.CHECKPOINTS_ROOT = Path(tmpdir) / "checkpoints"
+        try:
+            save_train_state("test-model", "fpb", "lora", {"status": "complete", "eval_loss": losses_p2[-1]})
+            state = load_train_state("test-model", "fpb", "lora")
+            assert state is not None
+            assert state["status"] == "complete"
+            assert math.isfinite(state["eval_loss"])
+            print(f"  train_state.json: status={state['status']}, eval_loss={state['eval_loss']:.4f} ✓")
 
-        # Reload NETWORK_VOLUME since it's computed at import time
-        import checkpoint_utils
-        checkpoint_utils.NETWORK_VOLUME = Path(tmpdir)
-
-        save_train_state("test-model", "fpb", "lora", {"status": "complete", "eval_loss": losses_p2[-1]})
-        state = load_train_state("test-model", "fpb", "lora")
-        assert state is not None
-        assert state["status"] == "complete"
-        assert math.isfinite(state["eval_loss"])
-        print(f"  train_state.json: status={state['status']}, eval_loss={state['eval_loss']:.4f} ✓")
-
-        # Place a checkpoint dir where checkpoint_utils expects it
-        nv_ckpt_dir = checkpoint_utils.NETWORK_VOLUME / "checkpoints" / "test-model" / "fpb" / "lora"
-        nv_ckpt_dir.mkdir(parents=True)
-        (nv_ckpt_dir / "checkpoint-3").mkdir()
-        (nv_ckpt_dir / "checkpoint-7").mkdir()
-        found = find_hf_resume_checkpoint("test-model", "fpb", "lora")
-        assert found is not None
-        assert found.name == "checkpoint-7"
-        print(f"  find_hf_resume_checkpoint: {found.name} ✓")
+            ckpt_dir = checkpoint_utils.CHECKPOINTS_ROOT / "test-model" / "fpb" / "lora"
+            ckpt_dir.mkdir(parents=True)
+            (ckpt_dir / "checkpoint-3").mkdir()
+            (ckpt_dir / "checkpoint-7").mkdir()
+            found = find_hf_resume_checkpoint("test-model", "fpb", "lora")
+            assert found is not None
+            assert found.name == "checkpoint-7"
+            print(f"  find_hf_resume_checkpoint: {found.name} ✓")
+        finally:
+            checkpoint_utils.CHECKPOINTS_ROOT = orig_ckpt_root
 
     print("\n=== All smoke checks passed ✓ ===\n")
 

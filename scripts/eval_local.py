@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 from checkpoint_utils import append_jsonl, atomic_write_json, finalize_partial, load_partial_ids, partial_path
 from utils import build_messages, load_jsonl, rows_hash as _rows_hash, read_prompt_sha as _read_prompt_sha, seed_sample as _seed_sample
 from pipeline.config import get_local_models, get_tasks
+from pipeline.hardware import check_allowed_gpu, get_current_gpu_name
 from pipeline.log import configure, get_logger
 from pipeline.paths import adapter_path, pred_path
 from pipeline.providers import call_vllm  # noqa: F401  # re-exported for test patching
@@ -38,6 +39,8 @@ ALL_TASKS: list[str] = get_tasks()
 ALL_MODELS: list[str] = [m["id"] for m in get_local_models()]
 
 MAX_CONCURRENCY = 4
+# Discarded warmup requests — removes cold-start (JIT, CUDA graphs, KV cache).
+WARMUP_REQUESTS = 20
 VLLM_HOST = "http://localhost:8000"
 VLLM_HEALTH_TIMEOUT_GPU = 1200
 VLLM_HEALTH_TIMEOUT_SMOKE = 300
@@ -80,6 +83,21 @@ def get_test_path(task_id: str, smoke_test: bool) -> Path:
     return prepared / ("smoke_test.jsonl" if smoke_test else "test.jsonl")
 
 
+def load_label_set(task_id: str) -> Optional[list[str]]:
+    """Return the closed label set written by prepare_datasets, or None.
+
+    Presence of labels.json is the signal that guided decoding applies — the
+    file is emitted exactly when the task has a finite output vocabulary.
+    """
+    p = REPO_ROOT / "data" / "prepared" / task_id / "labels.json"
+    if not p.exists():
+        return None
+    labels = json.loads(p.read_text())
+    if not isinstance(labels, list) or not labels:
+        return None
+    return [str(s) for s in labels]
+
+
 def load_test_rows(task_id: str, smoke_test: bool, eval_seed: int = 0) -> list[dict]:
     """Load test prompts joined with their labels by id.
 
@@ -115,8 +133,20 @@ def _pred_path(model_short: str, task_id: str, condition: str) -> Path:
 
 
 def get_few_shot(task_id: str, model_short: str, smoke_test: bool) -> list[dict]:
-    """Return first 5 rows of the appropriate train file."""
+    """Return up to 5 few-shot examples.
+
+    Prefers the curated few_shot.jsonl emitted by prepare_datasets (covers
+    distinct classes deterministically) over the legacy "first 5 of train.jsonl"
+    fallback. The curated file is reproducibly built at prepare time and
+    versioned via prompt_sha + train_sha, so few_shot_hash changes track upstream
+    data changes correctly.
+    """
     prepared = REPO_ROOT / "data" / "prepared" / task_id
+    if not smoke_test:
+        curated = prepared / "few_shot.jsonl"
+        if curated.exists():
+            return load_jsonl(curated)
+
     if smoke_test:
         train_path = prepared / "smoke_train.jsonl"
     else:
@@ -179,6 +209,7 @@ def start_vllm_server(
     max_seq_length: int,
     vllm_task: str = "auto",
     smoke_test: bool = False,
+    max_concurrent: int = 64,
 ) -> subprocess.Popen:
     """Start a vLLM server.
 
@@ -212,7 +243,9 @@ def start_vllm_server(
         "--port", "8000",
         "--gpu-memory-utilization", gpu_mem_util,
         "--swap-space", "0",
-        "--max-num-seqs", str(MAX_CONCURRENCY * 2),
+        # Sized so the highest batch-size profile (typically 32) can actually
+        # batch. Lower client concurrency just under-utilises this ceiling.
+        "--max-num-seqs", str(max_concurrent),
     ]
     if smoke_test:
         cmd += ["--enforce-eager"]
@@ -280,9 +313,15 @@ async def run_eval(
     dry_run: bool,
     smoke_test: bool = False,
     eval_seed: int = 0,
+    concurrency: int = MAX_CONCURRENCY,
 ) -> None:
     """Run eval for one (task, condition). model_name is passed directly to vLLM:
     use model_cfg.model_id for base conditions, 'adapter_{task_id}' for LoRA.
+
+    concurrency: client-side asyncio semaphore limit. The default (4) preserves
+    legacy behaviour. Other values (e.g. 1 for single-user latency, 32 for
+    high-traffic throughput) get suffixed in the output path as `_bs{N}` so
+    the regimes are stored side-by-side and don't overwrite each other.
     """
     import aiohttp
 
@@ -297,7 +336,10 @@ async def run_eval(
 
     test_rows = load_test_rows(task_id, smoke_test, eval_seed)
 
+    # Suffix order: seed first, batch-size second (orthogonal).
     cond_key = condition if eval_seed == 0 else f"{condition}_seed{eval_seed}"
+    if concurrency != MAX_CONCURRENCY:
+        cond_key = f"{cond_key}_bs{concurrency}"
     out_path = (
         REPO_ROOT / "results" / "predictions" / "local"
         / model_cfg.model_short / task_id / f"{cond_key}.jsonl"
@@ -325,21 +367,30 @@ async def run_eval(
         click.echo(f"  All {len(test_rows)} rows complete, finalized to {out_path.relative_to(REPO_ROOT)}")
         return
 
-    semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+    semaphore = asyncio.Semaphore(concurrency)
     totals = [0, 0]  # [input_tokens, output_tokens]
     chat_template_kwargs = (
         {"enable_thinking": False} if model_cfg.enable_thinking is False else None
     )
+    # Closed-set tasks (banking77, fpb, ledgar, medmcqa) get vLLM's guided_choice
+    # constraint, which pins decoding to one of the valid labels. Free-form tasks
+    # (cuad extraction) skip this — labels.json is absent for them.
+    guided_choice = load_label_set(task_id)
+    if guided_choice:
+        click.echo(f"  guided_choice: {len(guided_choice)} labels for {task_id}")
 
     async def process_row(row: dict, session: "aiohttp.ClientSession") -> None:
         msgs = build_messages(row, few_shot, condition)
         try:
-            text, in_tok, out_tok, lat, ttft = await call_vllm(
+            text, in_tok, out_tok, reasoning_tok, lat, ttft, avg_logprob = await call_vllm(
                 session, model_name, msgs, task_cfg.max_output_tokens, semaphore,
                 chat_template_kwargs=chat_template_kwargs,
+                guided_choice=guided_choice,
             )
         except Exception as exc:
-            text, in_tok, out_tok, lat, ttft = f"ERROR: {exc}", 0, 0, 0.0, 0.0
+            text, in_tok, out_tok, reasoning_tok, lat, ttft, avg_logprob = (
+                f"ERROR: {exc}", 0, 0, 0, 0.0, 0.0, None
+            )
         totals[0] += in_tok
         totals[1] += out_tok
         result = {
@@ -354,19 +405,50 @@ async def run_eval(
             "ground_truth": row.get("label", ""),
             "input_tokens": in_tok,
             "output_tokens": out_tok,
+            "reasoning_tokens": reasoning_tok,
             "latency_ms": lat,
             "ttft_ms": ttft,
+            "avg_logprob": avg_logprob,
             "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
         append_jsonl(result, pp)
+
+    async def _warmup(session: "aiohttp.ClientSession") -> None:
+        """Send WARMUP_REQUESTS dummy requests and discard their latency.
+
+        Uses the first test row as the warmup prompt — same model/adapter,
+        same prompt structure, so the warmup exercises the actual hot path
+        (LoRA load, CUDA graphs, KV cache). Errors are swallowed: a warmup
+        failure shouldn't block the real eval.
+        """
+        if not pending_rows:
+            return
+        warm_msg = build_messages(pending_rows[0], few_shot, condition)
+        n = min(WARMUP_REQUESTS, max(5, len(pending_rows)))
+        click.echo(f"  Warming up: {n} requests through {model_name}...")
+
+        async def _one() -> None:
+            try:
+                await call_vllm(
+                    session, model_name, warm_msg, task_cfg.max_output_tokens, semaphore,
+                    chat_template_kwargs=chat_template_kwargs,
+                    guided_choice=guided_choice,
+                )
+            except Exception:
+                pass
+
+        await asyncio.gather(*[_one() for _ in range(n)])
 
     seed_label = f" seed={eval_seed}" if eval_seed > 0 else ""
     _log.info("evaluating", model=model_cfg.model_short, task=task_id, condition=condition, eval_seed=eval_seed,
               n_rows=len(pending_rows), n_total=len(test_rows))
     click.echo(f"  Evaluating {model_cfg.model_short}/{task_id}/{condition}{seed_label} ({len(pending_rows)}/{len(test_rows)} rows)...")
     from tqdm.asyncio import tqdm
-    t_wall_start = time.time()
     async with aiohttp.ClientSession() as session:
+        await _warmup(session)
+        # Wall-time clock starts AFTER warmup so cold-start cost doesn't
+        # pollute throughput / cost-per-query downstream.
+        t_wall_start = time.time()
         await tqdm.gather(
             *[process_row(r, session) for r in pending_rows],
             desc=f"{model_cfg.model_short}/{task_id}",
@@ -375,10 +457,17 @@ async def run_eval(
 
     finalize_partial(pp, out_path)
 
-    # Write wall time sidecar — vLLM batches cause all per-row timestamps to
-    # collapse to the same millisecond, making timestamp-derived wall time useless.
+    # vLLM batches collapse per-row timestamps to the same millisecond, so
+    # wall time can't be derived from the timestamp range — record it here.
     wall_path = out_path.with_suffix(".wall.json")
-    atomic_write_json({"eval_wall_time_s": eval_wall_time_s}, wall_path)
+    atomic_write_json(
+        {
+            "eval_wall_time_s": eval_wall_time_s,
+            "gpu_model": get_current_gpu_name(),
+            "concurrency": concurrency,
+        },
+        wall_path,
+    )
 
     total_toks = totals[0] + totals[1]
     tok_per_s = round(total_toks / eval_wall_time_s) if eval_wall_time_s and total_toks else None
@@ -400,9 +489,12 @@ async def run_eval(
 @click.option("--condition", default="all", help="zero-shot|5-shot|lora|all")
 @click.option("--eval-seed", "eval_seed", default=0, type=int,
               help="Evaluation seed (0 = deterministic sample; >0 resamples from test_full.jsonl)")
+@click.option("--serving-profile", "serving_profile", default=None,
+              help="Comma-separated batch sizes to sweep (e.g. '1,32'). Each value runs a separate eval at that client-concurrency; outputs are written to {condition}_bs{N}.jsonl. Default: single run at MAX_CONCURRENCY.")
 @click.option("--dry-run", is_flag=True, help="Validate without running inference")
 @click.option("--smoke-test", is_flag=True, help="Use smoke test data and model; mirrors train_local.py --smoke-test")
-def main(model: Optional[str], task: str, condition: str, eval_seed: int, dry_run: bool, smoke_test: bool) -> None:
+def main(model: Optional[str], task: str, condition: str, eval_seed: int,
+         serving_profile: Optional[str], dry_run: bool, smoke_test: bool) -> None:
     """Evaluate local fine-tuned models via vLLM server.
 
     Starts one vLLM server per model with all available LoRA adapters loaded
@@ -410,11 +502,19 @@ def main(model: Optional[str], task: str, condition: str, eval_seed: int, dry_ru
     LoRA conditions are served from the same running instance.
     """
     configure(REPO_ROOT)
+    check_allowed_gpu(skip=smoke_test or dry_run)
     if model is None:
         model = "qwen2.5-0.5b" if smoke_test else "qwen3-8b"
     model_ids = ALL_MODELS if model == "all" else [model]
     task_ids = ALL_TASKS if task == "all" else [task]
     conditions = ["zero-shot", "5-shot", "lora"] if condition == "all" else [condition]
+
+    if serving_profile:
+        concurrencies = [int(n) for n in serving_profile.split(",") if n.strip()]
+        if not concurrencies:
+            raise click.UsageError(f"--serving-profile parsed to empty list from {serving_profile!r}")
+    else:
+        concurrencies = [MAX_CONCURRENCY]
 
     failures = []
 
@@ -451,9 +551,13 @@ def main(model: Optional[str], task: str, condition: str, eval_seed: int, dry_ru
                 else:
                     click.echo(f"  SKIP [{mid}/{tid}/lora]: adapter not found at {ap}")
 
-        # Build the full work list, checking idempotency up front.
-        cond_key_for = lambda cond: cond if eval_seed == 0 else f"{cond}_seed{eval_seed}"
-        pending: list[tuple[str, str, TaskConfig, str]] = []
+        def _cond_key_for(cond: str, conc: int) -> str:
+            k = cond if eval_seed == 0 else f"{cond}_seed{eval_seed}"
+            if conc != MAX_CONCURRENCY:
+                k = f"{k}_bs{conc}"
+            return k
+
+        pending: list[tuple[str, str, TaskConfig, str, int]] = []
         for tid, task_cfg in task_cfgs.items():
             for cond in conditions:
                 if cond in task_cfg.skip_conditions:
@@ -462,21 +566,24 @@ def main(model: Optional[str], task: str, condition: str, eval_seed: int, dry_ru
                 if cond == "lora" and f"adapter_{tid}" not in lora_modules:
                     continue  # already reported above
                 model_name = f"adapter_{tid}" if cond == "lora" else model_cfg.model_id
-                if not dry_run and _pred_path(model_cfg.model_short, tid, cond_key_for(cond)).exists():
-                    click.echo(f"  SKIP [{mid}/{tid}/{cond_key_for(cond)}]: already complete")
-                    continue
-                pending.append((tid, cond, task_cfg, model_name))
+                for conc in concurrencies:
+                    if not dry_run and _pred_path(model_cfg.model_short, tid, _cond_key_for(cond, conc)).exists():
+                        click.echo(f"  SKIP [{mid}/{tid}/{_cond_key_for(cond, conc)}]: already complete")
+                        continue
+                    pending.append((tid, cond, task_cfg, model_name, conc))
 
         if dry_run:
-            for tid, cond, task_cfg, model_name in pending:
+            for tid, cond, task_cfg, model_name, conc in pending:
                 try:
-                    asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, model_name, dry_run=True, smoke_test=smoke_test, eval_seed=eval_seed))
+                    asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, model_name,
+                                         dry_run=True, smoke_test=smoke_test,
+                                         eval_seed=eval_seed, concurrency=conc))
                 except Exception as exc:
-                    click.echo(f"  ERROR [{mid}/{tid}/{cond}]: {exc}", err=True)
+                    click.echo(f"  ERROR [{mid}/{tid}/{cond}/bs{conc}]: {exc}", err=True)
                     _log.error(f"eval failed: {type(exc).__name__}: {exc}",
                                model=mid, task=tid, condition=cond,
                                exc=str(exc), traceback=_tb.format_exc())
-                    failures.append((f"{mid}/{tid}/{cond}", str(exc)))
+                    failures.append((f"{mid}/{tid}/{cond}/bs{conc}", str(exc)))
             continue
 
         if not pending:
@@ -485,23 +592,28 @@ def main(model: Optional[str], task: str, condition: str, eval_seed: int, dry_ru
 
         # Start one server for ALL tasks and conditions of this model.
         # Base-model requests use model_cfg.model_id; LoRA requests use adapter_{tid}.
+        # max_concurrent sized to the largest profile so high-BS conditions
+        # actually batch (a profile of [1, 32] needs --max-num-seqs ≥ 32).
         proc = start_vllm_server(
             model_cfg.model_id, lora_modules, seq_len,
             model_cfg.vllm_task, smoke_test,
+            max_concurrent=max(max(concurrencies) * 2, 8),
         )
         try:
             ready = asyncio.run(wait_for_vllm(proc, timeout=_vllm_health_timeout(smoke_test)))
             if not ready:
                 raise RuntimeError("vLLM server did not become ready in time")
-            for tid, cond, task_cfg, model_name in pending:
+            for tid, cond, task_cfg, model_name, conc in pending:
                 try:
-                    asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, model_name, dry_run=False, smoke_test=smoke_test, eval_seed=eval_seed))
+                    asyncio.run(run_eval(model_cfg, tid, cond, task_cfg, model_name,
+                                         dry_run=False, smoke_test=smoke_test,
+                                         eval_seed=eval_seed, concurrency=conc))
                 except Exception as exc:
-                    click.echo(f"  ERROR [{mid}/{tid}/{cond}]: {exc}", err=True)
+                    click.echo(f"  ERROR [{mid}/{tid}/{cond}/bs{conc}]: {exc}", err=True)
                     _log.error(f"eval failed: {type(exc).__name__}: {exc}",
                                model=mid, task=tid, condition=cond,
                                exc=str(exc), traceback=_tb.format_exc())
-                    failures.append((f"{mid}/{tid}/{cond}", str(exc)))
+                    failures.append((f"{mid}/{tid}/{cond}/bs{conc}", str(exc)))
         except Exception as exc:
             click.echo(f"  ERROR [{mid}]: {exc}", err=True)
             _log.error(f"vLLM server error: {type(exc).__name__}: {exc}",

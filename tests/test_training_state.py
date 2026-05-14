@@ -5,7 +5,7 @@ Unsloth, TRL, and transformers are all mocked. These tests verify:
   - In-progress state is written before training starts
   - _CheckpointCallback persists epoch state on each save
   - Completed state is written after training finishes
-  - Final adapter is mirrored to the network volume via shutil.copytree
+  - Final adapter is mirrored to the checkpoint dir via shutil.copytree
   - Training resumes from the latest checkpoint when one exists
 """
 from __future__ import annotations
@@ -85,11 +85,10 @@ def mock_ml_modules():
 
 
 @pytest.fixture
-def train_env(tmp_path, monkeypatch, tmp_network_volume):
-    """Full environment: redirect REPO_ROOT + NETWORK_VOLUME for train_local.py."""
+def train_env(tmp_path, monkeypatch, tmp_checkpoints_root):
+    """Full environment: redirect REPO_ROOT for train_local.py; CHECKPOINTS_ROOT comes from tmp_checkpoints_root."""
     import train_local as train
     monkeypatch.setattr(train, "REPO_ROOT", tmp_path)
-    monkeypatch.setattr(checkpoint_utils, "NETWORK_VOLUME", tmp_network_volume)
 
     from train_local import ModelConfig, TaskConfig
     model_cfg = ModelConfig(
@@ -136,7 +135,7 @@ def train_env(tmp_path, monkeypatch, tmp_network_volume):
 
 # ── Tests ──────────────────────────────────────────────────────────────────────
 
-def test_train_one_skips_complete_condition(train_env, tmp_network_volume):
+def test_train_one_skips_complete_condition(train_env, tmp_checkpoints_root):
     """If train_state.json says 'complete', train_one returns without training."""
     import train_local as train
 
@@ -153,8 +152,8 @@ def test_train_one_skips_complete_condition(train_env, tmp_network_volume):
     assert result.get("model_id") == "test-model"
 
 
-def test_train_one_writes_in_progress_state(train_env, tmp_network_volume, mock_ml_modules):
-    """Training starts by writing status=in_progress to the network volume."""
+def test_train_one_writes_in_progress_state(train_env, tmp_checkpoints_root, mock_ml_modules):
+    """Training starts by writing status=in_progress to the checkpoint dir."""
     import train_local as train
 
     e = train_env
@@ -166,7 +165,7 @@ def test_train_one_writes_in_progress_state(train_env, tmp_network_volume, mock_
     assert state["status"] == "complete"
 
 
-def test_train_one_writes_complete_state(train_env, tmp_network_volume, mock_ml_modules):
+def test_train_one_writes_complete_state(train_env, tmp_checkpoints_root, mock_ml_modules):
     """After training, train_state.json has status=complete with eval_loss."""
     import train_local as train
 
@@ -179,7 +178,7 @@ def test_train_one_writes_complete_state(train_env, tmp_network_volume, mock_ml_
     assert state["eval_loss"] == pytest.approx(0.42)
 
 
-def test_train_one_writes_metadata_atomically(train_env, tmp_network_volume, mock_ml_modules):
+def test_train_one_writes_metadata_atomically(train_env, tmp_checkpoints_root, mock_ml_modules):
     """metadata.json is written atomically (no .tmp residue)."""
     import train_local as train
 
@@ -194,7 +193,7 @@ def test_train_one_writes_metadata_atomically(train_env, tmp_network_volume, moc
     assert data["task_id"] == "toy"
 
 
-def test_train_one_mirrors_adapter_to_network_volume(train_env, tmp_network_volume, mock_ml_modules):
+def test_train_one_mirrors_adapter_to_checkpoint_dir(train_env, tmp_checkpoints_root, mock_ml_modules):
     """Adapter is copied (via shutil.copytree) to ckpt_dir/final_adapter."""
     import train_local as train
 
@@ -214,8 +213,8 @@ def test_train_one_mirrors_adapter_to_network_volume(train_env, tmp_network_volu
     assert "adapters" in str(copied_src[0])
 
 
-def test_train_one_passes_resume_checkpoint_to_trainer(train_env, tmp_network_volume, mock_ml_modules):
-    """If a checkpoint-N dir exists on the network volume, it is passed to trainer.train()."""
+def test_train_one_passes_resume_checkpoint_to_trainer(train_env, tmp_checkpoints_root, mock_ml_modules):
+    """If a checkpoint-N dir exists in the checkpoints root, it is passed to trainer.train()."""
     import train_local as train
 
     e = train_env
@@ -231,7 +230,7 @@ def test_train_one_passes_resume_checkpoint_to_trainer(train_env, tmp_network_vo
     assert "checkpoint-5" in str(resume_arg)
 
 
-def test_checkpoint_callback_updates_state(train_env, tmp_network_volume, mock_ml_modules):
+def test_checkpoint_callback_updates_state(train_env, tmp_checkpoints_root, mock_ml_modules):
     """_CheckpointCallback.on_save must write epoch/step to train_state.json."""
     import train_local as train
 
@@ -265,7 +264,7 @@ def test_checkpoint_callback_updates_state(train_env, tmp_network_volume, mock_m
     assert state["global_step"] == 50
 
 
-def test_train_one_dry_run_writes_metadata_no_training(train_env, tmp_network_volume):
+def test_train_one_dry_run_writes_metadata_no_training(train_env, tmp_checkpoints_root):
     """--dry-run writes metadata.json but never imports unsloth."""
     import train_local as train
 
@@ -276,3 +275,59 @@ def test_train_one_dry_run_writes_metadata_no_training(train_env, tmp_network_vo
     assert result["n_train"] >= 0
     meta_path = e["tmp_path"] / "results" / "training" / "local" / "test-model" / "toy" / "lora" / "metadata.json"
     assert meta_path.exists()
+
+
+# ── TaskConfig training_overrides ─────────────────────────────────────────────
+
+@pytest.mark.unit
+@pytest.mark.parametrize("overrides,expected", [
+    ({"learning_rate": 5e-5}, {"learning_rate": 5e-5}),
+    (None, None),
+])
+def test_task_config_training_overrides_roundtrip(overrides, expected):
+    from train_local import TaskConfig
+    cfg = TaskConfig(task_id="x", training_overrides=overrides)
+    assert cfg.training_overrides == expected
+
+
+@pytest.mark.unit
+def test_fpb_yaml_specifies_anti_overfit_overrides():
+    """FPB (~600 train rows) keeps reduced LR + raised weight_decay so the
+    LoRA adapter can't memorise the train set and forget pretrained knowledge.
+    Thresholded (not equality) so values can be tuned without churning tests.
+    """
+    import train_local as train
+    cfg = train.load_task_config("fpb")
+    assert cfg.training_overrides is not None
+    assert cfg.training_overrides.get("learning_rate", 2e-4) <= 4e-5
+    assert cfg.training_overrides.get("weight_decay", 0.01) >= 0.05
+
+
+@pytest.mark.unit
+def test_training_overrides_merge_replaces_model_defaults():
+    model_training = {"learning_rate": 2e-4, "warmup_ratio": 0.05, "weight_decay": 0.01}
+    overrides = {"learning_rate": 5e-5, "warmup_ratio": 0.1}
+    merged = dict(model_training)
+    merged.update(overrides)
+    assert merged == {"learning_rate": 5e-5, "warmup_ratio": 0.1, "weight_decay": 0.01}
+
+
+@pytest.mark.unit
+def test_training_overrides_change_invalidates_cache(tmp_path):
+    """Tweaking task-level overrides must change input_hash so a cached run
+    is re-executed instead of silently skipped."""
+    from pipeline.cache import training_inputs_hash
+
+    data_path = tmp_path / "train.jsonl"
+    data_path.write_text('{"messages":[]}\n')
+    model_training = {"learning_rate": 2e-4}
+
+    def hash_for(overrides: dict | None) -> str:
+        merged = dict(model_training)
+        if overrides:
+            merged.update(overrides)
+        return training_inputs_hash(data_path, {"training": merged})
+
+    base = hash_for(None)
+    tweaked = hash_for({"learning_rate": 5e-5})
+    assert base != tweaked

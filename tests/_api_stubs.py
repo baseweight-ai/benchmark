@@ -22,11 +22,11 @@ for _name in ("openai", "aiohttp"):
         except ImportError:
             sys.modules[_name] = MagicMock()
 
-if "tqdm" not in sys.modules:
+try:
+    import tqdm.asyncio as _tqdm_async
+    _tqdm_async.tqdm.gather = _tqdm_gather  # type: ignore[attr-defined]
+except ImportError:
     _tqdm_stub = MagicMock()
     _tqdm_stub.asyncio.tqdm.gather = _tqdm_gather
     sys.modules["tqdm"] = _tqdm_stub
     sys.modules["tqdm.asyncio"] = _tqdm_stub.asyncio
-else:
-    import tqdm.asyncio as _tqdm_async
-    _tqdm_async.tqdm.gather = _tqdm_gather  # type: ignore[attr-defined]

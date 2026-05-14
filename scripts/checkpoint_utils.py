@@ -1,6 +1,6 @@
-"""Checkpoint, recovery, and logging utilities for remote GPU training.
+"""Checkpoint, recovery, and logging utilities for training runs.
 
-Network volume layout (under NETWORK_VOLUME/checkpoints/<model>/<task>/<condition>/):
+Checkpoint layout (under <repo>/checkpoints/<model>/<task>/<condition>/):
   checkpoint-N/      HF Trainer intermediate checkpoints (one per epoch)
   train_state.json   Lightweight state: epoch, step, loss, status
   adapter/           Final adapter copy (written atomically on job completion)
@@ -20,8 +20,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
-# Set NETWORK_VOLUME to your remote GPU network volume mount point.
-NETWORK_VOLUME = Path(os.environ.get("NETWORK_VOLUME", "/workspace"))
+REPO_ROOT = Path(__file__).parent.parent
+CHECKPOINTS_ROOT = REPO_ROOT / "checkpoints"
 
 
 # ── Atomic I/O ────────────────────────────────────────────────────────────────
@@ -85,11 +85,7 @@ def load_partial_ids(pp: Path) -> set[str]:
 # ── Training checkpoint helpers ───────────────────────────────────────────────
 
 def checkpoint_dir(model_short: str, task_id: str, condition: str) -> Path:
-    return NETWORK_VOLUME / "checkpoints" / model_short / task_id / condition
-
-
-def nv_prepared_dir(task_id: str) -> Path:
-    return NETWORK_VOLUME / "data" / "prepared" / task_id
+    return CHECKPOINTS_ROOT / model_short / task_id / condition
 
 
 def find_hf_resume_checkpoint(

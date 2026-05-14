@@ -1,5 +1,6 @@
-# Secrets
+# Secrets + per-developer local config
 .env
+.git-identity
 
 # OS
 .DS_Store
@@ -14,19 +15,25 @@ dist/
 .venv/
 venv/
 
-# Conda / env setup
+# Conda env (lives inside the repo)
+.conda-envs/
 .setup_stamp
 environment.lock.yml
 condaenv.*.requirements.txt
-unsloth_compiled_cache/
 
-# Data & artifacts
+# Caches (HF, vLLM, torch_inductor, triton, pip — all repo-relative now)
+.cache/
+unsloth_compiled_cache/
+torchinductor_root/
+
+# Pipeline outputs
 data/
 results/
+checkpoints/
 dashboard-data/results.json
-workspace/
 runs/
 !runs/.gitkeep
+*.log
 
 # Local-only docs
 docs/
@@ -35,3 +42,15 @@ TESTING.md
 
 # Agent files (per-dev symlink)
 CLAUDE.md
+.claude/
+.agents/
+skills-lock.json
+# Editor/IDE
+.vscode/
+.idea/
+
+# Coverage artifacts
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml

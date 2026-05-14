@@ -6,6 +6,7 @@ import json
 import math
 import os
 import random
+from functools import lru_cache
 from io import StringIO
 from pathlib import Path
 from typing import Optional
@@ -65,6 +66,7 @@ def _strip_instruct_suffix(name: str) -> str:
     return name
 
 
+@lru_cache(maxsize=64)
 def _get_model_meta(model_id: str) -> dict:
     """Return {"display_name": ..., "family": ...} for any model_id."""
     config_path = REPO_ROOT / "configs" / "training" / f"{model_id}.yaml"
@@ -96,6 +98,7 @@ def load_pricing() -> PricingConfig:
     return PricingConfig(**data)
 
 
+@lru_cache(maxsize=64)
 def _api_cost_per_token(model_id: str) -> tuple[float, float]:
     """Return (input_$/token, output_$/token) via litellm for any API model.
 
@@ -251,10 +254,15 @@ def build_result(
     n_predictions = summary["n_predictions"] if summary else None
     total_input = summary.get("total_input_tokens", 0) if summary else 0
     total_output = summary.get("total_output_tokens", 0) if summary else 0
+    # Legacy summaries lack these — fall back so answer + reasoning = output.
+    total_reasoning = summary.get("total_reasoning_tokens", 0) or 0 if summary else 0
+    total_answer = summary.get("total_answer_tokens", total_output) if summary else 0
     avg_latency_ms = summary.get("avg_latency_ms") if summary else None
     eval_wall_time_s = summary.get("eval_wall_time_s") if summary else None
     ttft_p50 = summary.get("ttft_p50_ms") if summary else None
     ttft_p95 = summary.get("ttft_p95_ms") if summary else None
+    latency_p50_ms = summary.get("latency_p50_ms") if summary else None
+    latency_p99_ms = summary.get("latency_p99_ms") if summary else None
     error_counts = summary.get("error_counts", {}) if summary else {}
     semantic_error_counts = summary.get("semantic_error_counts", {}) if summary else {}
     format_compliance_rate = summary.get("format_compliance_rate") if summary else None
@@ -272,12 +280,20 @@ def build_result(
     hyperparams = training_meta.get("hyperparams") if training_meta else None
     training_diagnostics = training_meta.get("training_diagnostics") if training_meta else None
     compute_dtype = training_meta.get("compute_dtype") if training_meta else None
+    # Prefer eval-time GPU (where latency was measured); API rows have none.
+    gpu_model = None
+    if summary and summary.get("gpu_model"):
+        gpu_model = summary["gpu_model"]
+    elif training_meta and training_meta.get("gpu_model"):
+        gpu_model = training_meta["gpu_model"]
     per_class_metrics = summary.get("per_class_metrics") if summary else None
 
     # Decomposed cost inputs — stored so the site can recalculate or display assumptions.
     n = n_predictions or 1
     avg_input_tokens = round(total_input / n, 1) if summary else None
     avg_output_tokens = round(total_output / n, 1) if summary else None
+    avg_reasoning_tokens = round(total_reasoning / n, 1) if summary else None
+    avg_answer_tokens = round(total_answer / n, 1) if summary else None
     gpu_hourly_rate = pricing.self_hosted.get("gpu_hourly_rate", GPU_HOURLY) if meta["family"] == "open-source" else None
     in_per_tok, out_per_tok = (_api_cost_per_token(model_id) if meta["family"] == "frontier" and summary else (None, None))
 
@@ -289,6 +305,35 @@ def build_result(
     if cost_per_query is not None and metric_value and metric_value > 0:
         cost_per_1k_correct = (cost_per_query * 1000) / metric_value
 
+    cost_per_1k_requests: Optional[float] = (
+        round(cost_per_query * 1000, 4) if cost_per_query is not None else None
+    )
+    cost_per_1m_queries: Optional[float] = (
+        round(cost_per_query * 1_000_000, 2) if cost_per_query is not None else None
+    )
+    # throughput_qps: queries served per second at the eval's observed
+    # Queries-per-second at the eval's observed concurrency — also the
+    # denominator for self-hosted cost: cost_per_query = gpu_hourly / 3600 / qps.
+    throughput_qps: Optional[float] = None
+    if eval_wall_time_s and eval_wall_time_s > 0 and n > 0:
+        throughput_qps = round(n / eval_wall_time_s, 2)
+    total_tokens = total_input + total_output
+    cost_per_1k_tokens: Optional[float] = None
+    cost_per_1m_input_tokens: Optional[float] = None
+    cost_per_1m_output_tokens: Optional[float] = None
+    if cost_per_query is not None and total_tokens > 0 and n > 0:
+        total_cost = cost_per_query * n
+        cost_per_1k_tokens = round(total_cost / total_tokens * 1000, 6)
+        if meta["family"] == "frontier" and in_per_tok is not None and out_per_tok is not None:
+            cost_per_1m_input_tokens = round(in_per_tok * 1_000_000, 4)
+            cost_per_1m_output_tokens = round(out_per_tok * 1_000_000, 4)
+        else:
+            # Self-hosted shares wall time between prefill and decode — can't
+            # attribute input vs output separately, so report the same rate.
+            effective = round(total_cost / total_tokens * 1_000_000, 4)
+            cost_per_1m_input_tokens = effective
+            cost_per_1m_output_tokens = effective
+
     tco_12mo = compute_tco_12mo(model_id, training_cost, cost_per_query or 0, daily_volume, pricing, eval_wall_time_s, n_predictions) if cost_per_query is not None else None
 
     metric_std = summary.get("metric_std") if summary else None
@@ -297,6 +342,13 @@ def build_result(
     metric_ci_hi = summary.get("metric_ci_hi") if summary else None
     n_seeds = summary.get("n_seeds") if summary else None
     metric_granularity = summary.get("metric_granularity") if summary else None
+
+    exact_match = summary.get("exact_match") if summary else None
+    macro_f1 = summary.get("macro_f1") if summary else None
+    weighted_f1 = summary.get("weighted_f1") if summary else None
+    hallucination_rate = summary.get("hallucination_rate") if summary else None
+    avg_logprob = summary.get("avg_logprob") if summary else None
+    p10_logprob = summary.get("p10_logprob") if summary else None
 
     # Per-axis scores: start from what classify_errors.py computed, then add cost.
     eval_axes: list[str] = summary.get("eval_axes", []) if summary else []
@@ -321,14 +373,26 @@ def build_result(
         "metric_ci_hi": round(metric_ci_hi, 4) if metric_ci_hi is not None else None,
         "n_seeds": n_seeds,
         "n_predictions": n_predictions,
-        # Cost (derived)
+        "exact_match": exact_match,
+        "macro_f1": macro_f1,
+        "weighted_f1": weighted_f1,
+        "hallucination_rate": hallucination_rate,
+        "avg_logprob": avg_logprob,
+        "p10_logprob": p10_logprob,
         "cost_per_query": round(cost_per_query, 8) if cost_per_query is not None else None,
+        "cost_per_1k_requests": cost_per_1k_requests,
+        "cost_per_1m_queries": cost_per_1m_queries,
+        "cost_per_1k_tokens": cost_per_1k_tokens,
+        "cost_per_1m_input_tokens": cost_per_1m_input_tokens,
+        "cost_per_1m_output_tokens": cost_per_1m_output_tokens,
         "cost_per_1k_correct": round(cost_per_1k_correct, 4) if cost_per_1k_correct is not None else None,
         "tco_12mo": round(tco_12mo, 2) if tco_12mo is not None else None,
-        # Latency
         "avg_latency_ms": round(avg_latency_ms, 1) if avg_latency_ms is not None else None,
+        "latency_p50_ms": latency_p50_ms,
+        "latency_p99_ms": latency_p99_ms,
         "ttft_p50_ms": ttft_p50,
         "ttft_p95_ms": ttft_p95,
+        "throughput_qps": throughput_qps,
         # Training
         "training_cost": round(training_cost, 4) if training_cost is not None else None,
         "training_time_min": training_time_min,
@@ -353,11 +417,15 @@ def build_result(
         "hyperparams": hyperparams,
         "training_diagnostics": training_diagnostics,
         "compute_dtype": compute_dtype,
-        # Cost inputs (decomposed for transparency / recalculation)
+        "gpu_model": gpu_model,
         "total_input_tokens": total_input if summary else None,
         "total_output_tokens": total_output if summary else None,
+        "total_reasoning_tokens": total_reasoning if summary else None,
+        "total_answer_tokens": total_answer if summary else None,
         "avg_input_tokens": avg_input_tokens,
         "avg_output_tokens": avg_output_tokens,
+        "avg_reasoning_tokens": avg_reasoning_tokens,
+        "avg_answer_tokens": avg_answer_tokens,
         "input_cost_per_token": in_per_tok if in_per_tok else None,
         "output_cost_per_token": out_per_tok if out_per_tok else None,
         "gpu_hourly_rate": gpu_hourly_rate,
@@ -695,33 +763,48 @@ def _export_tables(results: list[dict], out_dir: Path) -> None:
     # Per-task accuracy table: rows = models, cols = conditions
     tasks = sorted({r["task_id"] for r in results})
 
-    # CSV: one row per (model, task, condition)
     csv_path = out_dir / "results.csv"
     fieldnames = ["model_id", "task_id", "condition", "metric_id", "metric_value",
                   "metric_std", "metric_ci_lo", "metric_ci_hi",
-                  "cost_per_query", "avg_latency_ms", "n_predictions"]
+                  "exact_match", "macro_f1", "weighted_f1", "hallucination_rate",
+                  "cost_per_query", "cost_per_1k_requests", "cost_per_1k_tokens",
+                  "cost_per_1m_input_tokens", "cost_per_1m_output_tokens",
+                  "avg_latency_ms", "n_predictions"]
     with open(csv_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         w.writeheader()
         for r in sorted(results, key=lambda x: (x["model_id"], x["task_id"], x["condition"])):
             w.writerow({k: r.get(k) for k in fieldnames})
 
-    # Markdown: accuracy leaderboard per task
     md_lines = ["# Benchmark Results\n"]
     for task in tasks:
         task_rows = [r for r in results if r["task_id"] == task and r.get("metric_value") is not None]
         if not task_rows:
             continue
         md_lines.append(f"\n## {task}\n")
-        md_lines.append("| Model | Condition | Metric | Value | Std | CI |")
-        md_lines.append("|-------|-----------|--------|-------|-----|-----|")
+        md_lines.append(
+            "| Model | Condition | Metric | Value | Std | CI | EM | Macro-F1 | "
+            "Weighted-F1 | Halluc | $/1k req | $/1M in | $/1M out |"
+        )
+        md_lines.append(
+            "|-------|-----------|--------|-------|-----|-----|----|----------|"
+            "-------------|--------|----------|---------|----------|"
+        )
         for r in sorted(task_rows, key=lambda x: -(x["metric_value"] or 0)):
             std = f"±{r['metric_std']:.4f}" if r.get("metric_std") is not None else ""
             ci = (f"[{r['metric_ci_lo']:.4f},{r['metric_ci_hi']:.4f}]"
                   if r.get("metric_ci_lo") is not None else "")
+            em = f"{r['exact_match']:.4f}" if r.get("exact_match") is not None else ""
+            mf1 = f"{r['macro_f1']:.4f}" if r.get("macro_f1") is not None else ""
+            wf1 = f"{r['weighted_f1']:.4f}" if r.get("weighted_f1") is not None else ""
+            halluc = f"{r['hallucination_rate']:.4f}" if r.get("hallucination_rate") is not None else ""
+            cpr = f"${r['cost_per_1k_requests']:.4f}" if r.get("cost_per_1k_requests") is not None else ""
+            cin = f"${r['cost_per_1m_input_tokens']:.4f}" if r.get("cost_per_1m_input_tokens") is not None else ""
+            cout = f"${r['cost_per_1m_output_tokens']:.4f}" if r.get("cost_per_1m_output_tokens") is not None else ""
             md_lines.append(
                 f"| {r['model_id']} | {r['condition']} | {r.get('metric_id','')} "
-                f"| {r['metric_value']:.4f} | {std} | {ci} |"
+                f"| {r['metric_value']:.4f} | {std} | {ci} "
+                f"| {em} | {mf1} | {wf1} | {halluc} | {cpr} | {cin} | {cout} |"
             )
 
     md_path = out_dir / "results.md"
@@ -801,9 +884,59 @@ def merge_results(fresh: list[dict], existing_path: Path) -> list[dict]:
     return merged
 
 
-def build_dashboard_data(daily_volume: int = 10000) -> dict:
-    """Assemble full BenchmarkData JSON."""
+def _summarise_hardware(results: list[dict]) -> dict:
+    """Walk local result rows and surface GPU consistency state.
+
+    Latency / throughput / cost are GPU-bound. If different local rows ran on
+    different silicon, comparing them on those axes is invalid. This block
+    makes the situation visible in the dashboard JSON so consumers can either
+    filter or raise the issue.
+    """
+    by_model: dict[str, set] = {}
+    for r in results:
+        if r.get("family") != "open-source":
+            continue
+        gpu = r.get("gpu_model")
+        if not gpu:
+            continue
+        by_model.setdefault(r["model_id"], set()).add(gpu)
+
+    inconsistent = {m: sorted(gpus) for m, gpus in by_model.items() if len(gpus) > 1}
+    all_local_gpus = sorted({g for gpus in by_model.values() for g in gpus})
+    return {
+        "local_gpus_observed": all_local_gpus,
+        # Models where >1 GPU was seen across runs — latency/throughput/cost
+        # comparisons within those rows are not apples-to-apples.
+        "inconsistent_gpu_models": inconsistent,
+        "hardware_warning": (
+            f"Multiple GPUs detected for the same model_id: {inconsistent}. "
+            f"Latency/throughput/cost columns are not directly comparable. "
+            f"Re-run on a single GPU for publication."
+        ) if inconsistent else None,
+    }
+
+
+def build_dashboard_data(
+    daily_volume: int = 10000,
+    gpu_hourly_rate_override: Optional[float] = None,
+) -> dict:
+    """Assemble full BenchmarkData JSON.
+
+    gpu_hourly_rate_override: if set, replaces pricing.yaml's gpu_hourly_rate
+    for this render. Lets you re-generate results.json with an ICP-realistic
+    rate (e.g. AWS A10G on-demand) without re-running eval — the cost formulas
+    are linear in the rate, so a fresh dashboard render is enough.
+    """
+    # Reset per-render so monkeypatch'd REPO_ROOT in tests doesn't see
+    # cached values from a previous invocation with a different repo root.
+    _get_model_meta.cache_clear()
+    _api_cost_per_token.cache_clear()
     pricing = load_pricing()
+    if gpu_hourly_rate_override is not None:
+        pricing = PricingConfig(
+            apis=pricing.apis,
+            self_hosted={**pricing.self_hosted, "gpu_hourly_rate": gpu_hourly_rate_override},
+        )
 
     results = []
     for source, model_id, task_id, condition in discover_summaries():
@@ -816,11 +949,21 @@ def build_dashboard_data(daily_volume: int = 10000) -> dict:
 
     stats = compute_stats(results)
     task_baselines = _load_task_baselines()
+    hardware = _summarise_hardware(results)
+    pricing_provenance = {
+        "gpu_hourly_rate_used": pricing.self_hosted.get("gpu_hourly_rate"),
+        "gpu_hourly_rate_source": (
+            "cli_override" if gpu_hourly_rate_override is not None else "pricing.yaml"
+        ),
+        "gpu_pricing_notes": pricing.self_hosted.get("gpu_pricing_notes"),
+    }
 
     return {
         "generated_at": None,  # filled at write time
         **stats,
         "task_baselines": task_baselines,
+        "hardware": hardware,
+        "pricing_provenance": pricing_provenance,
         "results": results,
     }
 
@@ -832,6 +975,8 @@ def build_dashboard_data(daily_volume: int = 10000) -> dict:
 @click.option("--also-benchmark-repo", is_flag=True, help="Also write to dashboard-data/results.json in benchmark repo")
 @click.option("--merge", is_flag=True, help="Preserve existing results where new run has no data (matched by model+task+condition)")
 @click.option("--export-tables", is_flag=True, help="Also write CSV and Markdown tables to results/tables/")
+@click.option("--gpu-hourly-rate", "gpu_hourly_rate", default=None, type=float,
+              help="Override self_hosted.gpu_hourly_rate for this render only — useful for re-rendering under an alternative ICP-realistic rate (e.g. AWS spot). Pricing.yaml is unchanged.")
 @click.option("--dry-run", is_flag=True)
 def main(
     daily_volume: int,
@@ -840,11 +985,22 @@ def main(
     also_benchmark_repo: bool,
     merge: bool,
     export_tables: bool,
+    gpu_hourly_rate: Optional[float],
     dry_run: bool,
 ) -> None:
     """Generate dashboard results.json from summaries."""
     from datetime import datetime, timezone
-    data = build_dashboard_data(daily_volume)
+    data = build_dashboard_data(daily_volume, gpu_hourly_rate_override=gpu_hourly_rate)
+
+    # Surface hardware-consistency warning prominently — easy to miss in JSON.
+    hw_warning = data.get("hardware", {}).get("hardware_warning")
+    if hw_warning:
+        click.echo(f"  WARNING: {hw_warning}", err=True)
+    pp = data.get("pricing_provenance", {})
+    rate_used = pp.get("gpu_hourly_rate_used")
+    rate_src = pp.get("gpu_hourly_rate_source")
+    if rate_used is not None:
+        click.echo(f"  GPU hourly rate used: ${rate_used} (source: {rate_src})")
 
     for w in data.get("dtype_warnings", []):
         click.echo(f"  WARNING: {w}", err=True)

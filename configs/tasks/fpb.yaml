@@ -4,13 +4,16 @@ dataset_path: "warwickai/financial_phrasebank_mirror"
 dataset_config: null
 task_type: classification
 num_classes: 3
-metric_id: weighted_f1
-metric_label: "Weighted F1"
-# per_class_weighted: FPB class distribution is highly skewed (~59% positive, 28% neutral,
-# 13% negative). Test uses stratified sampling to mirror this, so weighted F1 reflects real-
-# world performance rather than artificially equalising rare classes. Use macro_f1 instead
-# if equal per-class recall is the priority (e.g. auditing for minority-class errors).
-metric_granularity: per_class_weighted
+metric_id: macro_f1
+metric_label: "Macro F1"
+# Macro-F1 equally weights each sentiment class regardless of support.
+# Justified for FPB because (a) training is balanced (200/200/200 after
+# sampling), so the model is taught to handle each class equally, and
+# (b) the minority "negative" class (~11% of real-world distribution) is
+# the most consequential signal for financial sentiment — a missed
+# negative is a missed alert. Use weighted_f1 instead if reporting
+# real-world-prevalence-weighted performance is the priority.
+metric_granularity: per_class_macro
 max_output_tokens: 32
 lm_eval_task_id: null
 train_sampling:
@@ -36,3 +39,11 @@ epochs_by_size:
   small: 10
   medium: 5
   large: 3
+
+# Tiny dataset (~600 rows after balanced sampling) — conservative LR and high
+# weight_decay keep the LoRA adapter close to zero so the effective model
+# stays close to pretrained (catastrophic-forgetting mitigation).
+training_overrides:
+  learning_rate: 2.0e-5
+  weight_decay: 0.1
+  warmup_ratio: 0.1

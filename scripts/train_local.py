@@ -33,18 +33,17 @@ import yaml
 from pydantic import BaseModel, Field
 
 from checkpoint_utils import (
-    NETWORK_VOLUME,
     atomic_write_json,
     checkpoint_dir,
     find_hf_resume_checkpoint,
     load_train_state,
-    nv_prepared_dir,
     save_train_state,
     training_log,
 )
 from utils import write_jsonl
 from pipeline.cache import inputs_changed, training_inputs_hash
 from pipeline.config import get_local_models, get_tasks
+from pipeline.hardware import check_allowed_gpu, get_current_gpu_name
 from pipeline.log import configure, get_logger
 from pipeline.paths import adapter_path, training_meta_path
 from pipeline.validation import reject_test_path, require_jsonl
@@ -91,6 +90,10 @@ class ModelConfig(BaseModel):
 class TaskConfig(BaseModel):
     task_id: str
     max_seq_length: Optional[int] = None  # overrides model max_seq_length when set
+    # Per-task overrides merged into model_cfg.training before SFTConfig is
+    # built. Use for task-specific stability tweaks (e.g. lower LR on tiny
+    # datasets where the default overfits).
+    training_overrides: Optional[dict] = None
 
 
 def load_model_config(model_id: str) -> ModelConfig:
@@ -147,12 +150,9 @@ def count_jsonl(path: Path) -> int:
 
 
 def _resolve_prepared(task_id: str, filename: str) -> Optional[Path]:
-    """Return path to a prepared data file, falling back to the network volume."""
+    """Return path to a prepared data file, or None if absent."""
     p = REPO_ROOT / "data" / "prepared" / task_id / filename
-    if p.exists():
-        return p
-    nv = nv_prepared_dir(task_id) / filename
-    return nv if nv.exists() else None
+    return p if p.exists() else None
 
 
 def get_or_create_cap(data_dir: Path, n: int, ctx: str = "") -> Path:
@@ -484,26 +484,32 @@ def run_training_task(
     train_ds = hf_datasets.Dataset.from_list(train_rows)
     val_ds = hf_datasets.Dataset.from_list(val_rows) if val_rows else None
 
-    # Pre-apply the chat template so trl tokenizes a plain "text" field.
-    # When enable_thinking is explicitly False, suppress <think> tokens.
+    # prompt-completion shape lets SFTTrainer apply completion_only_loss
+    # (gradients on assistant tokens only).
     template_kwargs = {}
     if model_cfg.enable_thinking is False:
         template_kwargs["enable_thinking"] = False
 
-    echo("Applying chat template...")
-    def apply_template(example):
-        return {"text": tokenizer.apply_chat_template(
-            example["messages"],
-            tokenize=False,
-            add_generation_prompt=False,
-            **template_kwargs,
-        )}
-    train_ds = train_ds.map(apply_template)
+    echo("Splitting messages into prompt/completion for completion-only loss...")
+    def to_prompt_completion(example):
+        msgs = example["messages"]
+        assistant_idx = next((i for i, m in enumerate(msgs) if m["role"] == "assistant"), -1)
+        if assistant_idx < 0:
+            raise ValueError(f"Training row has no assistant message: {msgs}")
+        row = {"prompt": msgs[:assistant_idx], "completion": msgs[assistant_idx:]}
+        if template_kwargs:
+            row["chat_template_kwargs"] = template_kwargs
+        return row
+
+    train_ds = train_ds.map(to_prompt_completion, remove_columns=train_ds.column_names)
     if val_ds is not None:
-        val_ds = val_ds.map(apply_template)
+        val_ds = val_ds.map(to_prompt_completion, remove_columns=val_ds.column_names)
     echo(f"Dataset ready: {len(train_ds)} train rows" + (f", {len(val_ds)} val rows" if val_ds else ""))
 
-    training_cfg = model_cfg.training
+    training_cfg = dict(model_cfg.training)
+    if task_cfg.training_overrides:
+        training_cfg.update(task_cfg.training_overrides)
+        echo(f"Task overrides applied: {task_cfg.training_overrides}")
     sft_kwargs = dict(
         output_dir=str(ckpt_dir),
         num_train_epochs=epochs,
@@ -525,7 +531,7 @@ def run_training_task(
         logging_nan_inf_filter=training_cfg.get("logging_nan_inf_filter", False),
         report_to=training_cfg.get("report_to", "none"),
         max_seq_length=hw_cfg.seq_len,
-        dataset_text_field="text",
+        completion_only_loss=True,
         packing=False,
     )
     sft_kwargs.update(hw_cfg.sft_extra)
@@ -568,6 +574,7 @@ def run_training_task(
     gpu_hours = round(elapsed_min / 60, 4)
     training_cost = 0.0 if smoke_test else gpu_hours * GPU_HOURLY
     peak_gpu_mem_mb = round(torch.cuda.max_memory_allocated() / 1024**2) if torch.cuda.is_available() else None
+    gpu_model = get_current_gpu_name()
     avg_gpu_util_pct = round(sum(callback.gpu_util_samples) / len(callback.gpu_util_samples)) if callback.gpu_util_samples else None
 
     model.save_pretrained(str(adapter_dir))
@@ -619,6 +626,7 @@ def run_training_task(
         "training_cost": round(training_cost, 4),
         "training_time_min": round(elapsed_min, 1),
         "gpu_hours": gpu_hours,
+        "gpu_model": gpu_model,
         "peak_gpu_mem_mb": peak_gpu_mem_mb,
         "avg_gpu_util_pct": avg_gpu_util_pct,
         "eval_loss": eval_loss,
@@ -692,11 +700,16 @@ def train_one(
     epochs = 1 if smoke_test else get_epochs(n_train)
     echo(f"n={n_train}, epochs={epochs}, seq_len={hw_cfg.seq_len}")
 
+    # Merge training_overrides into the hashed config so per-task LR/decay
+    # tweaks trigger a retrain via inputs_changed.
+    hashed_training = dict(model_cfg.training)
+    if task_cfg.training_overrides:
+        hashed_training.update(task_cfg.training_overrides)
     input_hash = training_inputs_hash(data_path, {
         "epochs": epochs,
         "smoke_test": smoke_test,
         "lora": model_cfg.lora,
-        "training": model_cfg.training,
+        "training": hashed_training,
         "seq_len": hw_cfg.seq_len,
         "load_in_4bit": hw_cfg.load_in_4bit,
     })
@@ -786,6 +799,7 @@ def _upload_adapter(model_short: str, task_id: str, condition: str, ctx: str = "
 def main(model: Optional[str], task: str, cap: Optional[int], auto_upload: bool, dry_run: bool, smoke_test: bool) -> None:
     """QLoRA fine-tune one or more model/task combinations."""
     configure(REPO_ROOT)
+    check_allowed_gpu(skip=smoke_test or dry_run)
     if smoke_test:
         torch.set_num_threads(4)
         click.echo("Smoke-test mode: 4 threads, seq_len=256, r=4.")

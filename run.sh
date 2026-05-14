@@ -33,12 +33,12 @@
 #   -h, --help       Show this message
 
 set -euo pipefail
+REPO_ROOT="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)"
 source "$HOME/miniconda3/etc/profile.d/conda.sh" 2>/dev/null || \
     source "$HOME/anaconda3/etc/profile.d/conda.sh" 2>/dev/null || \
-    { echo "ERROR: conda not found — run: source /workspace/config/start.sh"; exit 1; }
+    { echo "ERROR: conda not found — run: bash ${REPO_ROOT}/start.sh"; exit 1; }
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main >/dev/null 2>&1 || true
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r >/dev/null 2>&1 || true
-REPO_ROOT="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)"
 SCRIPTS="${REPO_ROOT}/scripts"
 
 # ---------------------------------------------------------------------------
@@ -218,17 +218,16 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Resolve conda env Python — deferred when --setup will create/recreate it
+# Resolve conda env Python — env lives in-repo at .conda-envs/<name>.
+# Deferred when --setup will create/recreate it.
 # ---------------------------------------------------------------------------
-CONDA_ENV="baseweight-benchmark"
+CONDA_ENV_PREFIX="${REPO_ROOT}/.conda-envs/baseweight-benchmark"
 _resolve_python() {
-    local env_path
-    env_path=$(conda env list 2>/dev/null | awk -v n="$CONDA_ENV" '$1==n{print $NF}')
-    if [[ -z "$env_path" ]]; then
-        echo "Error: conda env '$CONDA_ENV' not found. Run: bash scripts/setup.sh" >&2
+    if [[ ! -x "${CONDA_ENV_PREFIX}/bin/python" ]]; then
+        echo "Error: conda env not found at ${CONDA_ENV_PREFIX}. Run: ${REPO_ROOT}/start.sh" >&2
         exit 1
     fi
-    PYTHON="${env_path}/bin/python"
+    PYTHON="${CONDA_ENV_PREFIX}/bin/python"
 }
 
 # ---------------------------------------------------------------------------
@@ -243,15 +242,6 @@ _read_env_key() {
         grep -E "^${key}=" "$ENV_FILE" | tail -1 | cut -d= -f2- || true
     fi
 }
-
-# ---------------------------------------------------------------------------
-# Load .env for NETWORK_VOLUME (used in train clean)
-# ---------------------------------------------------------------------------
-NETWORK_VOLUME="/workspace"   # default; overridden below if set in .env
-if [[ -f "$ENV_FILE" ]]; then
-    val=$(_read_env_key NETWORK_VOLUME)
-    [[ -n "$val" ]] && NETWORK_VOLUME="$val"
-fi
 
 # If setup will (re)create the env we don't need Python yet; resolve after setup.
 # In every other case the env must already exist.
@@ -307,10 +297,8 @@ if [[ "$CLEAN" == true ]]; then
     if [[ "$DO_TRAIN_LOCAL" == true ]]; then
         clean_paths \
             "${REPO_ROOT}/results/adapters/local/${MODEL_G}/${TASK_G}" \
-            "${REPO_ROOT}/results/training/local/${MODEL_G}/${TASK_G}"
-        if [[ -d "$NETWORK_VOLUME/checkpoints" ]]; then
-            clean_paths "${NETWORK_VOLUME}/checkpoints/${MODEL_G}/${TASK_G}"
-        fi
+            "${REPO_ROOT}/results/training/local/${MODEL_G}/${TASK_G}" \
+            "${REPO_ROOT}/checkpoints/${MODEL_G}/${TASK_G}"
     fi
 
     if [[ "$DO_EVAL_LOCAL" == true ]]; then
@@ -354,10 +342,9 @@ if [[ "$CLEAN" == true ]]; then
     fi
 
     if [[ "$DO_SETUP" == true ]]; then
-        eval "$(conda shell.bash hook)"
-        if conda env list 2>/dev/null | grep -qE "^${CONDA_ENV}[[:space:]]"; then
-            echo "  [pipeline] Removing conda env ${CONDA_ENV}..."
-            _run_tagged "pipeline" conda env remove -n "${CONDA_ENV}" -y
+        if [[ -d "${CONDA_ENV_PREFIX}/conda-meta" ]]; then
+            echo "  [pipeline] Removing conda env at ${CONDA_ENV_PREFIX}..."
+            _run_tagged "pipeline" conda env remove --prefix "${CONDA_ENV_PREFIX}" -y
         fi
     fi
 fi
@@ -367,8 +354,8 @@ fi
 # ---------------------------------------------------------------------------
 if [[ "$DO_SETUP" == true ]]; then
     step "pipeline" "Setup"
-    _run_tagged "pipeline" bash "${SCRIPTS}/setup.sh"
-    _resolve_python   # env now exists (created or updated by setup.sh)
+    _run_tagged "pipeline" bash "${REPO_ROOT}/start.sh" --skip-pull
+    _resolve_python   # env now exists (created or updated by start.sh)
 fi
 
 STAGES=""

@@ -68,6 +68,10 @@ def _write_toy_prepared_data(root: Path) -> None:
 
     write_jsonl(test_rows, prep / "test.jsonl")
     write_jsonl(train_rows, prep / "train.jsonl")
+    # Mirror what prepare_datasets.py emits for closed-set tasks. Without this,
+    # classify_errors can't compute hallucination_rate (no closed label set
+    # known) and the dashboard's mandated metrics are silently null.
+    (prep / "labels.json").write_text(json.dumps(labels))
 
 
 @pytest.fixture
@@ -98,7 +102,8 @@ def _stage_eval(root: Path, monkeypatch) -> Path:
     async def counting_call(*args, **kwargs):
         label = labels[call_count[0] % 3]
         call_count[0] += 1
-        return label, 100, 10, 120.0, 50.0
+        # (text, input_tokens, output_tokens, reasoning_tokens, latency_ms, ttft_ms)
+        return label, 100, 10, 0, 120.0, 50.0, None
 
     cfg = EvalTaskConfig(task_id=TASK_ID, max_output_tokens=32, task_type="classification")
     with patch("eval_api.call_openai", side_effect=counting_call):
@@ -187,3 +192,22 @@ def test_smoke_pipeline(toy_repo, monkeypatch):
     ]
     assert len(matching) == 1
     assert matching[0]["metric_value"] == pytest.approx(summary["metric_value"], rel=1e-4)
+
+    # End-to-end coverage check: the four mandated metrics + cost-per-1k forms
+    # must flow from summary into the dashboard result row for classification.
+    row = matching[0]
+    for k in ("exact_match", "macro_f1", "weighted_f1", "hallucination_rate"):
+        assert k in row, f"{k} missing from dashboard row"
+        assert row[k] is not None, f"{k} is None in dashboard row for classification task"
+    for k in ("cost_per_1k_requests", "cost_per_1k_tokens",
+              "cost_per_1m_input_tokens", "cost_per_1m_output_tokens"):
+        assert k in row, f"{k} missing from dashboard row"
+        assert row[k] is not None, f"{k} should be derived for any row with cost data"
+
+    # Sanity invariants
+    assert 0.0 <= row["exact_match"] <= 1.0
+    assert 0.0 <= row["macro_f1"] <= 1.0
+    assert 0.0 <= row["weighted_f1"] <= 1.0
+    assert 0.0 <= row["hallucination_rate"] <= 1.0
+    # cost_per_1k_requests == cost_per_query × 1000
+    assert row["cost_per_1k_requests"] == pytest.approx(row["cost_per_query"] * 1000, rel=1e-3)

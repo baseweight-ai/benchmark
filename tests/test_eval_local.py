@@ -13,6 +13,7 @@ from eval_local import (
     ModelConfig,
     TaskConfig,
     get_few_shot,
+    load_label_set,
     load_model_config,
     load_task_config,
     load_test_rows,
@@ -133,6 +134,82 @@ def test_load_test_rows_no_labels_file(tmp_path, monkeypatch):
     assert len(rows) == 3
 
 
+def test_load_label_set_present(tmp_path, monkeypatch):
+    """labels.json drives guided_choice — return its list verbatim."""
+    monkeypatch.setattr(eval_local, "REPO_ROOT", tmp_path)
+    task_dir = tmp_path / "data" / "prepared" / "fpb"
+    task_dir.mkdir(parents=True)
+    (task_dir / "labels.json").write_text(json.dumps(["positive", "negative", "neutral"]))
+    assert load_label_set("fpb") == ["positive", "negative", "neutral"]
+
+
+def test_load_label_set_absent_returns_none(tmp_path, monkeypatch):
+    """Free-form tasks lack labels.json → no guided_choice constraint."""
+    monkeypatch.setattr(eval_local, "REPO_ROOT", tmp_path)
+    (tmp_path / "data" / "prepared" / "cuad").mkdir(parents=True)
+    assert load_label_set("cuad") is None
+
+
+def test_run_eval_writes_bs_suffix_when_concurrency_set(tmp_path, monkeypatch):
+    """Non-default concurrency suffixes the output filename with _bs{N}, so
+    BS=1 and BS=32 runs are stored side-by-side instead of overwriting."""
+    from unittest.mock import patch
+    monkeypatch.setattr(eval_local, "REPO_ROOT", tmp_path)
+    _write_test_data(tmp_path, n=3, with_labels=True)
+    _write_train_data(tmp_path)
+
+    async def mock_call(*args, **kwargs):
+        from pipeline.providers import InferenceResult
+        return InferenceResult("positive", 100, 5, 0, 100.0, 50.0, None)
+
+    with patch("eval_local.call_vllm", side_effect=mock_call):
+        asyncio.run(eval_local.run_eval(
+            _model_cfg(), "fpb", "zero-shot", _task_cfg(),
+            model_name="Qwen/Qwen2.5-0.5B-Instruct",
+            dry_run=False, smoke_test=False, eval_seed=0,
+            concurrency=1,  # non-default → expect _bs1 suffix
+        ))
+
+    out = tmp_path / "results" / "predictions" / "local" / "qwen2.5-0.5b" / "fpb" / "zero-shot_bs1.jsonl"
+    assert out.exists(), f"Expected {out}, but it wasn't created"
+    # Default-concurrency path must NOT exist (no overwrite)
+    default = tmp_path / "results" / "predictions" / "local" / "qwen2.5-0.5b" / "fpb" / "zero-shot.jsonl"
+    assert not default.exists()
+
+
+def test_run_eval_default_concurrency_keeps_legacy_filename(tmp_path, monkeypatch):
+    """concurrency=MAX_CONCURRENCY (default) → no suffix, preserving back-compat
+    with existing predictions paths."""
+    from unittest.mock import patch
+    monkeypatch.setattr(eval_local, "REPO_ROOT", tmp_path)
+    _write_test_data(tmp_path, n=3, with_labels=True)
+    _write_train_data(tmp_path)
+
+    async def mock_call(*args, **kwargs):
+        from pipeline.providers import InferenceResult
+        return InferenceResult("positive", 100, 5, 0, 100.0, 50.0, None)
+
+    with patch("eval_local.call_vllm", side_effect=mock_call):
+        asyncio.run(eval_local.run_eval(
+            _model_cfg(), "fpb", "zero-shot", _task_cfg(),
+            model_name="Qwen/Qwen2.5-0.5B-Instruct",
+            dry_run=False, smoke_test=False, eval_seed=0,
+            # concurrency omitted → defaults to MAX_CONCURRENCY
+        ))
+
+    out = tmp_path / "results" / "predictions" / "local" / "qwen2.5-0.5b" / "fpb" / "zero-shot.jsonl"
+    assert out.exists()
+
+
+def test_load_label_set_empty_list_returns_none(tmp_path, monkeypatch):
+    """An empty list is not a valid constraint — treat as absent."""
+    monkeypatch.setattr(eval_local, "REPO_ROOT", tmp_path)
+    task_dir = tmp_path / "data" / "prepared" / "task"
+    task_dir.mkdir(parents=True)
+    (task_dir / "labels.json").write_text("[]")
+    assert load_label_set("task") is None
+
+
 def test_get_few_shot_returns_at_most_five(tmp_path, monkeypatch):
     monkeypatch.setattr(eval_local, "REPO_ROOT", tmp_path)
     _write_train_data(tmp_path, n=10)
@@ -144,6 +221,48 @@ def test_get_few_shot_missing_file_returns_empty(tmp_path, monkeypatch):
     monkeypatch.setattr(eval_local, "REPO_ROOT", tmp_path)
     rows = get_few_shot("fpb", "qwen2.5-0.5b", smoke_test=False)
     assert rows == []
+
+
+def test_get_few_shot_prefers_curated_file(tmp_path, monkeypatch):
+    """When data/prepared/{task}/few_shot.jsonl exists, it must be used over
+    train.jsonl[:5] — curated selection is deterministic and class-diverse."""
+    monkeypatch.setattr(eval_local, "REPO_ROOT", tmp_path)
+    prep = tmp_path / "data" / "prepared" / "fpb"
+    prep.mkdir(parents=True)
+    # 5 dummy train rows, none of which should be picked
+    train_rows = [
+        {"messages": [{"role": "user", "content": f"DUMMY{i}"},
+                      {"role": "assistant", "content": "negative"}]}
+        for i in range(5)
+    ]
+    (prep / "train.jsonl").write_text("\n".join(json.dumps(r) for r in train_rows) + "\n")
+    # Curated few-shot with distinct labels
+    curated = [
+        {"messages": [{"role": "user", "content": "CURATED1"},
+                      {"role": "assistant", "content": "positive"}]},
+        {"messages": [{"role": "user", "content": "CURATED2"},
+                      {"role": "assistant", "content": "neutral"}]},
+    ]
+    (prep / "few_shot.jsonl").write_text("\n".join(json.dumps(r) for r in curated) + "\n")
+    result = get_few_shot("fpb", "qwen3-8b", smoke_test=False)
+    assert len(result) == 2
+    assert result[0]["messages"][0]["content"] == "CURATED1"
+
+
+def test_get_few_shot_falls_back_to_train_when_no_curated(tmp_path, monkeypatch):
+    """No few_shot.jsonl → legacy behaviour (first 5 of train.jsonl)."""
+    monkeypatch.setattr(eval_local, "REPO_ROOT", tmp_path)
+    prep = tmp_path / "data" / "prepared" / "fpb"
+    prep.mkdir(parents=True)
+    train_rows = [
+        {"messages": [{"role": "user", "content": f"TRAIN{i}"},
+                      {"role": "assistant", "content": "neutral"}]}
+        for i in range(5)
+    ]
+    (prep / "train.jsonl").write_text("\n".join(json.dumps(r) for r in train_rows) + "\n")
+    result = get_few_shot("fpb", "qwen3-8b", smoke_test=False)
+    assert len(result) == 5
+    assert result[0]["messages"][0]["content"] == "TRAIN0"
 
 
 def test_get_few_shot_fewer_than_five_rows(tmp_path, monkeypatch):

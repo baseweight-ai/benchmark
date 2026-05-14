@@ -167,27 +167,35 @@ def is_refusal(text: str) -> bool:
 
 
 def is_format_violation(text: str, valid_labels: Optional[list[str]]) -> bool:
-    """Check if output is not in the valid label set."""
+    """Check if output is not in the valid label set — strict case-sensitive.
+
+    Constrained decoding (guided_choice) forces the model to emit one of the
+    valid labels verbatim, so any deviation (case, whitespace, extra tokens) is
+    a real format violation worth surfacing rather than masking with
+    normalisation.
+    """
     if valid_labels is None:
         return False
-    norm = normalize_text(text)
-    for label in valid_labels:
-        if normalize_text(label) == norm:
-            return False
-    return True
+    return text not in valid_labels
 
 
 # ── Classification task error classification ───────────────────────────────
 
 def classify_classification(prediction: str, ground_truth: str, valid_labels: Optional[list[str]] = None) -> str:
-    """Priority: empty > refusal > format_violation > correct > wrong_class."""
+    """Priority: empty > refusal > format_violation > correct > wrong_class.
+
+    Correctness is strict, case-sensitive equality. With guided_choice active,
+    the model's output is constrained to one of the exact label strings, so
+    `prediction == ground_truth` is the right test — no lowercasing, no
+    punctuation stripping, no whitespace collapse.
+    """
     if is_empty(prediction):
         return "empty"
     if is_refusal(prediction):
         return "refusal"
     if valid_labels and is_format_violation(prediction, valid_labels):
         return "format_violation"
-    if normalize_text(prediction) == normalize_text(ground_truth):
+    if prediction == ground_truth:
         return "correct"
     return "wrong_class"
 
@@ -283,6 +291,11 @@ def aggregate_seed_summaries(summaries: list[dict]) -> dict:
     # metric is sensitive to test-set sampling, weakening per-seed comparisons.
     metric_cv = round(std / mean, 4) if mean != 0 else None
 
+    def _mean_field(key: str) -> Optional[float]:
+        # Excludes seeds where the field is None (legacy summaries).
+        vals = [s[key] for s in summaries if s.get(key) is not None]
+        return round(sum(vals) / len(vals), 4) if vals else None
+
     return {
         "model": base.get("model"),
         "task_id": base.get("task_id"),
@@ -291,13 +304,19 @@ def aggregate_seed_summaries(summaries: list[dict]) -> dict:
         "seed_metric_values": metric_values,
         "metric_id": base.get("metric_id"),
         "metric_granularity": base.get("metric_granularity"),
-        "metric_value": round(mean, 4),    # mean used as the primary value
+        "metric_value": round(mean, 4),
         "metric_mean": round(mean, 4),
         "metric_std": round(std, 4),
         "metric_cv": metric_cv,
         "metric_ci_lo": round(ci_lo, 4),
         "metric_ci_hi": round(ci_hi, 4),
+        "exact_match": _mean_field("exact_match"),
+        "macro_f1": _mean_field("macro_f1"),
+        "weighted_f1": _mean_field("weighted_f1"),
+        "hallucination_rate": _mean_field("hallucination_rate"),
         "n_predictions": sum(s.get("n_predictions", 0) for s in summaries),
+        "total_reasoning_tokens": sum(s.get("total_reasoning_tokens", 0) or 0 for s in summaries),
+        "total_answer_tokens": sum(s.get("total_answer_tokens", 0) or 0 for s in summaries),
         "error_counts": dict(all_counts),
         "semantic_error_counts": dict(all_semantic_counts),
         "prompt_sha": base.get("prompt_sha"),
@@ -318,7 +337,11 @@ def compute_metric(task_cfg: TaskConfig, classified_rows: list[dict]) -> Optiona
         average = "weighted" if metric == "weighted_f1" else "macro"
         y_true, y_pred = [], []
         for r in classified_rows:
-            y_true.append(normalize_text(r["ground_truth"]))
+            # Strict match: both sides are raw label strings. predicted_clean
+            # is the raw prediction for valid rows, "__INVALID__" sentinel for
+            # empty/refusal/format_violation rows so they count as wrong without
+            # accidentally colliding with a real label.
+            y_true.append(r["ground_truth"])
             y_pred.append(r["predicted_clean"])
         try:
             score = f1_score(y_true, y_pred, average=average, zero_division=0)
@@ -335,6 +358,65 @@ def compute_metric(task_cfg: TaskConfig, classified_rows: list[dict]) -> Optiona
         return sum(scores) / len(scores) if scores else 0.0
 
     return None
+
+
+def compute_classification_metrics(
+    classified_rows: list[dict], valid_labels: Optional[list[str]]
+) -> dict:
+    """Compute EM, macro/weighted F1, and hallucination_rate for a classification task.
+
+    All four are always computed for closed-set classification regardless of the
+    task's primary metric_id, so the dashboard can surface them side-by-side.
+    Returns Nones for tasks where the metric doesn't apply (e.g. extraction).
+
+      EM             = correct / n_predictions (strict label equality).
+      Macro-F1       = unweighted mean of per-class F1 (rare classes equal vote).
+      Weighted-F1    = per-class F1 weighted by class support in y_true.
+      Hallucination  = format_violation / n — fraction of outputs that look
+                       like an attempted answer but aren't in the target label
+                       set. Standard ML usage: the model confidently invented
+                       something outside the allowed vocabulary. Refusals
+                       ("I cannot...") and empty outputs are tracked separately
+                       in refusal_rate / empty_rate, not folded in here.
+                       None when the task has no closed label set.
+    """
+    n = len(classified_rows)
+    if n == 0:
+        return {
+            "exact_match": None,
+            "macro_f1": None,
+            "weighted_f1": None,
+            "hallucination_rate": None,
+        }
+
+    correct = sum(1 for r in classified_rows if r.get("error_category") == "correct")
+    exact_match = round(correct / n, 4)
+
+    try:
+        from sklearn.metrics import f1_score
+        y_true = [r["ground_truth"] for r in classified_rows]
+        y_pred = [r["predicted_clean"] for r in classified_rows]
+        macro = round(float(f1_score(y_true, y_pred, average="macro", zero_division=0)), 4)
+        weighted = round(float(f1_score(y_true, y_pred, average="weighted", zero_division=0)), 4)
+    except Exception:
+        macro = None
+        weighted = None
+
+    if valid_labels is None:
+        hallucination = None
+    else:
+        format_violations = sum(
+            1 for r in classified_rows
+            if r.get("error_category") == "format_violation"
+        )
+        hallucination = round(format_violations / n, 4)
+
+    return {
+        "exact_match": exact_match,
+        "macro_f1": macro,
+        "weighted_f1": weighted,
+        "hallucination_rate": hallucination,
+    }
 
 
 # ── Main classification loop ───────────────────────────────────────────────
@@ -356,7 +438,9 @@ def classify_predictions(
         if task_cfg.task_type == "classification":
             cat = classify_classification(pred, gt, valid_labels)
             enriched["error_category"] = cat
-            enriched["predicted_clean"] = normalize_text(pred) if cat not in ("empty", "refusal", "format_violation") else "__INVALID__"
+            # predicted_clean is the raw prediction (no normalisation) for valid
+            # rows, "__INVALID__" sentinel otherwise. Used by F1 — strict match.
+            enriched["predicted_clean"] = pred if cat not in ("empty", "refusal", "format_violation") else "__INVALID__"
 
         elif task_cfg.task_type == "extraction":
             cat = classify_extraction(pred, gt)
@@ -423,23 +507,47 @@ def process_model_task_condition(
 
     metric_value = compute_metric(task_cfg, classified)
 
+    if task_cfg.task_type == "classification":
+        classification_metrics = compute_classification_metrics(classified, valid_labels)
+    else:
+        classification_metrics = {
+            "exact_match": None, "macro_f1": None,
+            "weighted_f1": None, "hallucination_rate": None,
+        }
+
+    from pipeline.data_quality import _percentile
+
+    def _pct(values: list[float], p: float) -> Optional[float]:
+        return _percentile(sorted(values), p) if values else None
+
     latencies = [r["latency_ms"] for r in predictions if r.get("latency_ms", 0) > 0]
     ttfts = [r["ttft_ms"] for r in predictions if r.get("ttft_ms", 0) > 0]
     avg_latency = sum(latencies) / len(latencies) if latencies else None
-    ttft_p50 = sorted(ttfts)[len(ttfts) // 2] if ttfts else None
-    ttft_p95 = sorted(ttfts)[int(len(ttfts) * 0.95)] if ttfts else None
+    ttft_p50 = _pct(ttfts, 50)
+    ttft_p95 = _pct(ttfts, 95)
+    latency_p50 = _pct(latencies, 50)
+    latency_p99 = _pct(latencies, 99)
 
     total_input_tokens = sum(r.get("input_tokens", 0) for r in predictions)
     total_output_tokens = sum(r.get("output_tokens", 0) for r in predictions)
+    total_reasoning_tokens = sum(r.get("reasoning_tokens", 0) or 0 for r in predictions)
+    total_answer_tokens = total_output_tokens - total_reasoning_tokens
+
+    logprobs = [r["avg_logprob"] for r in predictions if r.get("avg_logprob") is not None]
+    avg_logprob = round(sum(logprobs) / len(logprobs), 4) if logprobs else None
+    p10_logprob = round(_pct(logprobs, 10), 4) if logprobs else None
 
     # Wall time: prefer the sidecar written by eval_local.py (vLLM batch processing
     # collapses per-row timestamps to the same millisecond, making the span useless).
     # Fall back to timestamp-derived span for API predictions which lack a sidecar.
     wall_sidecar = input_path.with_suffix(".wall.json")
     eval_wall_time_s = None
+    gpu_model = None
     try:
         with open(wall_sidecar) as _wf:
-            eval_wall_time_s = json.load(_wf).get("eval_wall_time_s")
+            sidecar = json.load(_wf)
+            eval_wall_time_s = sidecar.get("eval_wall_time_s")
+            gpu_model = sidecar.get("gpu_model")
     except FileNotFoundError:
         from datetime import datetime, timezone as tz
         timestamps = [r["timestamp"] for r in predictions if r.get("timestamp")]
@@ -501,6 +609,11 @@ def process_model_task_condition(
         "metric_id": task_cfg.metric_id,
         "metric_granularity": task_cfg.metric_granularity,
         "metric_value": round(metric_value, 4) if metric_value is not None else None,
+        # Classification-only fields below are None for extraction tasks.
+        "exact_match": classification_metrics["exact_match"],
+        "macro_f1": classification_metrics["macro_f1"],
+        "weighted_f1": classification_metrics["weighted_f1"],
+        "hallucination_rate": classification_metrics["hallucination_rate"],
         "error_counts": counts,
         "semantic_error_counts": dict(semantic_counts),
         "format_compliance_rate": format_compliance_rate,
@@ -508,11 +621,18 @@ def process_model_task_condition(
         "empty_rate": empty_rate,
         "partial_rate": partial_rate,
         "avg_latency_ms": round(avg_latency, 1) if avg_latency is not None else None,
+        "latency_p50_ms": round(latency_p50, 1) if latency_p50 is not None else None,
+        "latency_p99_ms": round(latency_p99, 1) if latency_p99 is not None else None,
         "ttft_p50_ms": round(ttft_p50, 1) if ttft_p50 is not None else None,
         "ttft_p95_ms": round(ttft_p95, 1) if ttft_p95 is not None else None,
         "total_input_tokens": total_input_tokens,
         "total_output_tokens": total_output_tokens,
+        "total_reasoning_tokens": total_reasoning_tokens,
+        "total_answer_tokens": total_answer_tokens,
+        "avg_logprob": avg_logprob,
+        "p10_logprob": p10_logprob,
         "eval_wall_time_s": eval_wall_time_s,
+        "gpu_model": gpu_model,
         "per_class_metrics": per_class_metrics,
     }
 
@@ -532,15 +652,21 @@ def process_model_task_condition(
 
 
 def get_valid_labels(task_id: str) -> Optional[list[str]]:
-    """Return valid output labels for classification tasks, or None (no format check)."""
-    label_map: dict[str, Optional[list[str]]] = {
-        "banking77":  None,  # 77 classes — too many to enumerate
-        "cuad":       None,  # extraction — no fixed label set
-        "ledgar":     None,  # many provision types — skip format check
-        "fpb":        ["positive", "negative", "neutral"],
-        "medmcqa":    ["A", "B", "C", "D"],
-    }
-    return label_map.get(task_id)
+    """Return valid output labels for format-violation checking, or None.
+
+    Reads the labels.json sidecar emitted by prepare_datasets.py. Present for
+    every closed-set classification task (banking77, fpb, ledgar, medmcqa) and
+    absent for free-form tasks (cuad). This replaces a hardcoded map that
+    silently disabled format-violation checks for banking77 and ledgar — the
+    sidecar carries the full enumerated label set for those too.
+    """
+    p = REPO_ROOT / "data" / "prepared" / task_id / "labels.json"
+    if not p.exists():
+        return None
+    labels = json.loads(p.read_text())
+    if not isinstance(labels, list) or not labels:
+        return None
+    return [str(s) for s in labels]
 
 
 def _print_classify_summary(summaries: list[dict]) -> None:

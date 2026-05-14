@@ -26,7 +26,7 @@ from pydantic import BaseModel
 # Serializing calls with this lock prevents the AttributeError on concurrent loads.
 _load_from_disk_lock = threading.Lock()
 
-from checkpoint_utils import atomic_write_json, nv_prepared_dir
+from checkpoint_utils import atomic_write_json
 from pipeline.cache import rows_sha
 from pipeline.config import get_tasks
 from pipeline.paths import prompt_path
@@ -121,6 +121,27 @@ def to_chat(system: str, user: str, assistant: Optional[str] = None) -> dict:
     if assistant is not None:
         msgs.append({"role": "assistant", "content": assistant})
     return {"messages": msgs}
+
+
+def get_label_set(prompt: dict, label_names: Optional[list[str]]) -> Optional[list[str]]:
+    """Return the closed output label set for this task, or None for free-form tasks.
+
+    Mirrors format_assistant: the labels are the exact strings the model is
+    trained/expected to emit. Consumers (eval, classify) use this for guided
+    decoding and format-violation checks. Order is preserved when known
+    (ClassLabel.names ordering) since it can carry semantic meaning.
+    """
+    lf = prompt.get("label_format")
+    if lf == "letter":
+        label_map = prompt.get("label_map", {"0": "A", "1": "B", "2": "C", "3": "D"})
+        # label_map values are the rendered tokens (A/B/C/D); de-dup while preserving order.
+        seen: dict[str, None] = {}
+        for v in label_map.values():
+            seen.setdefault(str(v), None)
+        return list(seen)
+    if lf == "verbatim" and label_names:
+        return list(label_names)
+    return None
 
 
 # ── Sampling ───────────────────────────────────────────────────────────────
@@ -503,10 +524,32 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
     # Prompt versioning sidecar — records which prompt produced this prepared data.
     (out_dir / "prompt_sha.txt").write_text(prompt_sha + "\n")
 
-    if os.environ.get("NETWORK_VOLUME"):
-        nv_dir = nv_prepared_dir(cfg.task_id)
-        shutil.copytree(str(out_dir), str(nv_dir), dirs_exist_ok=True)
-        click.echo(f"  Mirrored to {nv_dir}")
+    # Up to 5 deterministic examples, one per distinct label.
+    if not smoke_test and fmt_train:
+        seen_labels: set[str] = set()
+        few_shot: list[dict] = []
+        for row in fmt_train:
+            msgs = row["messages"]
+            assistant_msg = next((m for m in msgs if m["role"] == "assistant"), None)
+            if assistant_msg is None:
+                continue
+            label = assistant_msg["content"]
+            if label in seen_labels:
+                continue
+            seen_labels.add(label)
+            few_shot.append(row)
+            if len(few_shot) >= 5:
+                break
+        if few_shot:
+            write_jsonl(few_shot, out_dir / "few_shot.jsonl")
+            click.echo(f"  [{cfg.task_id}] Curated few-shot: {len(few_shot)} examples spanning {len(seen_labels)} distinct labels")
+
+    # Closed-set label sidecar — emitted only when the task has a finite output
+    # vocabulary. Consumed by eval_local (guided_choice decoding) and by
+    # classify_errors (format_violation checking). Absent file → free-form task.
+    label_set = get_label_set(prompt, label_names)
+    if label_set is not None:
+        atomic_write_json(label_set, out_dir / "labels.json")
 
 
 @click.command()

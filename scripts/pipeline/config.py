@@ -41,6 +41,17 @@ def get_model_conditions() -> dict[str, list[str]]:
     return {m["id"]: m.get("conditions", []) for m in get_api_models()}
 
 
+def get_reasoning_capable() -> dict[str, bool]:
+    """Return {model_id: reasoning_capable} for all API models.
+
+    True means the model accepts the `reasoning_effort` parameter. The benchmark
+    sends `reasoning_effort="minimal"` for every reasoning-capable model so the
+    reasoning loop is off across the board — no model gets free inference-time
+    compute that another doesn't.
+    """
+    return {m["id"]: bool(m.get("reasoning_capable", False)) for m in get_api_models()}
+
+
 def get_sft_base_models() -> dict[str, str]:
     """Return {model_id: sft_base_model} for SFT-capable API models."""
     return {m["id"]: m["sft_base_model"] for m in get_sft_models()}
