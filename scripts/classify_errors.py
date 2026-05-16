@@ -16,7 +16,7 @@ import yaml
 from pydantic import BaseModel
 
 from checkpoint_utils import atomic_write_json
-from utils import load_jsonl, write_jsonl as _write_jsonl
+from utils import is_chunked, load_jsonl, load_label_set, question_id, write_jsonl as _write_jsonl
 from pipeline.config import get_tasks
 from pipeline.paths import classified_path, pred_path, summary_path
 
@@ -109,6 +109,10 @@ class TaskConfig(BaseModel):
     # metric_id — mismatches are flagged because they silently change what is measured.
     # Values: per_class_weighted | per_class_macro | per_example
     metric_granularity: str = "per_example"
+    # direct → the model output IS the label; compare it directly.
+    # tagged → the output is a CoT around <answer>X</answer> (medmcqa); the
+    #          <answer> payload is extracted before scoring.
+    answer_mode: str = "direct"
     eval_axes: list[str] = []
 
 
@@ -129,8 +133,17 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def token_f1(prediction: str, ground_truth: str) -> float:
-    """Compute token-level F1 (whitespace tokenization) for extraction tasks."""
+def token_f1(prediction: str, ground_truth) -> float:
+    """Token-level F1 (whitespace tokenization) for extraction tasks.
+
+    ground_truth may be a single gold string or a list of acceptable gold
+    answers; for a list the max F1 over them is returned — the standard
+    SQuAD/CUAD treatment of a question that has several equally-valid spans.
+    """
+    if isinstance(ground_truth, list):
+        if not ground_truth:
+            return token_f1(prediction, "")
+        return max(token_f1(prediction, g) for g in ground_truth)
     pred_tokens = normalize_text(prediction).split()
     gold_tokens = normalize_text(ground_truth).split()
     if not pred_tokens and not gold_tokens:
@@ -179,6 +192,24 @@ def is_format_violation(text: str, valid_labels: Optional[list[str]]) -> bool:
     return text not in valid_labels
 
 
+_ANSWER_TAG_RE = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.IGNORECASE | re.DOTALL)
+
+
+def extract_tagged_answer(text: str) -> str:
+    """Pull the <answer>...</answer> payload out of a chain-of-thought output.
+
+    Tagged tasks (medmcqa) train the model to emit
+    `<thinking>...</thinking><answer>X</answer>`; scoring uses X, not the whole
+    generation. When no <answer> tag is present the raw text is returned
+    unchanged — it then fails the closed-set check and is scored as a format
+    violation, the correct outcome for an output that ignored the required
+    format. The last tag wins, so a stray <answer> inside the thinking block
+    does not shadow the real answer.
+    """
+    matches = _ANSWER_TAG_RE.findall(text or "")
+    return matches[-1].strip() if matches else (text or "")
+
+
 # ── Classification task error classification ───────────────────────────────
 
 def classify_classification(prediction: str, ground_truth: str, valid_labels: Optional[list[str]] = None) -> str:
@@ -202,8 +233,16 @@ def classify_classification(prediction: str, ground_truth: str, valid_labels: Op
 
 # ── Extraction task error classification ──────────────────────────────────
 
-def classify_extraction(prediction: str, ground_truth: str, f1_threshold_partial: float = 0.5) -> str:
-    """Priority: empty > format_violation > correct > partial > hallucinated > not_applicable."""
+def classify_extraction(prediction: str, ground_truth, f1_threshold_partial: float = 0.5) -> str:
+    """Priority: empty > format_violation > correct > partial > hallucinated > not_applicable.
+
+    ground_truth may be a list of valid gold spans (a CUAD question can have
+    several); the prediction is then classified against whichever span it
+    matches best (max-F1), mirroring multi-answer extraction scoring.
+    """
+    if isinstance(ground_truth, list):
+        ground_truth = (max(ground_truth, key=lambda g: token_f1(prediction, g))
+                        if ground_truth else "")
     if is_empty(prediction):
         return "empty"
 
@@ -311,10 +350,20 @@ def aggregate_seed_summaries(summaries: list[dict]) -> dict:
         "metric_ci_lo": round(ci_lo, 4),
         "metric_ci_hi": round(ci_hi, 4),
         "exact_match": _mean_field("exact_match"),
+        "precision_at_1": _mean_field("precision_at_1"),
         "macro_f1": _mean_field("macro_f1"),
         "weighted_f1": _mean_field("weighted_f1"),
         "hallucination_rate": _mean_field("hallucination_rate"),
+        "answer_detection_precision": _mean_field("answer_detection_precision"),
+        "answer_detection_recall": _mean_field("answer_detection_recall"),
+        "answer_detection_f1": _mean_field("answer_detection_f1"),
+        "precision_at_80_recall": _mean_field("precision_at_80_recall"),
+        "aupr": _mean_field("aupr"),
         "n_predictions": sum(s.get("n_predictions", 0) for s in summaries),
+        # Token totals summed across seeds so the dashboard can still derive
+        # cost from an aggregated (_agg) summary, exactly as for a single seed.
+        "total_input_tokens": sum(s.get("total_input_tokens", 0) or 0 for s in summaries),
+        "total_output_tokens": sum(s.get("total_output_tokens", 0) or 0 for s in summaries),
         "total_reasoning_tokens": sum(s.get("total_reasoning_tokens", 0) or 0 for s in summaries),
         "total_answer_tokens": sum(s.get("total_answer_tokens", 0) or 0 for s in summaries),
         "error_counts": dict(all_counts),
@@ -324,6 +373,67 @@ def aggregate_seed_summaries(summaries: list[dict]) -> dict:
         "eval_axes": eval_axes,
         "axis_scores": agg_axis_scores,
     }
+
+
+# ── Sliding-window chunk aggregation ───────────────────────────────────────
+
+def _reads_as_no_answer(text: str) -> bool:
+    """True when an extraction output (or gold) signals 'no clause is present'."""
+    norm = normalize_text(str(text))
+    if not norm:
+        return True
+    return (norm == "none"
+            or any(p in norm for p in ("not found", "no answer", "not applicable", "not mentioned")))
+
+
+def aggregate_chunk_predictions(predictions: list[dict]) -> list[dict]:
+    """Collapse sliding-window chunk predictions into one row per question.
+
+    Sliding-window tasks (CUAD) emit one prediction per context window, with ids
+    `..._chunkNN`. This regroups windows by question and picks a single answer:
+    the most confident window (highest avg_logprob) that returned a real
+    extraction, falling back to "Not found." when no window did. Token, latency
+    and reasoning counts are SUMMED across every window so downstream cost stays
+    the true per-question cost of running the model over the whole contract.
+    """
+    groups: dict[str, list[dict]] = defaultdict(list)
+    order: list[str] = []
+    for r in predictions:
+        base = question_id(r.get("id", ""))
+        if base not in groups:
+            order.append(base)
+        groups[base].append(r)
+
+    def _errored(c: dict) -> bool:
+        return str(c.get("output", "")).startswith("ERROR:")
+
+    aggregated: list[dict] = []
+    for base in order:
+        chunks = groups[base]
+        # Prefer a window that returned a real extraction; among those, the most
+        # confident (highest avg_logprob). Else the first non-errored window
+        # ("Not found."), else the first window.
+        extracted = [c for c in chunks
+                     if not _errored(c) and not _reads_as_no_answer(c.get("output", ""))]
+        if extracted:
+            chosen = max(
+                extracted,
+                key=lambda c: c["avg_logprob"] if c.get("avg_logprob") is not None else float("-inf"),
+            )
+        else:
+            non_errored = [c for c in chunks if not _errored(c)]
+            chosen = non_errored[0] if non_errored else chunks[0]
+
+        agg = dict(chosen)
+        agg["id"] = base
+        agg["input_tokens"] = sum(c.get("input_tokens", 0) for c in chunks)
+        agg["output_tokens"] = sum(c.get("output_tokens", 0) for c in chunks)
+        agg["reasoning_tokens"] = sum(c.get("reasoning_tokens", 0) or 0 for c in chunks)
+        agg["latency_ms"] = sum(c.get("latency_ms", 0) or 0 for c in chunks)
+        agg["ttft_ms"] = chunks[0].get("ttft_ms", 0.0)
+        agg["n_chunks"] = len(chunks)
+        aggregated.append(agg)
+    return aggregated
 
 
 # ── Primary metric computation ─────────────────────────────────────────────
@@ -363,13 +473,19 @@ def compute_metric(task_cfg: TaskConfig, classified_rows: list[dict]) -> Optiona
 def compute_classification_metrics(
     classified_rows: list[dict], valid_labels: Optional[list[str]]
 ) -> dict:
-    """Compute EM, macro/weighted F1, and hallucination_rate for a classification task.
+    """Compute EM, Precision@1, macro/weighted F1, and hallucination_rate.
 
-    All four are always computed for closed-set classification regardless of the
+    All are always computed for closed-set classification regardless of the
     task's primary metric_id, so the dashboard can surface them side-by-side.
     Returns Nones for tasks where the metric doesn't apply (e.g. extraction).
 
       EM             = correct / n_predictions (strict label equality).
+      Precision@1    = correct / n_predictions. For a single-best-answer task
+                       each example yields exactly one prediction and one gold
+                       label, so "relevant items in the top-1 result" reduces to
+                       the EM indicator — Precision@1 equals EM by construction.
+                       Reported under its own name because medmcqa lists it as a
+                       primary metric.
       Macro-F1       = unweighted mean of per-class F1 (rare classes equal vote).
       Weighted-F1    = per-class F1 weighted by class support in y_true.
       Hallucination  = format_violation / n — fraction of outputs that look
@@ -384,6 +500,7 @@ def compute_classification_metrics(
     if n == 0:
         return {
             "exact_match": None,
+            "precision_at_1": None,
             "macro_f1": None,
             "weighted_f1": None,
             "hallucination_rate": None,
@@ -391,6 +508,8 @@ def compute_classification_metrics(
 
     correct = sum(1 for r in classified_rows if r.get("error_category") == "correct")
     exact_match = round(correct / n, 4)
+    # Precision@1 ≡ EM for a single-best-answer task: one prediction, one gold.
+    precision_at_1 = exact_match
 
     try:
         from sklearn.metrics import f1_score
@@ -413,9 +532,93 @@ def compute_classification_metrics(
 
     return {
         "exact_match": exact_match,
+        "precision_at_1": precision_at_1,
         "macro_f1": macro,
         "weighted_f1": weighted,
         "hallucination_rate": hallucination,
+    }
+
+
+# ── Extraction metrics (positive / no-answer mix) ──────────────────────────
+
+_EXTRACTION_METRIC_KEYS = (
+    "answer_detection_precision", "answer_detection_recall", "answer_detection_f1",
+    "precision_at_80_recall", "aupr",
+)
+
+# token-F1 at/above which an extraction counts as a real "hit" for Precision@Recall.
+_EXTRACTION_HIT_THRESHOLD = 0.5
+
+
+def compute_extraction_metrics(classified_rows: list[dict]) -> dict:
+    """Metrics for an extraction task with a positive / no-answer mix (CUAD).
+
+    answer_detection_{precision,recall,f1}: the binary "is this clause present
+      at all?" decision — the model "says present" when it returns a
+      non-"Not found." extraction.
+    precision_at_80_recall / aupr: rank questions by the model's confidence
+      (avg_logprob), sweep an accept threshold down the ranking, and trace a
+      precision-recall curve over the answerable questions. A question is a hit
+      when the model attempts an extraction and scores token-F1 >= 0.5. AUPR is
+      the area under that curve; precision_at_80_recall is the (interpolated)
+      best precision at recall >= 0.8, or None if 0.8 recall is unreachable.
+    Returns Nones for every key when there are no rows.
+    """
+    if not classified_rows:
+        return {k: None for k in _EXTRACTION_METRIC_KEYS}
+
+    # (gold_answerable, pred_answered, hit, confidence) per question.
+    items: list[tuple[bool, bool, bool, Optional[float]]] = []
+    for r in classified_rows:
+        golds = r.get("ground_truth", [])
+        if isinstance(golds, str):
+            golds = [golds]
+        gold_answerable = bool(golds) and not all(_reads_as_no_answer(g) for g in golds)
+        pred_answered = not _reads_as_no_answer(r.get("output", ""))
+        hit = gold_answerable and pred_answered and r.get("token_f1", 0.0) >= _EXTRACTION_HIT_THRESHOLD
+        items.append((gold_answerable, pred_answered, hit, r.get("avg_logprob")))
+
+    # ── answer-detection precision / recall / F1 ───────────────────────────
+    tp = sum(1 for a, p, _, _ in items if a and p)
+    fp = sum(1 for a, p, _, _ in items if not a and p)
+    fn = sum(1 for a, p, _, _ in items if a and not p)
+    det_p = tp / (tp + fp) if (tp + fp) else 0.0
+    det_r = tp / (tp + fn) if (tp + fn) else 0.0
+    det_f1 = 2 * det_p * det_r / (det_p + det_r) if (det_p + det_r) else 0.0
+
+    # ── confidence-ranked Precision@Recall / AUPR ──────────────────────────
+    total_answerable = sum(1 for a, _, _, _ in items if a)
+    p_at_80: Optional[float] = None
+    aupr: Optional[float] = None
+    if total_answerable:
+        # Rank by confidence (descending); missing confidence sorts last.
+        ranked = sorted(
+            items, reverse=True,
+            key=lambda it: (it[3] is not None, it[3] if it[3] is not None else 0.0),
+        )
+        curve: list[tuple[float, float]] = []  # (recall, precision)
+        accepted = accepted_hits = 0
+        for _, pred_answered, hit, _ in ranked:
+            if not pred_answered:
+                continue  # an abstention is never an accepted extraction
+            accepted += 1
+            accepted_hits += int(hit)
+            curve.append((accepted_hits / total_answerable, accepted_hits / accepted))
+        if curve:
+            at80 = [prec for rec, prec in curve if rec >= 0.80]
+            p_at_80 = round(max(at80), 4) if at80 else None
+            pts = [(0.0, curve[0][1])] + curve
+            aupr = round(sum((pts[i][0] - pts[i - 1][0]) * (pts[i][1] + pts[i - 1][1]) / 2
+                             for i in range(1, len(pts))), 4)
+        else:
+            aupr = 0.0
+
+    return {
+        "answer_detection_precision": round(det_p, 4),
+        "answer_detection_recall": round(det_r, 4),
+        "answer_detection_f1": round(det_f1, 4),
+        "precision_at_80_recall": p_at_80,
+        "aupr": aupr,
     }
 
 
@@ -436,11 +639,16 @@ def classify_predictions(
         enriched = dict(row)
 
         if task_cfg.task_type == "classification":
-            cat = classify_classification(pred, gt, valid_labels)
+            # Tagged (CoT) tasks emit <thinking>...</thinking><answer>X</answer> —
+            # score the extracted <answer>, not the whole generation.
+            scored = extract_tagged_answer(pred) if task_cfg.answer_mode == "tagged" else pred
+            cat = classify_classification(scored, gt, valid_labels)
             enriched["error_category"] = cat
-            # predicted_clean is the raw prediction (no normalisation) for valid
-            # rows, "__INVALID__" sentinel otherwise. Used by F1 — strict match.
-            enriched["predicted_clean"] = pred if cat not in ("empty", "refusal", "format_violation") else "__INVALID__"
+            # predicted_clean is the (extracted) prediction for valid rows,
+            # "__INVALID__" sentinel otherwise. Used by F1 — strict match.
+            enriched["predicted_clean"] = scored if cat not in ("empty", "refusal", "format_violation") else "__INVALID__"
+            if task_cfg.answer_mode == "tagged":
+                enriched["parsed_answer"] = scored
 
         elif task_cfg.task_type == "extraction":
             cat = classify_extraction(pred, gt)
@@ -487,6 +695,14 @@ def process_model_task_condition(
         click.echo(f"  [dry-run] Would classify {len(predictions)} predictions for {label}")
         return {}
 
+    # Sliding-window tasks (CUAD) emit one prediction per context window;
+    # collapse them to one row per question before classifying so metrics and
+    # cost are per-question, not per-window.
+    if is_chunked(predictions):
+        n_windows = len(predictions)
+        predictions = aggregate_chunk_predictions(predictions)
+        click.echo(f"  [{label}] aggregated {n_windows} window predictions → {len(predictions)} questions")
+
     classified, counts = classify_predictions(predictions, task_cfg, valid_labels)
 
     classified_out = classified_path(REPO_ROOT, source, model_short, task_id, condition)
@@ -511,9 +727,14 @@ def process_model_task_condition(
         classification_metrics = compute_classification_metrics(classified, valid_labels)
     else:
         classification_metrics = {
-            "exact_match": None, "macro_f1": None,
+            "exact_match": None, "precision_at_1": None, "macro_f1": None,
             "weighted_f1": None, "hallucination_rate": None,
         }
+
+    if task_cfg.task_type == "extraction":
+        extraction_metrics = compute_extraction_metrics(classified)
+    else:
+        extraction_metrics = {k: None for k in _EXTRACTION_METRIC_KEYS}
 
     from pipeline.data_quality import _percentile
 
@@ -611,9 +832,16 @@ def process_model_task_condition(
         "metric_value": round(metric_value, 4) if metric_value is not None else None,
         # Classification-only fields below are None for extraction tasks.
         "exact_match": classification_metrics["exact_match"],
+        "precision_at_1": classification_metrics["precision_at_1"],
         "macro_f1": classification_metrics["macro_f1"],
         "weighted_f1": classification_metrics["weighted_f1"],
         "hallucination_rate": classification_metrics["hallucination_rate"],
+        # Extraction-only fields below are None for classification tasks.
+        "answer_detection_precision": extraction_metrics["answer_detection_precision"],
+        "answer_detection_recall": extraction_metrics["answer_detection_recall"],
+        "answer_detection_f1": extraction_metrics["answer_detection_f1"],
+        "precision_at_80_recall": extraction_metrics["precision_at_80_recall"],
+        "aupr": extraction_metrics["aupr"],
         "error_counts": counts,
         "semantic_error_counts": dict(semantic_counts),
         "format_compliance_rate": format_compliance_rate,
@@ -654,19 +882,10 @@ def process_model_task_condition(
 def get_valid_labels(task_id: str) -> Optional[list[str]]:
     """Return valid output labels for format-violation checking, or None.
 
-    Reads the labels.json sidecar emitted by prepare_datasets.py. Present for
-    every closed-set classification task (banking77, fpb, ledgar, medmcqa) and
-    absent for free-form tasks (cuad). This replaces a hardcoded map that
-    silently disabled format-violation checks for banking77 and ledgar — the
-    sidecar carries the full enumerated label set for those too.
+    Present for every closed-set classification task (banking77, fpb, ledgar,
+    medmcqa) and absent for free-form tasks (cuad).
     """
-    p = REPO_ROOT / "data" / "prepared" / task_id / "labels.json"
-    if not p.exists():
-        return None
-    labels = json.loads(p.read_text())
-    if not isinstance(labels, list) or not labels:
-        return None
-    return [str(s) for s in labels]
+    return load_label_set(REPO_ROOT, task_id)
 
 
 def _print_classify_summary(summaries: list[dict]) -> None:
@@ -701,7 +920,7 @@ def main(model: str, task: str, condition: str, source: str, dry_run: bool) -> N
     task_ids = ALL_TASKS if task == "all" else [task]
 
     if condition == "all":
-        conditions = ["zero-shot", "5-shot", "lora", "api-sft"]
+        conditions = ["zero-shot", "5-shot", "lora"]
     else:
         conditions = [condition]
 

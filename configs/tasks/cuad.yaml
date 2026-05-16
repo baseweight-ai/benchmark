@@ -1,16 +1,37 @@
 task_id: cuad
 task_name: "Contract Clause Extraction"
-dataset_path: "chenghao/cuad_qa"
+# The canonical Atticus CUAD QA dataset — a full contract x clause-type grid in
+# which ~half of (contract, clause) pairs have no answer, so the benchmark can
+# measure abstention as well as extraction.
+dataset_path: "theatticusproject/cuad-qa"
 dataset_config: null
+# theatticusproject/cuad-qa ships a loading script, which datasets>=3 can no
+# longer execute. Load the Hub's auto-generated Parquet conversion instead.
+dataset_revision: "refs/convert/parquet"
+# The full train split is ~22.5k rows, each carrying an entire contract — large
+# on disk. Pull a 12k-row slice (≈290 contracts, ample to sample 3k from); the
+# test split is comparatively small, so pull it whole (backs multi-seed too).
+download_caps:
+  train: 12000
+  test: null
 task_type: extraction
 metric_id: token_f1
 metric_label: "Token F1"
-# per_example: arithmetic mean of per-document token-level F1 (SQuAD-style). Each
-# contract clause question is equally weighted regardless of span length or clause type.
-# An alternative is per_class_macro averaging over clause types, but per-document
-# averaging is standard for extraction benchmarks.
+# per_example: arithmetic mean of per-question token-level F1 (SQuAD-style),
+# kept as the headline metric — on a no-answer question a correct "Not found."
+# scores 1.0, so token-F1 reads sensibly across the answerable/no-answer mix.
+# Because the dataset is now 50/50 answerable/no-answer, classify_errors also
+# reports answer-detection precision/recall/F1 (is a clause present at all?)
+# and a confidence-ranked Precision@80%Recall + AUPR — the CUAD-style metrics
+# that only become meaningful once no-answer questions are present.
+#
+# Sliding-window chunking (see below) expands one test question into several
+# windowed prompts; classify_errors aggregates the per-window predictions back
+# to a single per-question score before these metrics are computed.
 metric_granularity: per_example
-max_output_tokens: 512
+# Gold clauses run up to ~480 words (~670 tokens); 768 leaves headroom so even
+# the longest clause is extracted in full rather than truncated mid-span.
+max_output_tokens: 768
 lm_eval_task_id: null
 train_sampling:
   strategy: stratified
@@ -18,18 +39,39 @@ train_sampling:
   total_cap: 3000
   min_per_group: 5
   seed: 42
+  balance_by: has_answer       # 50/50 answerable / no-answer questions
 test_sampling:
   strategy: stratified
   stratify_by: clause_type
   total_cap: 500
   min_per_group: 1
   seed: 42
+  balance_by: has_answer       # 50/50 answerable / no-answer questions
 eval_axes: [token_f1, cost, latency]
 prompt_file: "prompts/cuad.json"
-context_max_tokens: 750
 skip_conditions: [5-shot]
 epochs_by_size:
   small: 10
   medium: 5
   large: 3
-max_seq_length: 2048
+# A 750-word window (~1.1k tokens) + system prompt + a 768-token extraction must
+# fit in one sequence; 2560 leaves margin. At 2048 the long clauses would be
+# truncated by the sequence limit even with a larger max_output_tokens.
+max_seq_length: 2560
+
+# ── Context-window management: sliding-window chunking ──────────────────────
+# CUAD contracts average ~9k words — far past any usable context budget — so
+# naive head-truncation drops the clause. prepare_datasets.py instead slides a
+# fixed window across each contract:
+#   - training: each question contributes exactly one window — the answer-bearing
+#     window for an answerable question, a random window (target "Not found.")
+#     for a no-answer one. The 50/50 answerable/no-answer split (balance_by,
+#     above) teaches completion-only SFT both extraction and abstention; no
+#     synthetic answer-free windows are needed.
+#   - test: each question is expanded into one prompt per window (capped at
+#     `max_chunks`); classify_errors aggregates the per-window predictions back
+#     to one score per question (and sums their tokens so cost stays per-question).
+# context_max_tokens is the window size in whitespace-delimited words.
+context_max_tokens: 750
+context_stride_tokens: 600          # window step — 150-word overlap between windows
+max_chunks: 12                      # cap on windows emitted per test contract

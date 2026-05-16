@@ -5,7 +5,6 @@ import asyncio
 import json
 import os
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -15,13 +14,13 @@ import traceback as _tb
 import click
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from checkpoint_utils import append_jsonl, finalize_partial, load_partial_ids, partial_path
-from utils import build_messages, load_jsonl, rows_hash as _rows_hash, read_prompt_sha as _read_prompt_sha, seed_sample as _seed_sample
+from utils import build_messages, load_jsonl, load_label_set as _load_label_set, question_id, rows_hash as _rows_hash, read_prompt_sha as _read_prompt_sha, seed_sample_questions
 from pipeline.config import get_model_conditions, get_openai_models, get_reasoning_capable, get_tasks
 from pipeline.log import configure, get_logger
-from pipeline.paths import pred_path, training_meta_path
+from pipeline.paths import pred_path
 from pipeline.providers import call_openai  # noqa: F401  # re-exported for test patching
 
 _log = get_logger("eval-api")
@@ -34,11 +33,13 @@ OPENAI_MODELS: dict[str, Optional[str]] = get_openai_models()
 MODEL_CONDITIONS: dict[str, list[str]] = get_model_conditions()
 REASONING_CAPABLE: dict[str, bool] = get_reasoning_capable()
 
-# OpenAI's lowest-effort reasoning tier — effectively disables the loop.
-REASONING_EFFORT_OFF = "minimal"
+# Reasoning fully off — the v1 benchmark holds every model to the same
+# (non-reasoning) compute regime so the cost/latency comparison stays
+# apples-to-apples. A later benchmark version may turn reasoning on.
+REASONING_EFFORT_OFF = "none"
 
-SMOKE_MODELS = ["gpt-4.1-nano"]
-PROD_MODELS  = ["gpt-4.1-mini", "gpt-5.5"]
+SMOKE_MODELS = ["gpt-5.4-nano"]
+PROD_MODELS  = ["gpt-5.4-mini"]
 ALL_API_MODELS = SMOKE_MODELS + PROD_MODELS
 
 MAX_CONCURRENCY = 5
@@ -48,6 +49,11 @@ class TaskConfig(BaseModel):
     task_id: str
     max_output_tokens: int
     task_type: str
+    # direct → the raw output IS the label (banking77/fpb/ledgar): the response
+    #          is response_format-constrained and classify compares it directly.
+    # tagged → the output is a chain-of-thought wrapped around <answer>X</answer>
+    #          (medmcqa): unconstrained — a CoT cannot be pinned to a label set.
+    answer_mode: str = "direct"
     skip_conditions: list[str] = []
 
 
@@ -58,65 +64,52 @@ def load_task_config(task_id: str) -> TaskConfig:
     return TaskConfig(**{k: v for k, v in data.items() if k in TaskConfig.model_fields})
 
 
-async def _load_sft_model_id(model_id: str, task_id: str) -> Optional[str]:
-    """Return the fine-tuned model ID from training metadata.
+def load_label_set(task_id: str) -> Optional[list[str]]:
+    """Return the closed label set written by prepare_datasets, or None.
 
-    If the job is still pending (submitted via --submit-only), polls OpenAI until
-    it completes and updates metadata.json with the final ft_model_id.
-    Returns None if not trained or if the job fails.
+    Read to build the response_format schema that pins API classification
+    answers to the same set eval_local constrains the local model with.
     """
-    mp = training_meta_path(REPO_ROOT, "api", model_id, task_id, "api-sft")
-    if not mp.exists():
-        return None
-    with open(mp) as f:
-        meta = json.load(f)
+    return _load_label_set(REPO_ROOT, task_id)
 
-    ft_model_id = meta.get("ft_model_id")
-    if ft_model_id:
-        return ft_model_id
 
-    job_id = meta.get("job_id")
-    if not job_id:
-        return None
+def build_label_response_format(labels: list[str]) -> dict:
+    """OpenAI structured-output schema pinning the answer to one label.
 
-    from openai import OpenAI
-    from checkpoint_utils import atomic_write_json
-    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-    key = f"{model_id}/{task_id}/api-sft"
-    click.echo(f"  [{key}] Training job {job_id} still pending, waiting for completion...")
+    The API counterpart of vLLM's guided_choice: the model must return
+    {"label": <one of labels>}. eval_local constrains the local model to the
+    exact same set, so the closed-set comparison stays apples-to-apples.
+    """
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "classification_label",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {"label": {"type": "string", "enum": list(labels)}},
+                "required": ["label"],
+                "additionalProperties": False,
+            },
+        },
+    }
 
-    poll_start = last_log = time.time()
-    while True:
-        job = client.fine_tuning.jobs.retrieve(job_id)
-        if job.status == "succeeded":
-            with open(REPO_ROOT / "configs" / "pricing.yaml") as f:
-                pricing = yaml.safe_load(f)
-            training_per_m = pricing.get("apis", {}).get(model_id, {}).get("training_per_m", 25.0)
-            trained_tokens = job.trained_tokens or 0
-            training_time_min = (
-                round((job.finished_at - job.created_at) / 60, 1)
-                if job.finished_at and job.created_at else None
-            )
-            updated = {
-                "ft_model_id": job.fine_tuned_model,
-                "job_id": job_id,
-                "trained_tokens": trained_tokens,
-                "training_cost": trained_tokens * training_per_m / 1_000_000,
-                "training_time_min": training_time_min,
-                "n_train": meta.get("n_train", 0),
-            }
-            atomic_write_json(updated, mp)
-            click.echo(f"  [{key}] Training complete → {job.fine_tuned_model}")
-            return job.fine_tuned_model
-        elif job.status in ("failed", "cancelled"):
-            click.echo(f"  [{key}] Training job ended with status: {job.status}", err=True)
-            return None
 
-        now = time.time()
-        if now - last_log >= 60:
-            click.echo(f"  [{key}/{job.status}] waiting... ({int(now - poll_start)}s elapsed)")
-            last_log = now
-        await asyncio.sleep(15)
+def parse_constrained_label(text: str) -> str:
+    """Unwrap the bare label from a response_format JSON object.
+
+    response_format constrains the output to {"label": X}; storing the bare X
+    keeps API predictions in the same shape as local (guided_choice) ones. On
+    any parse failure the raw text is returned so the anomaly stays visible
+    rather than being silently swallowed.
+    """
+    try:
+        obj = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return text
+    if isinstance(obj, dict) and "label" in obj:
+        return str(obj["label"])
+    return text
 
 
 async def run_eval(
@@ -139,15 +132,14 @@ async def run_eval(
         raise FileNotFoundError(f"test data not found: {base_test_path}")
 
     # For seed > 0, resample from the full test set when it's available.
+    # Resample whole questions, not rows: chunked tasks (CUAD) have many rows per
+    # question, and a question's windows must stay together. Degenerates to
+    # row-level resampling for unchunked tasks (one row == one question).
     if eval_seed > 0 and full_test_path.exists() and not smoke_test:
-        meta_path = prepared / "dataset_meta.json"
-        if meta_path.exists():
-            with open(meta_path) as f:
-                n_test = json.load(f)["n_test"]
-        else:
-            n_test = len(load_jsonl(base_test_path))
+        base_rows = load_jsonl(base_test_path)
+        n_questions = len({question_id(r["id"]) for r in base_rows})
         full_rows = load_jsonl(full_test_path)
-        test_rows = _seed_sample(full_rows, n_test, eval_seed)
+        test_rows = seed_sample_questions(full_rows, n_questions, eval_seed)
     else:
         test_rows = load_jsonl(base_test_path)
 
@@ -174,18 +166,10 @@ async def run_eval(
     prompt_sha = _read_prompt_sha(prepared)
     few_shot_hash = _rows_hash(few_shot) if few_shot else None
 
-    # Resolve the exact model string to use — task-specific for api-sft, base otherwise.
-    # Never mutate the module-level OPENAI_MODELS dict; keep model_str local so
-    # different tasks in the same run each get the right ft model.
-    if condition == "api-sft":
-        model_str = await _load_sft_model_id(model_id, task_id)
-        if not model_str:
-            click.echo(f"  SKIP [{model_id}/{task_id}/api-sft]: no training metadata — run train_api.py first")
-            return
-    else:
-        model_str = OPENAI_MODELS.get(model_id)
-        if not model_str:
-            raise ValueError(f"Model string not set for {model_id}")
+    # Resolve the model string. Never mutate the module-level OPENAI_MODELS dict.
+    model_str = OPENAI_MODELS.get(model_id)
+    if not model_str:
+        raise ValueError(f"Model string not set for {model_id}")
 
     if dry_run:
         seed_label = f" seed={eval_seed}" if eval_seed > 0 else ""
@@ -220,6 +204,20 @@ async def run_eval(
     # Non-capable models reject the param entirely — only send when supported.
     reasoning_effort = REASONING_EFFORT_OFF if REASONING_CAPABLE.get(model_id, False) else None
 
+    # Constrained decoding: classification tasks whose raw output IS the label
+    # (answer_mode == "direct") get response_format pinned to labels.json — the
+    # SAME closed set eval_local constrains the local model with via guided_choice.
+    # Tagged/CoT tasks (medmcqa) and extraction (cuad) stay unconstrained.
+    label_set = load_label_set(task_id)
+    constrain = (
+        task_cfg.task_type == "classification"
+        and task_cfg.answer_mode == "direct"
+        and label_set is not None
+    )
+    response_format = build_label_response_format(label_set) if constrain else None
+    if constrain:
+        click.echo(f"  response_format: {len(label_set)} labels for {task_id}")
+
     async def process_row(row: dict) -> None:
         msgs = build_messages(row, few_shot, condition)
         ground_truth = row.get("label", "")
@@ -227,7 +225,12 @@ async def run_eval(
             text, in_tok, out_tok, reasoning_tok, lat, ttft, avg_logprob = await call_openai(
                 client, model_str, msgs, task_cfg.max_output_tokens, semaphore,
                 reasoning_effort=reasoning_effort,
+                response_format=response_format,
             )
+            # Unwrap {"label": X} → bare X so API predictions match the local
+            # (guided_choice) output shape that classify_errors expects.
+            if response_format is not None:
+                text = parse_constrained_label(text)
         except Exception as exc:
             text, in_tok, out_tok, reasoning_tok, lat, ttft, avg_logprob = (
                 f"ERROR: {exc}", 0, 0, 0, 0, 0.0, None
@@ -275,16 +278,13 @@ async def run_eval(
 @click.command()
 @click.option("--model", default="all", help=f"Model ID or 'all'. Choices: {', '.join(ALL_API_MODELS)}")
 @click.option("--task", default="all", help="Task ID or 'all'")
-@click.option("--condition", default="all", help="zero-shot|5-shot|api-sft|all")
+@click.option("--condition", default="all", help="zero-shot|5-shot|all")
 @click.option("--eval-seed", "eval_seed", default=0, type=int,
               help="Evaluation seed (0 = deterministic sample; >0 resamples from test_full.jsonl)")
 @click.option("--dry-run", is_flag=True)
 @click.option("--smoke-test", is_flag=True)
 def main(model: str, task: str, condition: str, eval_seed: int, dry_run: bool, smoke_test: bool) -> None:
-    """Evaluate frontier OpenAI models on benchmark tasks.
-
-    For api-sft conditions, training metadata must already exist (run train_api.py first).
-    """
+    """Evaluate frontier OpenAI models on benchmark tasks (zero-shot and 5-shot)."""
     configure(REPO_ROOT)
     default_models = SMOKE_MODELS if smoke_test else PROD_MODELS
     model_ids = default_models if model == "all" else [model]

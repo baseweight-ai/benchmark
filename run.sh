@@ -9,10 +9,9 @@
 #   --download       Run download_data.py
 #   --prepare        Run prepare_datasets.py
 #   --train-local    Run train_local.py (local QLoRA training)
-#   --train-api      Run train_api.py   (OpenAI SFT training — idempotent, never reruns unless --force)
-#   --train          Both --train-local and --train-api
+#   --train          Alias for --train-local
 #   --eval-local     Run eval_local.py  (vLLM, fine-tuned models)
-#   --eval-api       Run eval_api.py    (frontier API eval; api-sft requires --train-api first)
+#   --eval-api       Run eval_api.py    (frontier API eval — zero-shot and 5-shot)
 #   --eval           Both --eval-local and --eval-api
 #   --classify       Run classify_errors.py (error classification + summaries)
 #   --dashboard      Run generate_dashboard_data.py
@@ -23,12 +22,11 @@
 #   --cpu            Skip train-local and eval-local (GPU steps); run API steps only
 #   --task TASK      Task ID or 'all' (default: all)
 #   --model MODEL    Model ID or 'all' (default: qwen3-8b; qwen2.5-0.5b with --smoke-test)
-#   --from STAGE     Run STAGE and all downstream stages. Aliases: train (both branches),
-#                    eval (both branches). Specific: train-local, train-api, eval-local,
+#   --from STAGE     Run STAGE and all downstream stages. Aliases: train (= train-local),
+#                    eval (both eval branches). Specific: train-local, eval-local,
 #                    eval-api, classify, dashboard. Overrides explicit step flags.
 #   --clean          Delete prior outputs for selected steps/model/task, then run
 #   --dry-run        Pass --dry-run to all supporting scripts
-#   --force          Pass --force to train_api.py (retrain even if already trained)
 #   --test-sampling  Run download+prepare with full production data to verify sampling. --task still applies.
 #   -h, --help       Show this message
 
@@ -48,7 +46,6 @@ DO_SETUP=false
 DO_DOWNLOAD=false
 DO_PREPARE=false
 DO_TRAIN_LOCAL=false
-DO_TRAIN_API=false
 DO_EVAL_LOCAL=false
 DO_EVAL_API=false
 DO_CLASSIFY=false
@@ -63,7 +60,6 @@ TASK="all"
 MODEL_OVERRIDE=""   # explicit --model; empty = use resolved default below
 CLEAN=false
 DRY_RUN=false
-FORCE=false
 FROM_STAGE=""
 
 # ---------------------------------------------------------------------------
@@ -79,9 +75,8 @@ while [[ $# -gt 0 ]]; do
         --setup)        DO_SETUP=true;                              ANY_STEP=true; shift ;;
         --download)     DO_DOWNLOAD=true;                           ANY_STEP=true; shift ;;
         --prepare)      DO_PREPARE=true;                            ANY_STEP=true; shift ;;
-        --train-local)  DO_TRAIN_LOCAL=true;                           ANY_STEP=true; shift ;;
-        --train-api)    DO_TRAIN_API=true;                             ANY_STEP=true; shift ;;
-        --train)        DO_TRAIN_LOCAL=true; DO_TRAIN_API=true;        ANY_STEP=true; shift ;;
+        --train-local)  DO_TRAIN_LOCAL=true;                        ANY_STEP=true; shift ;;
+        --train)        DO_TRAIN_LOCAL=true;                        ANY_STEP=true; shift ;;
         --eval-local)   DO_EVAL_LOCAL=true;                         ANY_STEP=true; shift ;;
         --eval-api)     DO_EVAL_API=true;                           ANY_STEP=true; shift ;;
         --eval)         DO_EVAL_LOCAL=true;  DO_EVAL_API=true;      ANY_STEP=true; shift ;;
@@ -97,7 +92,6 @@ while [[ $# -gt 0 ]]; do
         --from)        FROM_STAGE="$2";        ANY_STEP=true; shift 2 ;;
         --clean)         CLEAN=true;             shift ;;
         --dry-run)       DRY_RUN=true;           shift ;;
-        --force)         FORCE=true;             shift ;;
         --test-sampling) TEST_SAMPLING=true;     shift ;;
         -h|--help)     usage ;;
         *) echo "Unknown argument: $1" >&2; usage ;;
@@ -111,7 +105,7 @@ fi
 
 if [[ "$ALL_STEPS" == true ]]; then
     DO_SETUP=true; DO_DOWNLOAD=true; DO_PREPARE=true
-    DO_TRAIN_LOCAL=true; DO_EVAL_LOCAL=true; DO_TRAIN_API=true
+    DO_TRAIN_LOCAL=true; DO_EVAL_LOCAL=true
     DO_EVAL_API=true; DO_CLASSIFY=true; DO_DASHBOARD=true
 fi
 
@@ -119,31 +113,23 @@ fi
 _apply_from_stage() {
     DO_SETUP=false
     DO_DOWNLOAD=false; DO_PREPARE=false
-    DO_TRAIN_LOCAL=false; DO_TRAIN_API=false
+    DO_TRAIN_LOCAL=false
     DO_EVAL_LOCAL=false; DO_EVAL_API=false
     DO_CLASSIFY=false; DO_DASHBOARD=false
     case "$1" in
         download)
             DO_DOWNLOAD=true; DO_PREPARE=true
-            DO_TRAIN_LOCAL=true; DO_TRAIN_API=true
+            DO_TRAIN_LOCAL=true
             DO_EVAL_LOCAL=true; DO_EVAL_API=true
             DO_CLASSIFY=true; DO_DASHBOARD=true ;;
         prepare)
             DO_PREPARE=true
-            DO_TRAIN_LOCAL=true; DO_TRAIN_API=true
+            DO_TRAIN_LOCAL=true
             DO_EVAL_LOCAL=true; DO_EVAL_API=true
             DO_CLASSIFY=true; DO_DASHBOARD=true ;;
-        train)
-            DO_TRAIN_LOCAL=true; DO_TRAIN_API=true
-            DO_EVAL_LOCAL=true; DO_EVAL_API=true
-            DO_CLASSIFY=true; DO_DASHBOARD=true ;;
-        train-local)
+        train|train-local)
             DO_TRAIN_LOCAL=true
             DO_EVAL_LOCAL=true
-            DO_CLASSIFY=true; DO_DASHBOARD=true ;;
-        train-api)
-            DO_TRAIN_API=true
-            DO_EVAL_API=true
             DO_CLASSIFY=true; DO_DASHBOARD=true ;;
         eval)
             DO_EVAL_LOCAL=true; DO_EVAL_API=true
@@ -158,7 +144,7 @@ _apply_from_stage() {
             DO_CLASSIFY=true; DO_DASHBOARD=true ;;
         dashboard)
             DO_DASHBOARD=true ;;
-        *) echo "Unknown --from stage: $1  (valid: download prepare train train-local train-api eval eval-local eval-api classify dashboard)" >&2; exit 1 ;;
+        *) echo "Unknown --from stage: $1  (valid: download prepare train train-local eval eval-local eval-api classify dashboard)" >&2; exit 1 ;;
     esac
 }
 
@@ -181,14 +167,14 @@ _run_tagged() {
 }
 
 # Fail fast if API steps require a key that isn't present.
-if [[ "$DO_TRAIN_API" == true ]] || [[ "$DO_EVAL_API" == true ]]; then
+if [[ "$DO_EVAL_API" == true ]]; then
     step "pipeline" "API key check"
     _api_key="${OPENAI_API_KEY:-}"
     if [[ -z "$_api_key" ]] && [[ -f "${REPO_ROOT}/.env" ]]; then
         _api_key=$(grep -E "^OPENAI_API_KEY=" "${REPO_ROOT}/.env" | tail -1 | cut -d= -f2- || true)
     fi
     if [[ -z "$_api_key" ]] || [[ "$_api_key" == "sk-..." ]] || [[ ${#_api_key} -lt 20 ]]; then
-        echo "  [pipeline] FAIL  OPENAI_API_KEY  not set or invalid — add it to ${REPO_ROOT}/.env before running train-api or eval-api" >&2
+        echo "  [pipeline] FAIL  OPENAI_API_KEY  not set or invalid — add it to ${REPO_ROOT}/.env before running eval-api" >&2
         exit 1
     fi
     echo "  [pipeline] OK    OPENAI_API_KEY  ${_api_key:0:12}…  (${#_api_key} chars)"
@@ -258,9 +244,6 @@ if [[ "$SMOKE_TEST" == true ]]; then SMOKE_FLAG="--smoke-test"; fi
 DRY_FLAG=""
 if [[ "$DRY_RUN" == true ]]; then DRY_FLAG="--dry-run"; fi
 
-FORCE_FLAG=""
-if [[ "$FORCE" == true ]]; then FORCE_FLAG="--force"; fi
-
 # Glob-safe delete — skips patterns that match nothing.
 clean_paths() {
     local p hit
@@ -308,10 +291,6 @@ if [[ "$CLEAN" == true ]]; then
     fi
 
     API_MODEL_G=$(glob "${MODEL_OVERRIDE:-all}")
-
-    if [[ "$DO_TRAIN_API" == true ]]; then
-        clean_paths "${REPO_ROOT}/results/training/api/${API_MODEL_G}/${TASK_G}"
-    fi
 
     if [[ "$DO_EVAL_API" == true ]]; then
         clean_paths \
@@ -363,7 +342,6 @@ _add_stage() { STAGES="${STAGES:+${STAGES},}${1}"; }
 [[ "$DO_DOWNLOAD" == true ]]    && _add_stage "download"
 [[ "$DO_PREPARE" == true ]]     && _add_stage "prepare"
 [[ "$DO_TRAIN_LOCAL" == true ]] && _add_stage "train-local"
-[[ "$DO_TRAIN_API" == true ]]   && _add_stage "train-api"
 [[ "$DO_EVAL_LOCAL" == true ]]  && _add_stage "eval-local"
 [[ "$DO_EVAL_API" == true ]]    && _add_stage "eval-api"
 [[ "$DO_CLASSIFY" == true ]]    && _add_stage "classify"
@@ -387,7 +365,6 @@ elif [[ -n "$STAGES" ]]; then
     [[ -n "$MODEL_OVERRIDE" ]]  && RUN_ARGS+=("--api-model" "$MODEL_OVERRIDE")
     [[ -n "$SMOKE_FLAG" ]]      && RUN_ARGS+=("$SMOKE_FLAG")
     [[ -n "$DRY_FLAG" ]]        && RUN_ARGS+=("$DRY_FLAG")
-    [[ -n "$FORCE_FLAG" ]]      && RUN_ARGS+=("$FORCE_FLAG")
 
     $PYTHON "${SCRIPTS}/run.py" "${RUN_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"
 fi

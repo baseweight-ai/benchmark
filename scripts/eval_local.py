@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 from checkpoint_utils import append_jsonl, atomic_write_json, finalize_partial, load_partial_ids, partial_path
-from utils import build_messages, load_jsonl, rows_hash as _rows_hash, read_prompt_sha as _read_prompt_sha, seed_sample as _seed_sample
+from utils import build_messages, load_jsonl, load_label_set as _load_label_set, question_id, rows_hash as _rows_hash, read_prompt_sha as _read_prompt_sha, seed_sample_questions
 from pipeline.config import get_local_models, get_tasks
 from pipeline.hardware import check_allowed_gpu, get_current_gpu_name
 from pipeline.log import configure, get_logger
@@ -52,6 +52,9 @@ class TaskConfig(BaseModel):
     max_output_tokens: int
     task_type: str
     max_seq_length: Optional[int] = None
+    # direct → the raw output IS the label: guided_choice constrains decoding.
+    # tagged → output is a CoT around <answer>X</answer> (medmcqa): unconstrained.
+    answer_mode: str = "direct"
     skip_conditions: list[str] = []
 
 
@@ -84,18 +87,14 @@ def get_test_path(task_id: str, smoke_test: bool) -> Path:
 
 
 def load_label_set(task_id: str) -> Optional[list[str]]:
-    """Return the closed label set written by prepare_datasets, or None.
+    """Return the closed answer set written by prepare_datasets, or None.
 
-    Presence of labels.json is the signal that guided decoding applies — the
-    file is emitted exactly when the task has a finite output vocabulary.
+    Whether guided decoding actually applies is a separate decision — run_eval
+    constrains only classification tasks with answer_mode == "direct" (medmcqa
+    has a closed A/B/C/D answer set but emits a free-form CoT, so it is not
+    constrained).
     """
-    p = REPO_ROOT / "data" / "prepared" / task_id / "labels.json"
-    if not p.exists():
-        return None
-    labels = json.loads(p.read_text())
-    if not isinstance(labels, list) or not labels:
-        return None
-    return [str(s) for s in labels]
+    return _load_label_set(REPO_ROOT, task_id)
 
 
 def load_test_rows(task_id: str, smoke_test: bool, eval_seed: int = 0) -> list[dict]:
@@ -113,7 +112,11 @@ def load_test_rows(task_id: str, smoke_test: bool, eval_seed: int = 0) -> list[d
 
     if eval_seed > 0 and full_path.exists() and not smoke_test:
         full_prompts = load_jsonl(full_path)
-        prompts = _seed_sample(full_prompts, len(base_prompts), eval_seed)
+        # Resample whole questions, not rows: chunked tasks (CUAD) have many rows
+        # per question, and a question's windows must stay together. Degenerates
+        # to row-level resampling for unchunked tasks (one row == one question).
+        n_questions = len({question_id(r["id"]) for r in base_prompts})
+        prompts = seed_sample_questions(full_prompts, n_questions, eval_seed)
         if full_labels_path.exists():
             label_map = {r["id"]: r["label"] for r in load_jsonl(full_labels_path)}
         else:
@@ -372,10 +375,15 @@ async def run_eval(
     chat_template_kwargs = (
         {"enable_thinking": False} if model_cfg.enable_thinking is False else None
     )
-    # Closed-set tasks (banking77, fpb, ledgar, medmcqa) get vLLM's guided_choice
-    # constraint, which pins decoding to one of the valid labels. Free-form tasks
-    # (cuad extraction) skip this — labels.json is absent for them.
-    guided_choice = load_label_set(task_id)
+    # Constrained decoding: classification tasks whose raw output IS the label
+    # (answer_mode == "direct": banking77, fpb, ledgar) get vLLM's guided_choice,
+    # which pins decoding to the labels.json set. medmcqa is a tagged CoT task
+    # and cuad is free-form extraction — both stay unconstrained.
+    guided_choice = (
+        load_label_set(task_id)
+        if task_cfg.task_type == "classification" and task_cfg.answer_mode == "direct"
+        else None
+    )
     if guided_choice:
         click.echo(f"  guided_choice: {len(guided_choice)} labels for {task_id}")
 

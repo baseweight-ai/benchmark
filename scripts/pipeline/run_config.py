@@ -11,18 +11,11 @@ class Timeouts(BaseModel):
     download_s: int = 3600
     prepare_s: int = 3600
     train_local_s: int = 43200   # 12 h
-    train_api_s: int = 43200     # 12 h
     eval_local_s: int = 7200     # 2 h
     eval_api_s: int = 3600       # 1 h
     classify_s: int = 1800
     dashboard_s: int = 300
     catalog_s: int = 60
-
-
-class CostCaps(BaseModel):
-    train_api_usd: float = 100.0
-    eval_api_usd: float = 50.0
-    total_usd: float = 200.0
 
 
 class RunConfig(BaseModel):
@@ -31,10 +24,8 @@ class RunConfig(BaseModel):
     api_models: list[str] = Field(default_factory=lambda: ["all"])
     smoke_test: bool = False
     dry_run: bool = False
-    force: bool = False
     n_eval_seeds: int = 1
     timeouts: Timeouts = Field(default_factory=Timeouts)
-    cost_caps: CostCaps = Field(default_factory=CostCaps)
 
     @classmethod
     def from_yaml(cls, path: Path) -> "RunConfig":

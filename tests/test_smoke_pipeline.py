@@ -31,7 +31,7 @@ pytestmark = pytest.mark.smoke
 REPO_ROOT = Path(__file__).parent.parent
 
 TASK_ID = "fpb"
-MODEL_ID = "gpt-4.1-nano"
+MODEL_ID = "gpt-5.4-nano"
 CONDITION = "zero-shot"
 N = 8  # toy dataset size
 
@@ -128,6 +128,13 @@ def _stage_dashboard(root: Path, monkeypatch) -> Path:
     """Stage 4: generate dashboard data."""
     from datetime import datetime, timezone
     monkeypatch.setattr(generate_dashboard_data, "REPO_ROOT", root)
+    # gpt-5.4-* are hypothetical models absent from litellm's pricing DB; stub
+    # the lookup so the smoke test exercises the cost path deterministically
+    # rather than depending on a live pricing database.
+    monkeypatch.setattr(
+        generate_dashboard_data.litellm, "get_model_info",
+        lambda *a, **kw: {"input_cost_per_token": 2e-6, "output_cost_per_token": 8e-6},
+    )
     data = generate_dashboard_data.build_dashboard_data(daily_volume=1000)
 
     out = root / "dashboard-data" / "results.json"

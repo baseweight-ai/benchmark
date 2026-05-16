@@ -27,10 +27,6 @@ def get_api_models() -> list[dict]:
     return list(_load()["models"]["api"])
 
 
-def get_sft_models() -> list[dict]:
-    return [m for m in get_api_models() if m.get("sft_base_model")]
-
-
 def get_openai_models() -> dict[str, Optional[str]]:
     """Return {model_id: pinned_version} for all API models."""
     return {m["id"]: m.get("pinned_version") for m in get_api_models()}
@@ -45,13 +41,8 @@ def get_reasoning_capable() -> dict[str, bool]:
     """Return {model_id: reasoning_capable} for all API models.
 
     True means the model accepts the `reasoning_effort` parameter. The benchmark
-    sends `reasoning_effort="minimal"` for every reasoning-capable model so the
+    sends `reasoning_effort="none"` for every reasoning-capable model so the
     reasoning loop is off across the board — no model gets free inference-time
     compute that another doesn't.
     """
     return {m["id"]: bool(m.get("reasoning_capable", False)) for m in get_api_models()}
-
-
-def get_sft_base_models() -> dict[str, str]:
-    """Return {model_id: sft_base_model} for SFT-capable API models."""
-    return {m["id"]: m["sft_base_model"] for m in get_sft_models()}

@@ -6,7 +6,6 @@ Can also be invoked directly:
 """
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 
@@ -17,14 +16,12 @@ SCRIPTS = Path(__file__).parent
 sys.path.insert(0, str(SCRIPTS))
 
 from pipeline.dag import DAGRunner, Stage, StageResult, StageStatus
-from pipeline.log import configure, get_logger
+from pipeline.log import configure
 from pipeline.run_config import RunConfig
-
-_log = get_logger("run")
 
 _ALL_STAGE_IDS = [
     "download", "prepare",
-    "train-local", "train-api",
+    "train-local",
     "eval-local", "eval-api",
     "classify", "dashboard", "catalog",
 ]
@@ -43,7 +40,6 @@ def _build_stages(cfg: RunConfig, selected_ids: list[str], run_id: str | None = 
     py = sys.executable
     smoke = ["--smoke-test"] if cfg.smoke_test else []
     dry = ["--dry-run"] if cfg.dry_run else []
-    force = ["--force"] if cfg.force else []
     resolved_tasks = cfg.resolved_tasks()
     if "all" in cfg.tasks:
         task_arg = "all"
@@ -85,14 +81,6 @@ def _build_stages(cfg: RunConfig, selected_ids: list[str], run_id: str | None = 
             description=f"Fine-tune {local_model} with QLoRA on the local GPU.",
         ),
         Stage(
-            id="train-api",
-            cmd=[py, str(SCRIPTS / "train_api.py"), *task, "--model", api_model, *smoke, *dry, *force],
-            depends_on=["prepare"],
-            compute="cloud",
-            timeout_s=t.train_api_s,
-            description=f"Submit and wait for OpenAI SFT fine-tuning jobs ({api_model}).",
-        ),
-        Stage(
             id="eval-local",
             cmd=[py, str(SCRIPTS / "eval_local.py"), *task, "--model", local_model, *smoke, *dry],
             depends_on=["train-local"],
@@ -103,10 +91,10 @@ def _build_stages(cfg: RunConfig, selected_ids: list[str], run_id: str | None = 
         Stage(
             id="eval-api",
             cmd=[py, str(SCRIPTS / "eval_api.py"), *task, "--model", api_model, *smoke, *dry],
-            depends_on=["train-api"],
+            depends_on=["prepare"],
             compute="cloud",
             timeout_s=t.eval_api_s,
-            description=f"Evaluate fine-tuned and base API models ({api_model}).",
+            description=f"Evaluate base API models zero-shot and 5-shot ({api_model}).",
         ),
         Stage(
             id="classify",
@@ -159,7 +147,7 @@ def _build_stages(cfg: RunConfig, selected_ids: list[str], run_id: str | None = 
                     id=sid,
                     cmd=[py, str(SCRIPTS / "eval_api.py"), *task, "--model", api_model,
                          "--eval-seed", str(n), *smoke, *dry],
-                    depends_on=["train-api"],
+                    depends_on=["prepare"],
                     compute="cloud",
                     timeout_s=t.eval_api_s,
                 ))
@@ -172,16 +160,6 @@ def _build_stages(cfg: RunConfig, selected_ids: list[str], run_id: str | None = 
     for s in selected:
         s.depends_on = [d for d in s.depends_on if d in selected_set]
     return selected
-
-
-def _check_training_costs(repo_root: Path) -> float:
-    total = 0.0
-    for p in (repo_root / "results" / "training" / "api").glob("*/*/*/metadata.json"):
-        try:
-            total += json.loads(p.read_text()).get("training_cost", 0.0)
-        except Exception:
-            pass
-    return total
 
 
 def _init_run_manifest(repo_root: Path):  # -> RunManifest | None
@@ -227,7 +205,6 @@ def _print_results(results: dict[str, StageResult], ordered_ids: list[str]) -> N
               help="API model ID or 'all' (overrides config)")
 @click.option("--smoke-test", is_flag=True)
 @click.option("--dry-run", is_flag=True)
-@click.option("--force", is_flag=True, help="Re-run even if outputs exist")
 @click.option("--cpu", is_flag=True, help="Skip GPU stages (train-local, eval-local)")
 @click.option("--test-sampling", "test_sampling", is_flag=True,
               help="Run only download + prepare with full (non-smoke) data to verify sampling. --task still applies.")
@@ -239,7 +216,6 @@ def main(
     api_model: str | None,
     smoke_test: bool,
     dry_run: bool,
-    force: bool,
     cpu: bool,
     test_sampling: bool,
 ) -> None:
@@ -247,7 +223,7 @@ def main(
     configure(REPO_ROOT)
 
     cfg = RunConfig.from_yaml(Path(config_path)) if config_path else RunConfig()
-    for attr, val in (("smoke_test", smoke_test), ("dry_run", dry_run), ("force", force)):
+    for attr, val in (("smoke_test", smoke_test), ("dry_run", dry_run)):
         if val:
             setattr(cfg, attr, True)
     if task and task != "all":
@@ -262,7 +238,6 @@ def main(
         selected_ids = ["download", "prepare"]
         cfg.smoke_test = False
         cfg.dry_run = False
-        cfg.force = True
         click.echo("--test-sampling: running download+prepare with full production data.")
     elif stages == "all":
         selected_ids = list(_ALL_STAGE_IDS)
@@ -281,7 +256,6 @@ def main(
     if not stage_list:
         click.echo("No stages to run.")
         return
-    caps = cfg.cost_caps
 
     def after_stage(result: StageResult) -> bool:
         if manifest is not None:
@@ -291,14 +265,6 @@ def main(
                 save_manifest(manifest, REPO_ROOT)
             except Exception:
                 pass
-        if result.status == StageStatus.DONE and result.stage_id in ("train-api", "eval-api"):
-            total = _check_training_costs(REPO_ROOT)
-            if total > caps.total_usd:
-                click.echo(
-                    f"\n  WARNING: accumulated API cost ${total:.2f} exceeds cap ${caps.total_usd:.2f}",
-                    err=True,
-                )
-                _log.warning("cost cap exceeded", event="cost_cap", cost_usd=round(total, 4))
         return True
 
     runner = DAGRunner(stage_list, REPO_ROOT, after_stage=after_stage)

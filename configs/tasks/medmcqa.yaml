@@ -6,12 +6,24 @@ task_type: classification
 num_classes: 4
 metric_id: accuracy
 metric_label: "Accuracy"
-# per_example: MCQ answer choices (A/B/C/D) are balanced across questions by construction,
-# so per-example accuracy is equivalent to micro-F1 and macro-F1 here. Each question
-# is weighted equally regardless of medical subject. Use weighted_f1 if you need to
-# account for imbalanced subject-area sampling in the test set.
+# Each question has exactly one correct option and the model emits exactly one
+# answer letter, so Accuracy = Exact-Match = Precision@1 are the same
+# 0/1-per-question quantity here. classify_errors reports metric_value (accuracy),
+# exact_match and precision_at_1; all three are identical by construction for a
+# single-best-answer MCQ. Answer choices are balanced A/B/C/D across questions,
+# so per-example accuracy also coincides with micro-F1 and macro-F1. Each
+# question is weighted equally regardless of medical subject.
 metric_granularity: per_example
-max_output_tokens: 8
+# answer_mode: tagged — the model is trained and prompted to emit a chain-of-thought
+# in <thinking>...</thinking> followed by <answer>X</answer>. classify_errors extracts
+# the <answer> letter before scoring. The output is deliberately NOT constrained-decoded:
+# a free-form CoT cannot be pinned to a fixed label set, so guided_choice / response_format
+# are disabled for this task (see eval_local.py / eval_api.py).
+answer_mode: tagged
+# CoT answers need room for the <thinking> block plus <answer>X</answer>. Dataset
+# explanations average ~115 tokens (p90 ~260); 512 leaves generous headroom so the
+# closing <answer> tag is reached before the generation budget runs out.
+max_output_tokens: 512
 test_split: validation
 lm_eval_task_id: medmcqa
 train_sampling:

@@ -75,6 +75,12 @@ def find_exact_dupes(texts: list[str]) -> list[int]:
 # Shingles appearing in > this fraction of docs are stop-shingles (excluded from index).
 _STOP_FRAC = 0.4
 
+# Work budget for near-dup detection. Shingle-Jaccard scans can blow up on long,
+# boilerplate-heavy documents (e.g. windowed legal contracts) — past this many
+# candidate pairs / comparisons the scan stops and the result is flagged
+# `truncated`, a lower bound rather than an unbounded runtime.
+_NEAR_DUP_BUDGET = 250_000
+
 
 def _shingles(text: str, k: int = 3) -> frozenset[str]:
     words = _norm(text).split()
@@ -110,13 +116,18 @@ def find_near_dupes(
     """
     n = len(texts)
     if n < 2:
-        return {"n_near_dup_pairs": 0, "threshold": threshold, "example_pairs": []}
+        return {"n_near_dup_pairs": 0, "threshold": threshold,
+                "example_pairs": [], "truncated": False}
 
     doc_sh = [_shingles(t, shingle_k) for t in texts]
     index = _build_index(doc_sh, n * _STOP_FRAC)
 
     candidates: set[tuple[int, int]] = set()
+    truncated = False
     for docs in index.values():
+        if len(candidates) >= _NEAR_DUP_BUDGET:
+            truncated = True  # boilerplate-heavy corpus — stop enumerating pairs
+            break
         for a in range(len(docs)):
             for b in range(a + 1, len(docs)):
                 candidates.add((docs[a], docs[b]))
@@ -134,6 +145,7 @@ def find_near_dupes(
         "n_near_dup_pairs": len(pairs),
         "threshold": threshold,
         "example_pairs": pairs[:5],
+        "truncated": truncated,
     }
 
 
@@ -153,7 +165,7 @@ def cross_split_near_dupes(
         return {
             "train_indices_to_filter": [],
             "exact_count": 0, "near_dup_count": 0, "total": 0,
-            "threshold": threshold, "example_pairs": [],
+            "threshold": threshold, "example_pairs": [], "truncated": False,
         }
 
     test_hashes = {_md5(t): j for j, t in enumerate(test_texts)}
@@ -164,8 +176,13 @@ def cross_split_near_dupes(
     to_filter: list[int] = []
     exact_count = near_dup_count = 0
     examples: list[tuple[int, int, float]] = []
+    comparisons = 0
+    truncated = False
 
     for i, t in enumerate(train_texts):
+        if comparisons >= _NEAR_DUP_BUDGET:
+            truncated = True  # boilerplate-heavy corpus — stop after the budget
+            break
         h = _md5(t)
         if h in test_hashes:
             to_filter.append(i)
@@ -179,6 +196,7 @@ def cross_split_near_dupes(
             cands.update(test_index.get(sh, []))
 
         for j in cands:
+            comparisons += 1
             sj = test_sh[j]
             u = si | sj
             jacc = len(si & sj) / len(u) if u else 1.0
@@ -196,6 +214,7 @@ def cross_split_near_dupes(
         "total": exact_count + near_dup_count,
         "threshold": threshold,
         "example_pairs": examples[:5],
+        "truncated": truncated,
     }
 
 
@@ -386,8 +405,9 @@ def print_quality_summary(report: dict) -> None:
     n_tr_nd = tr_nd.get("n_near_dup_pairs", 0)
     n_te_nd = te_nd.get("n_near_dup_pairs", 0)
     thresh = tr_nd.get("threshold", 0.8)
+    cap_note = "  [capped — lower bound]" if (tr_nd.get("truncated") or te_nd.get("truncated")) else ""
     if n_tr_nd or n_te_nd:
-        _line(f"Near-dupes:   train={n_tr_nd}  test={n_te_nd}  (Jaccard≥{thresh})", warn=True)
+        _line(f"Near-dupes:   train={n_tr_nd}  test={n_te_nd}  (Jaccard≥{thresh}){cap_note}", warn=True)
     else:
         _line(f"Near-dupes:   none found (Jaccard≥{thresh})")
 

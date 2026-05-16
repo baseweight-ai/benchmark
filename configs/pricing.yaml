@@ -1,10 +1,8 @@
-# Inference costs for API models are fetched dynamically via litellm.
-# Only add entries here for costs litellm cannot provide (e.g. fine-tuning).
-apis:
-  gpt-4.1-nano:
-    training_per_m: 25.00
-  gpt-4.1-mini:
-    training_per_m: 25.00
+# Inference costs for API models are fetched dynamically via litellm. The
+# benchmark no longer does OpenAI SFT, so there is no fine-tuning cost to pin
+# here — the only API spend is inference, which litellm prices. `apis` is kept
+# (empty) so pricing.yaml still satisfies the PricingConfig schema.
+apis: {}
 
 self_hosted:
   # Hourly rental rate for the GPU the eval is running on.

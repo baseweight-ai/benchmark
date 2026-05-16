@@ -1,9 +1,17 @@
 """Unit tests for utils.py."""
 import json
+from collections import Counter
 
 import pytest
 
-from utils import build_messages, load_jsonl, write_jsonl
+from utils import (
+    build_messages,
+    is_chunked,
+    load_jsonl,
+    question_id,
+    seed_sample_questions,
+    write_jsonl,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -96,3 +104,68 @@ def test_build_messages_5shot_skips_incomplete_examples():
     msgs = build_messages(test_row, [incomplete, full], "5-shot")
     # Only the full example contributes 2 turns
     assert len(msgs) == 1 + 2 + 1  # system + (user+asst) + final_user
+
+
+# ── question_id / is_chunked ───────────────────────────────────────────────────
+
+def test_question_id_strips_chunk_suffix():
+    assert question_id("cuad_test_0007_chunk03") == "cuad_test_0007"
+
+
+def test_question_id_leaves_unchunked_ids_unchanged():
+    assert question_id("fpb_test_0042") == "fpb_test_0042"
+
+
+def test_is_chunked_true_for_chunk_ids():
+    assert is_chunked([{"id": "cuad_test_0000_chunk00"}, {"id": "cuad_test_0000_chunk01"}])
+
+
+def test_is_chunked_false_for_plain_ids():
+    assert not is_chunked([{"id": "fpb_test_0000"}, {"id": "fpb_test_0001"}])
+
+
+# ── seed_sample_questions ──────────────────────────────────────────────────────
+
+def _chunk_rows(n_questions: int, chunks_per_q: int) -> list[dict]:
+    return [
+        {"id": f"cuad_test_{q:04d}_chunk{c:02d}"}
+        for q in range(n_questions)
+        for c in range(chunks_per_q)
+    ]
+
+
+def test_seed_sample_questions_keeps_each_questions_windows_together():
+    """The whole point: a sampled question keeps every one of its windows."""
+    rows = _chunk_rows(n_questions=20, chunks_per_q=5)
+    sampled = seed_sample_questions(rows, n_questions=8, seed=1)
+    per_q = Counter(question_id(r["id"]) for r in sampled)
+    assert len(per_q) == 8
+    assert all(count == 5 for count in per_q.values())
+
+
+def test_seed_sample_questions_deterministic():
+    rows = _chunk_rows(15, 4)
+    a = seed_sample_questions(rows, 6, seed=3)
+    b = seed_sample_questions(rows, 6, seed=3)
+    assert [r["id"] for r in a] == [r["id"] for r in b]
+
+
+def test_seed_sample_questions_different_seeds_differ():
+    rows = _chunk_rows(30, 3)
+    a = {question_id(r["id"]) for r in seed_sample_questions(rows, 10, seed=1)}
+    b = {question_id(r["id"]) for r in seed_sample_questions(rows, 10, seed=2)}
+    assert a != b
+
+
+def test_seed_sample_questions_caps_at_available():
+    rows = _chunk_rows(5, 3)
+    sampled = seed_sample_questions(rows, n_questions=99, seed=1)
+    assert len(sampled) == 15  # 5 questions x 3 windows — never more
+
+
+def test_seed_sample_questions_unchunked_is_reproducible_row_sample():
+    """One row per question → a plain, reproducible, distinct row subsample."""
+    rows = [{"id": f"fpb_test_{i:04d}"} for i in range(50)]
+    sampled = seed_sample_questions(rows, n_questions=20, seed=7)
+    assert len(sampled) == 20
+    assert len({r["id"] for r in sampled}) == 20

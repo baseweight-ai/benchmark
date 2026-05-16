@@ -4,12 +4,16 @@ from collections import Counter
 import pytest
 
 from prepare_datasets import (
+    chunk_cuad_test,
+    chunk_cuad_train,
     format_assistant,
+    format_eval_label,
+    format_gold,
     format_user,
     get_label_set,
     sample,
+    sliding_windows,
     to_chat,
-    truncate_context,
 )
 
 pytestmark = pytest.mark.unit
@@ -284,20 +288,194 @@ def test_balanced_sample_different_seeds_differ():
     assert [r["id"] for r in r1] != [r["id"] for r in r2]
 
 
-# ── truncate_context ───────────────────────────────────────────────────────────
+# ── format_gold / cot_letter ────────────────────────────────────────────────────
 
-def test_truncate_context_within_limit():
-    text = "word " * 100
-    result = truncate_context(text, 200)
-    assert result == text.strip() or len(result.split()) <= 200
-
-
-def test_truncate_context_at_limit():
-    text = " ".join(["word"] * 150)
-    result = truncate_context(text, 100)
-    assert len(result.split()) == 100
+_COT_PROMPT = {
+    "label_format": "cot_letter", "label_field": "cop", "explanation_field": "exp",
+    "label_map": {"0": "A", "1": "B", "2": "C", "3": "D"},
+}
 
 
-def test_truncate_context_short_text():
-    text = "short"
-    assert truncate_context(text, 1000) == text
+def test_format_gold_cot_letter_returns_bare_letter():
+    """The gold/label for a CoT task is the answer letter only — no thinking block."""
+    assert format_gold(_COT_PROMPT, {"cop": 2}) == "C"
+
+
+def test_format_assistant_cot_letter_wraps_thinking_and_answer():
+    out = format_assistant(_COT_PROMPT, {"cop": 0, "exp": "Because reasons."})
+    assert out == "<thinking>Because reasons.</thinking><answer>A</answer>"
+
+
+def test_format_assistant_cot_letter_strips_explanation_whitespace():
+    out = format_assistant(_COT_PROMPT, {"cop": 1, "exp": "  spaced out  "})
+    assert out == "<thinking>spaced out</thinking><answer>B</answer>"
+
+
+def test_format_gold_matches_format_assistant_for_non_cot():
+    """For verbatim/letter/extractive the training target IS the gold label."""
+    for prompt, row in [
+        ({"label_format": "verbatim", "label_field": "label"}, {"label": "positive"}),
+        ({"label_format": "letter", "label_field": "cop"}, {"cop": 1}),
+        ({"label_format": "extractive", "answer_field": "answers"},
+         {"answers": {"text": ["a clause"]}}),
+    ]:
+        assert format_gold(prompt, row) == format_assistant(prompt, row)
+
+
+def test_get_label_set_cot_letter_returns_choice_letters():
+    prompt = {"label_format": "cot_letter", "label_map": {"0": "A", "1": "B", "2": "C", "3": "D"}}
+    assert get_label_set(prompt, None) == ["A", "B", "C", "D"]
+
+
+# ── format_eval_label (multi-answer extraction gold) ────────────────────────────
+
+def test_format_eval_label_extractive_returns_all_spans():
+    """A CUAD question can have several valid gold spans — all are kept so
+    token_f1 can score the max over them."""
+    prompt = {"label_format": "extractive", "answer_field": "answers"}
+    row = {"answers": {"text": ["Governing Law: Delaware", "Delaware law governs"]}}
+    assert format_eval_label(prompt, row) == ["Governing Law: Delaware", "Delaware law governs"]
+
+
+def test_format_eval_label_extractive_drops_empty_spans():
+    prompt = {"label_format": "extractive", "answer_field": "answers"}
+    row = {"answers": {"text": ["real span", "", "  "]}}
+    assert format_eval_label(prompt, row) == ["real span"]
+
+
+def test_format_eval_label_extractive_no_answer_is_not_found():
+    prompt = {"label_format": "extractive", "answer_field": "answers"}
+    assert format_eval_label(prompt, {"answers": {"text": []}}) == ["Not found."]
+
+
+def test_format_eval_label_classification_returns_single_string():
+    """Closed-set tasks keep a single string label (delegates to format_gold)."""
+    assert format_eval_label({"label_format": "verbatim", "label_field": "label"},
+                             {"label": "positive"}) == "positive"
+    assert format_eval_label({"label_format": "letter", "label_field": "cop"},
+                             {"cop": 2}) == "C"
+
+
+# ── sliding_windows ─────────────────────────────────────────────────────────────
+
+def test_sliding_windows_short_text_single_window():
+    assert sliding_windows("a b c", window=10, stride=5) == ["a b c"]
+
+
+def test_sliding_windows_overlapping_windows():
+    text = " ".join(str(i) for i in range(10))  # 10 words
+    windows = sliding_windows(text, window=4, stride=2)
+    # windows start at 0, 2, 4, 6 → words [0:4], [2:6], [4:8], [6:10]
+    assert windows[0] == "0 1 2 3"
+    assert windows[1] == "2 3 4 5"
+    assert windows[-1].split()[-1] == "9"  # the tail word is covered
+
+
+def test_sliding_windows_respects_max_chunks():
+    text = " ".join(str(i) for i in range(100))
+    assert len(sliding_windows(text, window=10, stride=5, max_chunks=3)) == 3
+
+
+def test_sliding_windows_rejects_nonpositive_stride():
+    with pytest.raises(ValueError, match="stride"):
+        sliding_windows("a b c d", window=2, stride=0)
+
+
+# ── chunk_cuad_train / chunk_cuad_test ──────────────────────────────────────────
+
+def _cuad_row(context: str, answer: str) -> dict:
+    return {
+        "context": context,
+        "question": "Governing Law",
+        "answers": {"text": [answer] if answer else [], "answer_start": [0]},
+        "clause_type": "Governing Law",
+        "has_answer": bool(answer),
+    }
+
+
+def test_chunk_cuad_train_one_row_per_question():
+    """chunk_cuad_train reduces each question to exactly one window."""
+    rows_in = [
+        _cuad_row(" ".join(["a"] * 100), "a a a"),   # answerable
+        _cuad_row(" ".join(["b"] * 100), ""),        # no-answer
+    ]
+    out = chunk_cuad_train(rows_in, window=20, stride=15)
+    assert len(out) == 2
+
+
+def test_chunk_cuad_train_positive_window_contains_the_clause():
+    ctx = " ".join(["filler"] * 50 + ["the governing law is delaware"] + ["filler"] * 50)
+    out = chunk_cuad_train([_cuad_row(ctx, "the governing law is delaware")],
+                           window=20, stride=15)
+    assert out[0]["answers"]["text"], "expected an answer-bearing positive window"
+    assert "the governing law is delaware" in out[0]["context"]
+
+
+def test_chunk_cuad_train_positive_is_a_grid_window():
+    """The training positive is a real grid window — the same fixed grid the
+    test side uses — not an answer-snapped off-grid window, so train and eval
+    clause positions stay aligned (the position-bias fix)."""
+    ctx = " ".join(["filler"] * 200 + ["the unique target clause here"] + ["filler"] * 200)
+    grid = sliding_windows(ctx, window=60, stride=45)
+    out = chunk_cuad_train([_cuad_row(ctx, "the unique target clause here")],
+                           window=60, stride=45)
+    assert out[0]["context"] in grid
+    assert "the unique target clause here" in out[0]["context"]
+
+
+def test_chunk_cuad_train_no_answer_question_targets_not_found():
+    """A no-answer question yields one window with an empty (→ 'Not found.') target."""
+    ctx = " ".join(["some clause text"] * 100)
+    out = chunk_cuad_train([_cuad_row(ctx, "")], window=20, stride=15)
+    assert len(out) == 1
+    assert out[0]["answers"]["text"] == []
+
+
+def test_chunk_cuad_train_deterministic():
+    ctx = " ".join(["the answer here"] + ["x"] * 300)
+    a = chunk_cuad_train([_cuad_row(ctx, "the answer here")], window=20, stride=10, seed=42)
+    b = chunk_cuad_train([_cuad_row(ctx, "the answer here")], window=20, stride=10, seed=42)
+    assert [r["context"] for r in a] == [r["context"] for r in b]
+
+
+# ── sample() balance_by (50/50 positive / no-answer) ────────────────────────────
+
+def test_sample_balance_by_produces_5050():
+    rows = [{"has_answer": i % 2 == 0, "label": ["A", "B", "C"][i % 3], "id": i}
+            for i in range(300)]
+    out = sample(rows, strategy="stratified", stratify_by="label",
+                 total_cap=60, balance_by="has_answer", seed=42)
+    assert len(out) == 60
+    pos = sum(1 for r in out if r["has_answer"])
+    assert pos == 30 and len(out) - pos == 30
+
+
+def test_sample_balance_by_requires_total_cap():
+    with pytest.raises(ValueError, match="total_cap"):
+        sample([{"has_answer": True, "label": "A"}],
+               strategy="stratified", stratify_by="label", balance_by="has_answer")
+
+
+def test_sample_balance_by_caps_at_available():
+    """When one side is too small for a true 50/50, take all of it (no more)."""
+    rows = ([{"has_answer": True, "label": "A", "id": f"p{i}"} for i in range(10)]
+            + [{"has_answer": False, "label": "A", "id": f"n{i}"} for i in range(200)])
+    out = sample(rows, strategy="stratified", stratify_by="label",
+                 total_cap=100, balance_by="has_answer", seed=42)
+    assert sum(1 for r in out if r["has_answer"]) == 10
+
+
+def test_chunk_cuad_test_one_row_per_window_with_stable_ids():
+    ctx = " ".join(str(i) for i in range(100))
+    rows = chunk_cuad_test([_cuad_row(ctx, "5 6 7")], window=20, stride=20, max_chunks=10)
+    assert len(rows) >= 2
+    assert rows[0]["_eval_id"] == "cuad_test_0000_chunk00"
+    assert rows[1]["_eval_id"] == "cuad_test_0000_chunk01"
+
+
+def test_chunk_cuad_test_distinct_questions_get_distinct_ids():
+    ctx = " ".join(str(i) for i in range(60))
+    rows = chunk_cuad_test([_cuad_row(ctx, "1"), _cuad_row(ctx, "2")],
+                           window=20, stride=20, max_chunks=10)
+    assert any(r["_eval_id"].startswith("cuad_test_0000_") for r in rows)
+    assert any(r["_eval_id"].startswith("cuad_test_0001_") for r in rows)

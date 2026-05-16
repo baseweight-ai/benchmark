@@ -56,6 +56,7 @@ class InferenceClient(Protocol):
 async def _openai_once(
     client, model_str: str, messages: list[dict], max_tokens: int,
     reasoning_effort: str | None = None,
+    response_format: dict | None = None,
 ) -> InferenceResult:
     t0 = time.time()
     ttft_ms = 0.0
@@ -70,6 +71,10 @@ async def _openai_once(
     extra: dict = {}
     if reasoning_effort is not None:
         extra["extra_body"] = {"reasoning_effort": reasoning_effort}
+    # response_format is an OpenAI-native param (unlike reasoning_effort) — set
+    # directly, not via extra_body.
+    if response_format is not None:
+        extra["response_format"] = response_format
 
     stream = await client.chat.completions.create(
         model=model_str, messages=messages, temperature=0, max_tokens=max_tokens,
@@ -118,10 +123,13 @@ async def _openai_once(
 async def _openai_with_retries(
     client, model_str: str, messages: list[dict], max_tokens: int,
     reasoning_effort: str | None = None,
+    response_format: dict | None = None,
 ) -> InferenceResult:
     for attempt in range(MAX_RETRIES_OPENAI):
         try:
-            return await _openai_once(client, model_str, messages, max_tokens, reasoning_effort)
+            return await _openai_once(
+                client, model_str, messages, max_tokens, reasoning_effort, response_format
+            )
         except Exception as exc:
             if attempt == MAX_RETRIES_OPENAI - 1:
                 raise
@@ -145,17 +153,23 @@ async def call_openai(
     max_tokens: int,
     semaphore: asyncio.Semaphore,
     reasoning_effort: str | None = None,
+    response_format: dict | None = None,
 ) -> InferenceResult:
     """Stream one OpenAI request with retries and circuit-breaker protection.
 
-    reasoning_effort: pass "minimal" (or "low"/"medium"/"high") on a
+    reasoning_effort: pass "none" (or "minimal"/"low"/"medium"/"high") on a
     reasoning-capable model. Pass None on a non-reasoning model — the parameter
     is omitted entirely so the API doesn't reject the request.
+
+    response_format: pass an OpenAI structured-output schema to constrain the
+    output (e.g. a closed label set); pass None for free-form generation.
     """
     _openai_cb.raise_if_open()
     async with semaphore:
         return await _openai_cb.call(
-            _openai_with_retries(client, model_str, messages, max_tokens, reasoning_effort)
+            _openai_with_retries(
+                client, model_str, messages, max_tokens, reasoning_effort, response_format
+            )
         )
 
 
@@ -307,17 +321,19 @@ class OpenAIAdapter:
     """InferenceClient that wraps call_openai."""
 
     def __init__(self, client, model_str: str,
-                 reasoning_effort: str | None = None) -> None:
+                 reasoning_effort: str | None = None,
+                 response_format: dict | None = None) -> None:
         self._client = client
         self._model_str = model_str
         self._reasoning_effort = reasoning_effort
+        self._response_format = response_format
 
     async def complete(
         self, messages: list[dict], max_tokens: int, semaphore: asyncio.Semaphore
     ) -> InferenceResult:
         return await call_openai(
             self._client, self._model_str, messages, max_tokens, semaphore,
-            self._reasoning_effort,
+            self._reasoning_effort, self._response_format,
         )
 
 

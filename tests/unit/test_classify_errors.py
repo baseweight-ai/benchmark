@@ -4,13 +4,16 @@ from pathlib import Path
 import pytest
 
 from classify_errors import (
+    aggregate_chunk_predictions,
     aggregate_seed_summaries,
     classify_classification,
     classify_extraction,
     classify_predictions,
     compute_axis_scores,
     compute_metric,
+    extract_tagged_answer,
     get_valid_labels,
+    is_chunked,
     is_empty,
     is_format_violation,
     is_refusal,
@@ -230,6 +233,38 @@ def test_classify_extraction_format_violation_too_long():
     pred = " ".join(["word"] * 200)
     result = classify_extraction(pred, gt)
     assert result == "format_violation"
+
+
+# ── multi-answer extraction scoring (CUAD questions with several gold spans) ──
+
+def test_token_f1_list_takes_max_over_golds():
+    """A question with multiple valid spans → F1 is the best match, not the first."""
+    pred = "the agreement is governed by delaware law"
+    golds = ["completely unrelated text", "the agreement is governed by delaware law"]
+    assert token_f1(pred, golds) == pytest.approx(1.0)
+
+
+def test_token_f1_list_picks_best_partial():
+    pred = "delaware law"
+    golds = ["new york", "governed by delaware law here"]
+    assert token_f1(pred, golds) == max(token_f1(pred, g) for g in golds)
+    assert token_f1(pred, golds) > 0.0
+
+
+def test_token_f1_empty_list_matches_empty_string():
+    assert token_f1("anything", []) == token_f1("anything", "")
+
+
+def test_classify_extraction_list_credits_a_non_first_gold():
+    """The multi-answer fix: extracting the SECOND valid span must score
+    'correct', not be penalised for not matching answers[0]."""
+    pred = "either party may terminate on 30 days notice"
+    golds = ["the first valid clause text here", "either party may terminate on 30 days notice"]
+    assert classify_extraction(pred, golds) == "correct"
+
+
+def test_classify_extraction_empty_gold_list_treated_as_string():
+    assert classify_extraction("", []) == "empty"
 
 
 # ── compute_metric ─────────────────────────────────────────────────────────────
@@ -798,3 +833,200 @@ def test_aggregate_seed_summaries_missing_semantic_counts_handled():
     agg = aggregate_seed_summaries(summaries)
     assert "semantic_error_counts" in agg
     assert agg["semantic_error_counts"] == {}
+
+
+# ── extract_tagged_answer (CoT <answer> parsing) ──────────────────────────────
+
+def test_extract_tagged_answer_basic():
+    assert extract_tagged_answer("<thinking>reasoning</thinking><answer>C</answer>") == "C"
+
+
+def test_extract_tagged_answer_no_tag_returns_raw():
+    """No <answer> tag → raw text passes through (and later fails the closed-set
+    check, scoring as a format violation)."""
+    assert extract_tagged_answer("the answer is C") == "the answer is C"
+
+
+def test_extract_tagged_answer_strips_whitespace():
+    assert extract_tagged_answer("<answer>  B  </answer>") == "B"
+
+
+def test_extract_tagged_answer_last_tag_wins():
+    """A stray <answer> inside the thinking block must not shadow the real one."""
+    text = "<thinking>maybe <answer>A</answer></thinking><answer>D</answer>"
+    assert extract_tagged_answer(text) == "D"
+
+
+def test_extract_tagged_answer_case_insensitive_and_empty():
+    assert extract_tagged_answer("<ANSWER>A</ANSWER>") == "A"
+    assert extract_tagged_answer("") == ""
+
+
+# ── classify_predictions with answer_mode="tagged" ────────────────────────────
+
+def _tagged_cfg():
+    from classify_errors import TaskConfig
+    return TaskConfig(task_id="medmcqa", task_type="classification",
+                      metric_id="accuracy", answer_mode="tagged")
+
+
+def test_classify_predictions_tagged_scores_extracted_answer():
+    rows = [
+        {"id": "q0", "output": "<thinking>r</thinking><answer>C</answer>", "ground_truth": "C"},
+        {"id": "q1", "output": "<thinking>r</thinking><answer>A</answer>", "ground_truth": "B"},
+    ]
+    classified, _ = classify_predictions(rows, _tagged_cfg(), ["A", "B", "C", "D"])
+    assert classified[0]["error_category"] == "correct"
+    assert classified[0]["parsed_answer"] == "C"
+    assert classified[1]["error_category"] == "wrong_class"
+
+
+def test_classify_predictions_tagged_missing_tag_is_format_violation():
+    """A CoT output that never emits <answer> fails the closed-set check."""
+    rows = [{"id": "q0", "output": "I think it is option C honestly", "ground_truth": "C"}]
+    classified, _ = classify_predictions(rows, _tagged_cfg(), ["A", "B", "C", "D"])
+    assert classified[0]["error_category"] == "format_violation"
+
+
+# ── precision_at_1 ─────────────────────────────────────────────────────────────
+
+def test_compute_classification_metrics_precision_at_1_equals_em():
+    """Precision@1 ≡ EM by construction for a single-best-answer task."""
+    from classify_errors import compute_classification_metrics
+    rows = [
+        {"error_category": "correct", "ground_truth": "A", "predicted_clean": "A"},
+        {"error_category": "wrong_class", "ground_truth": "B", "predicted_clean": "A"},
+        {"error_category": "correct", "ground_truth": "C", "predicted_clean": "C"},
+    ]
+    out = compute_classification_metrics(rows, ["A", "B", "C", "D"])
+    assert out["precision_at_1"] == out["exact_match"] == pytest.approx(2 / 3, abs=1e-4)
+
+
+def test_compute_classification_metrics_precision_at_1_none_when_empty():
+    from classify_errors import compute_classification_metrics
+    assert compute_classification_metrics([], ["A"])["precision_at_1"] is None
+
+
+# ── sliding-window chunk aggregation ───────────────────────────────────────────
+
+def _chunk(cid, output, gt="the gold clause", logprob=None, in_tok=100, out_tok=10, lat=50.0):
+    return {"id": cid, "model": "m", "condition": "lora", "output": output,
+            "ground_truth": gt, "input_tokens": in_tok, "output_tokens": out_tok,
+            "reasoning_tokens": 0, "latency_ms": lat, "ttft_ms": 5.0,
+            "avg_logprob": logprob, "timestamp": "2026-01-01T00:00:00Z"}
+
+
+def test_is_chunked_detects_chunk_suffix():
+    assert is_chunked([_chunk("cuad_test_0000_chunk00", "x")])
+    assert not is_chunked([_chunk("fpb_test_0000", "x")])
+
+
+def test_aggregate_chunk_predictions_groups_by_question():
+    preds = [
+        _chunk("cuad_test_0000_chunk00", "Not found."),
+        _chunk("cuad_test_0000_chunk01", "the gold clause", logprob=-0.2),
+        _chunk("cuad_test_0001_chunk00", "Not found."),
+    ]
+    agg = aggregate_chunk_predictions(preds)
+    assert {r["id"] for r in agg} == {"cuad_test_0000", "cuad_test_0001"}
+
+
+def test_aggregate_chunk_predictions_picks_extraction_over_not_found():
+    preds = [
+        _chunk("cuad_test_0000_chunk00", "Not found."),
+        _chunk("cuad_test_0000_chunk01", "the gold clause", logprob=-0.1),
+    ]
+    assert aggregate_chunk_predictions(preds)[0]["output"] == "the gold clause"
+
+
+def test_aggregate_chunk_predictions_picks_most_confident_extraction():
+    preds = [
+        _chunk("cuad_test_0000_chunk00", "wrong span", logprob=-2.0),
+        _chunk("cuad_test_0000_chunk01", "the gold clause", logprob=-0.1),
+    ]
+    assert aggregate_chunk_predictions(preds)[0]["output"] == "the gold clause"
+
+
+def test_aggregate_chunk_predictions_sums_tokens_and_latency():
+    """Token and latency counts are summed across windows so downstream cost
+    stays the true per-question cost of processing the whole contract."""
+    preds = [
+        _chunk("cuad_test_0000_chunk00", "Not found.", in_tok=100, out_tok=5, lat=40.0),
+        _chunk("cuad_test_0000_chunk01", "the gold clause", in_tok=120, out_tok=15, lat=60.0),
+    ]
+    agg = aggregate_chunk_predictions(preds)[0]
+    assert agg["input_tokens"] == 220
+    assert agg["output_tokens"] == 20
+    assert agg["latency_ms"] == 100.0
+    assert agg["n_chunks"] == 2
+
+
+def test_aggregate_chunk_predictions_all_not_found():
+    preds = [
+        _chunk("cuad_test_0000_chunk00", "Not found."),
+        _chunk("cuad_test_0000_chunk01", "Not found."),
+    ]
+    agg = aggregate_chunk_predictions(preds)
+    assert len(agg) == 1
+    assert "not found" in agg[0]["output"].lower()
+
+
+# ── compute_extraction_metrics (positive / no-answer mix) ─────────────────────
+
+def _ext_row(golds, output, token_f1_val, logprob):
+    return {"ground_truth": golds, "output": output,
+            "token_f1": token_f1_val, "avg_logprob": logprob}
+
+
+def test_compute_extraction_metrics_answer_detection():
+    """Answer-detection P/R/F1 over the binary clause-present decision."""
+    from classify_errors import compute_extraction_metrics
+    rows = [
+        _ext_row(["the clause"], "the clause", 1.0, -0.1),      # answerable, answered  → TP
+        _ext_row(["another clause"], "Not found.", 0.0, -0.5),  # answerable, abstained → FN
+        _ext_row(["Not found."], "Not found.", 1.0, -0.2),      # no-answer, abstained  → TN
+        _ext_row(["Not found."], "made up clause", 0.0, -2.0),  # no-answer, answered   → FP
+    ]
+    m = compute_extraction_metrics(rows)
+    assert m["answer_detection_precision"] == pytest.approx(0.5)  # TP 1 / (TP 1 + FP 1)
+    assert m["answer_detection_recall"] == pytest.approx(0.5)     # TP 1 / (TP 1 + FN 1)
+    assert m["answer_detection_f1"] == pytest.approx(0.5)
+
+
+def test_compute_extraction_metrics_aupr_and_p80_perfect():
+    """Every answerable question hit confidently, no false positives → AUPR = 1."""
+    from classify_errors import compute_extraction_metrics
+    rows = [
+        _ext_row(["clause one"], "clause one", 1.0, -0.1),
+        _ext_row(["clause two"], "clause two", 1.0, -0.2),
+        _ext_row(["Not found."], "Not found.", 1.0, -0.3),
+    ]
+    m = compute_extraction_metrics(rows)
+    assert m["aupr"] == pytest.approx(1.0)
+    assert m["precision_at_80_recall"] == pytest.approx(1.0)
+
+
+def test_compute_extraction_metrics_p80_none_when_recall_unreachable():
+    """Two answerable questions, only one ever hit → recall caps at 0.5 → P@80%R undefined."""
+    from classify_errors import compute_extraction_metrics
+    rows = [
+        _ext_row(["clause one"], "clause one", 1.0, -0.1),
+        _ext_row(["clause two"], "wrong span", 0.0, -1.0),
+    ]
+    m = compute_extraction_metrics(rows)
+    assert m["precision_at_80_recall"] is None
+
+
+def test_compute_extraction_metrics_empty_returns_nones():
+    from classify_errors import compute_extraction_metrics
+    m = compute_extraction_metrics([])
+    assert all(v is None for v in m.values())
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("Not found.", True), ("not found", True), ("", True), ("None", True),
+    ("no answer", True), ("the governing law clause", False), ("Delaware", False),
+])
+def test_reads_as_no_answer(text, expected):
+    from classify_errors import _reads_as_no_answer
+    assert _reads_as_no_answer(text) is expected

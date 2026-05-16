@@ -12,24 +12,24 @@ models:
       conditions: [zero-shot, 5-shot, lora]
 
   api:
-    # reasoning_capable: whether this model accepts the OpenAI reasoning_effort
-    # parameter. When true, eval_api sends reasoning_effort="minimal" to disable
-    # the reasoning loop — keeps every model on the same compute regime so the
-    # cost/latency comparison is apples-to-apples. When false, the parameter is
-    # not sent (non-reasoning models would 400 on it).
-    - id: gpt-4.1-nano
-      pinned_version: gpt-4.1-nano-2025-04-14
-      conditions: [zero-shot, 5-shot, api-sft]
-      sft_base_model: gpt-4.1-nano-2025-04-14
-      reasoning_capable: false
-    - id: gpt-4.1-mini
-      pinned_version: gpt-4.1-mini-2025-04-14
-      conditions: [zero-shot, api-sft]
-      sft_base_model: gpt-4.1-mini-2025-04-14
-      reasoning_capable: false
-    - id: gpt-5.5
-      pinned_version: gpt-5.5
-      conditions: [5-shot]
+    # The v1 benchmark baseline is a single OpenAI model, gpt-5.4-mini, with
+    # gpt-5.4-nano standing in for --smoke-test runs. OpenAI SFT was dropped
+    # (deprecated), so api-sft is no longer a condition — API models are
+    # evaluated zero-shot and 5-shot only.
+    #
+    # reasoning_capable: whether the model accepts the OpenAI reasoning_effort
+    # parameter. When true, eval_api sends reasoning_effort="none" to switch the
+    # reasoning loop fully off — keeps every model on the same compute regime so
+    # the cost/latency comparison is apples-to-apples. When false, the parameter
+    # is not sent (non-reasoning models would 400 on it). v1 leaves reasoning
+    # off across the board; a later benchmark version may turn it on.
+    - id: gpt-5.4-mini
+      pinned_version: gpt-5.4-mini
+      conditions: [zero-shot, 5-shot]
+      reasoning_capable: true
+    - id: gpt-5.4-nano
+      pinned_version: gpt-5.4-nano
+      conditions: [zero-shot, 5-shot]
       reasoning_capable: true
 
 stages:
@@ -59,15 +59,6 @@ stages:
       - results/adapters/local/{model_short}/{task_id}/lora
       - results/training/local/{model_short}/{task_id}/lora/metadata.json
 
-  - id: train-api
-    script: scripts/train_api.py
-    trainer: api-sft
-    depends_on: [prepare]
-    inputs:
-      - data/prepared/{task_id}/train.jsonl
-    outputs:
-      - results/training/api/{model_id}/{task_id}/api-sft/metadata.json
-
   - id: eval-lm-harness
     script: scripts/eval_lm_harness.py
     optional: true
@@ -87,7 +78,7 @@ stages:
 
   - id: eval-api
     script: scripts/eval_api.py
-    depends_on: [train-api]
+    depends_on: [prepare]
     inputs:
       - data/prepared/{task_id}/test.jsonl
     outputs:
@@ -116,17 +107,17 @@ nondeterminism:
       seed_param: SEED=42
     - component: prepare_datasets.py FPB split
       seed_param: split_seed=42
+    - component: prepare_datasets.py CUAD sliding-window negatives
+      seed_param: random.Random(42)
     - component: train_local.py SFTConfig
       seed_param: training.seed=42 (set in configs/training/{model}.yaml)
     - component: train_local.py data cap sampling
       seed_param: random.Random(42)
 
   undetermined:
-    - component: OpenAI API SFT (train_api.py)
-      reason: Cloud training infrastructure; seed control not exposed
     - component: vLLM inference (eval_local.py)
       reason: temperature=0 but GPU floating-point non-determinism at kernel level
     - component: OpenAI API inference (eval_api.py)
       reason: temperature=0 but server-side non-determinism
-    - component: gpt-5.5 model version
+    - component: gpt-5.4-mini / gpt-5.4-nano model version
       reason: No dated snapshot available; pinned_version is an alias that may resolve to a newer model

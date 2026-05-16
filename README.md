@@ -15,25 +15,32 @@ A configurable pipeline for comparing QLoRA fine-tuned open-source models agains
 | Gemma 3 4B | 4B |
 | Phi-4 Mini | 3.8B |
 
-**Frontier API models** (zero-shot and 5-shot):
+**Frontier API baseline** (zero-shot and 5-shot):
 
-| Model | Provider |
-|-------|----------|
-| GPT-5.4 | OpenAI |
-| GPT-4.1, 4.1 Mini, 4.1 Nano | OpenAI |
-| GPT-4.1 SFT-500 | OpenAI (API fine-tuned) |
-| Gemini 2.5 Flash | Google |
+| Model | Provider | Role |
+|-------|----------|------|
+| GPT-5.4 Mini | OpenAI | v1 benchmark baseline |
+| GPT-5.4 Nano | OpenAI | `--smoke-test` stand-in |
+
+OpenAI SFT was dropped from the benchmark (deprecated), so API models are
+evaluated zero-shot and 5-shot only — there is no API fine-tuning condition.
 
 **Tasks and metrics:**
 
 | Task | Dataset | Type | Metric |
 |------|---------|------|--------|
 | Customer support routing | BANKING77 | Classification | Weighted F1 |
-| Contract clause extraction | CUAD | Extraction | Token F1 |
+| Contract clause extraction | CUAD | Extraction | Token F1 (+ answer-detection F1, AUPR) |
 | Legal document classification | LEDGAR | Classification | Macro F1 |
 | Financial sentiment | FPB | Classification | Macro F1 |
 | Medical QA | MedMCQA | Classification | Accuracy |
 | Code generation | MBPP | Code | Pass@1 |
+
+CUAD uses the full Atticus CUAD QA grid (`theatticusproject/cuad-qa`), balanced
+50/50 between questions whose clause is present and questions where it is
+absent — so it measures abstention as well as extraction. Long contracts are
+handled with sliding-window chunking (one inference per window, aggregated to a
+per-question score). See `configs/tasks/cuad.yaml` for the methodology detail.
 
 **Conditions per model:**
 
@@ -41,9 +48,7 @@ A configurable pipeline for comparing QLoRA fine-tuned open-source models agains
 |-----------|-------------|
 | `zero-shot` | System + user prompt, no examples |
 | `5-shot` | 5 in-context examples |
-| `lora-500` | QLoRA fine-tuned on 500 training examples |
-| `lora-full` | QLoRA fine-tuned on full training set |
-| `api-sft-500` | OpenAI SFT API fine-tuned on 500 examples |
+| `lora` | QLoRA fine-tuned on the task's training set (open-source models only) |
 
 ## Repository layout
 
@@ -113,9 +118,8 @@ python scripts/train_local.py --model qwen3-8b --task banking77 --condition all 
 # Local model via vLLM
 python scripts/eval_local.py --model qwen3-8b --task banking77 --condition all
 
-# Frontier API models
-python scripts/eval_api.py --model gpt-4.1 --task banking77 --condition all
-python scripts/eval_api.py --model gpt-4.1-sft --task banking77  # triggers SFT job
+# Frontier API baseline (zero-shot and 5-shot)
+python scripts/eval_api.py --model gpt-5.4-mini --task banking77 --condition all
 ```
 
 ### 4. Classify errors and compute metrics

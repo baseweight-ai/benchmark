@@ -11,10 +11,10 @@ Usage:
     from pipeline.log import configure, get_logger
     configure(REPO_ROOT)
     log = get_logger("eval-api")
-    log.info("eval complete", model="gpt-4.1-mini", task="fpb",
+    log.info("eval complete", model="gpt-5.4-mini", task="fpb",
              condition="zero-shot", event="stage_complete",
              n_rows=350, total_input_tokens=120_000, total_output_tokens=3_500)
-    log.error("request failed", model="gpt-4.1-mini", task="fpb",
+    log.error("request failed", model="gpt-5.4-mini", task="fpb",
               exc=str(exc), traceback=traceback.format_exc())
 """
 from __future__ import annotations

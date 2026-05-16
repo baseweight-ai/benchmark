@@ -41,7 +41,6 @@ _CONDITION_LABELS: dict[str, str] = {
     "zero-shot": "Zero-shot",
     "5-shot": "5-shot",
     "lora": "LoRA",
-    "api-sft": "API SFT",
 }
 
 
@@ -50,7 +49,7 @@ def _condition_label(condition: str) -> str:
 
 
 def _format_api_display_name(model_id: str) -> str:
-    """'gpt-4.1-nano' → 'GPT 4.1 Nano'."""
+    """'gpt-5.4-mini' → 'GPT 5.4 Mini'."""
     parts = model_id.split("-")
     out = []
     for p in parts:
@@ -347,6 +346,10 @@ def build_result(
     macro_f1 = summary.get("macro_f1") if summary else None
     weighted_f1 = summary.get("weighted_f1") if summary else None
     hallucination_rate = summary.get("hallucination_rate") if summary else None
+    # Extraction-task metrics (None for classification tasks).
+    answer_detection_f1 = summary.get("answer_detection_f1") if summary else None
+    precision_at_80_recall = summary.get("precision_at_80_recall") if summary else None
+    aupr = summary.get("aupr") if summary else None
     avg_logprob = summary.get("avg_logprob") if summary else None
     p10_logprob = summary.get("p10_logprob") if summary else None
 
@@ -377,6 +380,9 @@ def build_result(
         "macro_f1": macro_f1,
         "weighted_f1": weighted_f1,
         "hallucination_rate": hallucination_rate,
+        "answer_detection_f1": answer_detection_f1,
+        "precision_at_80_recall": precision_at_80_recall,
+        "aupr": aupr,
         "avg_logprob": avg_logprob,
         "p10_logprob": p10_logprob,
         "cost_per_query": round(cost_per_query, 8) if cost_per_query is not None else None,
@@ -574,11 +580,9 @@ def compute_stats(results: list[dict]) -> dict:
     training_times = [r["training_time_min"] for r in results if r.get("training_time_min") is not None]
     n_trains = [r["n_train"] for r in results if r.get("n_train") is not None]
 
-    # All four comparison pairs
-    lora_vs_5shot      = _comparison(results, "open-source", "LoRA",    "frontier", "5-shot")
-    lora_vs_zero_shot  = _comparison(results, "open-source", "LoRA",    "frontier", "Zero-shot")
-    api_sft_vs_5shot   = _comparison(results, "frontier",    "API SFT", "frontier", "5-shot")
-    api_sft_vs_zero    = _comparison(results, "frontier",    "API SFT", "frontier", "Zero-shot")
+    # Comparison pairs: open-source LoRA against the API baseline conditions.
+    lora_vs_5shot      = _comparison(results, "open-source", "LoRA", "frontier", "5-shot")
+    lora_vs_zero_shot  = _comparison(results, "open-source", "LoRA", "frontier", "Zero-shot")
 
     # Average cost_per_query by condition (across all tasks/models with data)
     cpq_by_cond: dict[str, list[float]] = {}
@@ -623,8 +627,6 @@ def compute_stats(results: list[dict]) -> dict:
         "comparisons": {
             "lora_vs_5shot": lora_vs_5shot,
             "lora_vs_zero_shot": lora_vs_zero_shot,
-            "api_sft_vs_5shot": api_sft_vs_5shot,
-            "api_sft_vs_zero_shot": api_sft_vs_zero,
         },
         # Cost summary
         "cost_summary": {
@@ -658,8 +660,6 @@ def _print_run_report(data: dict) -> None:
     comp_labels = [
         ("lora_vs_5shot",       "LoRA vs 5-shot"),
         ("lora_vs_zero_shot",   "LoRA vs zero-shot"),
-        ("api_sft_vs_5shot",    "API SFT vs 5-shot"),
-        ("api_sft_vs_zero_shot","API SFT vs zero-shot"),
     ]
     for key, label in comp_labels:
         c = comps.get(key, {})
@@ -942,7 +942,7 @@ def build_dashboard_data(
     for source, model_id, task_id, condition in discover_summaries():
         summary = load_summary(source, model_id, task_id, condition)
         training_meta = None
-        if condition in ("lora", "api-sft"):
+        if condition == "lora":
             training_meta = load_training_meta(source, model_id, task_id, condition)
         result = build_result(model_id, task_id, condition, summary, training_meta, pricing, daily_volume)
         results.append(result)

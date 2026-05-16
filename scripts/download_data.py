@@ -38,6 +38,14 @@ class TaskConfig(BaseModel):
     dataset_path: str
     dataset_config: Optional[str] = None
     trust_remote_code: Optional[bool] = None
+    # Pin to a specific git ref — e.g. "refs/convert/parquet" for a script-based
+    # dataset (datasets>=3 can't run loading scripts, but the Hub auto-converts
+    # every dataset to Parquet on that ref).
+    dataset_revision: Optional[str] = None
+    # Per-split row caps {split: N | null}. Only the listed splits are pulled;
+    # a null cap pulls the whole split. Lets a very large dataset be partially
+    # downloaded — enough to sample from without materialising the full size.
+    download_caps: Optional[dict] = None
 
 
 def load_task_configs(task_ids: list[str]) -> list[TaskConfig]:
@@ -96,8 +104,10 @@ def download_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> N
 
     hf_token = os.environ.get("HF_TOKEN") or None
 
-    # Record the exact Hub commit so every experiment is traceable to a specific version.
-    ds_info = HfApi(token=hf_token).dataset_info(cfg.dataset_path)
+    # Record the exact Hub commit so every experiment is traceable to a specific
+    # version. dataset_revision steers which ref is resolved (e.g. the Parquet
+    # conversion ref for a script-based dataset); we still pin to its commit sha.
+    ds_info = HfApi(token=hf_token).dataset_info(cfg.dataset_path, revision=cfg.dataset_revision)
 
     sha = getattr(ds_info, "sha", None)
     load_kwargs: dict = {
@@ -143,6 +153,20 @@ def download_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> N
             )
         if not test_exists:
             click.echo(f"  No test split — downloaded {train_limit} train rows for smoke splitting")
+        ds = DatasetDict(loaded)
+    elif cfg.download_caps:
+        # Partial pull: download only the listed splits, capping row counts so a
+        # very large dataset stays a manageable size on disk.
+        loaded = {}
+        for split_name, cap in cfg.download_caps.items():
+            split_arg = f"{split_name}[:{cap}]" if cap else split_name
+            ds_split = _hub_load(cfg.dataset_path, split=split_arg, **load_kwargs)
+            count = len(ds_split)
+            expected = EXPECTED_COUNTS.get(cfg.task_id, {}).get(split_name, 0)
+            status = "OK" if count >= expected else f"WARNING: expected >= {expected}"
+            cap_note = f" (cap {cap})" if cap else " (full split)"
+            click.echo(f"  {split_name}: {count:,} rows{cap_note} — {status}")
+            loaded[split_name] = ds_split
         ds = DatasetDict(loaded)
     else:
         ds = _hub_load(cfg.dataset_path, **load_kwargs)

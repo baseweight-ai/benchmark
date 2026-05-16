@@ -2,7 +2,7 @@
 
 Usage:
     python scripts/catalog.py rebuild        # Scan summaries/ and runs/, write results/catalog.jsonl
-    python scripts/catalog.py search --model gpt-4.1-mini --task fpb
+    python scripts/catalog.py search --model gpt-5.4-mini --task fpb
     python scripts/catalog.py list-runs      # Print run manifest IDs and stage counts
 """
 from __future__ import annotations

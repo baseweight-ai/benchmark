@@ -134,6 +134,42 @@ def test_load_test_rows_no_labels_file(tmp_path, monkeypatch):
     assert len(rows) == 3
 
 
+def test_load_test_rows_seed_resamples_whole_questions(tmp_path, monkeypatch):
+    """For a chunked task (CUAD), eval_seed > 0 resamples whole questions from
+    test_full.jsonl: every window of a chosen question is kept together, and the
+    number of questions matches the seed-0 set."""
+    from collections import Counter
+    monkeypatch.setattr(eval_local, "REPO_ROOT", tmp_path)
+    prep = tmp_path / "data" / "prepared" / "cuad"
+    prep.mkdir(parents=True)
+
+    def _chunked(qids, chunks=4):
+        return [
+            {"id": f"cuad_test_{q:04d}_chunk{c:02d}",
+             "messages": [{"role": "user", "content": f"q{q} window {c}"}]}
+            for q in qids for c in range(chunks)
+        ]
+
+    def _dump(rows, path):
+        with open(path, "w") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+
+    # seed-0 set: 5 questions; full set: 25 — all chunked into 4 windows each.
+    _dump(_chunked(range(5)), prep / "test.jsonl")
+    full = _chunked(range(25))
+    _dump(full, prep / "test_full.jsonl")
+    _dump([{"id": r["id"], "label": ["gold span"]} for r in full],
+          prep / "test_full_labels.jsonl")
+
+    rows = load_test_rows("cuad", smoke_test=False, eval_seed=2)
+
+    per_q = Counter(r["id"].rsplit("_chunk", 1)[0] for r in rows)
+    assert len(per_q) == 5                      # same question count as the seed-0 set
+    assert all(c == 4 for c in per_q.values())  # every window of each question kept
+    assert all(r["label"] == ["gold span"] for r in rows)  # multi-answer label joined by id
+
+
 def test_load_label_set_present(tmp_path, monkeypatch):
     """labels.json drives guided_choice — return its list verbatim."""
     monkeypatch.setattr(eval_local, "REPO_ROOT", tmp_path)
@@ -199,6 +235,59 @@ def test_run_eval_default_concurrency_keeps_legacy_filename(tmp_path, monkeypatc
 
     out = tmp_path / "results" / "predictions" / "local" / "qwen2.5-0.5b" / "fpb" / "zero-shot.jsonl"
     assert out.exists()
+
+
+def test_run_eval_guided_choice_active_for_direct_task(tmp_path, monkeypatch):
+    """A direct classification task with labels.json IS guided_choice-constrained."""
+    from unittest.mock import patch
+    monkeypatch.setattr(eval_local, "REPO_ROOT", tmp_path)
+    _write_test_data(tmp_path, task_id="fpb", n=3, with_labels=True)
+    _write_train_data(tmp_path, task_id="fpb")
+    (tmp_path / "data" / "prepared" / "fpb" / "labels.json").write_text(
+        json.dumps(["positive", "negative", "neutral"]))
+
+    seen = []
+
+    async def mock_call(*args, **kwargs):
+        from pipeline.providers import InferenceResult
+        seen.append(kwargs.get("guided_choice"))
+        return InferenceResult("positive", 100, 5, 0, 100.0, 50.0, None)
+
+    with patch("eval_local.call_vllm", side_effect=mock_call):
+        asyncio.run(eval_local.run_eval(
+            _model_cfg(), "fpb", "zero-shot", _task_cfg("fpb"),
+            model_name="Qwen/Qwen2.5-0.5B-Instruct",
+            dry_run=False, smoke_test=False, eval_seed=0,
+        ))
+    assert seen and all(gc == ["positive", "negative", "neutral"] for gc in seen)
+
+
+def test_run_eval_guided_choice_gated_off_for_tagged_task(tmp_path, monkeypatch):
+    """A tagged (CoT) task must NOT be guided_choice-constrained, even though it
+    still emits a labels.json — a chain-of-thought cannot be pinned to a set."""
+    from unittest.mock import patch
+    monkeypatch.setattr(eval_local, "REPO_ROOT", tmp_path)
+    _write_test_data(tmp_path, task_id="medmcqa", n=3, with_labels=True)
+    _write_train_data(tmp_path, task_id="medmcqa")
+    (tmp_path / "data" / "prepared" / "medmcqa" / "labels.json").write_text(
+        json.dumps(["A", "B", "C", "D"]))
+
+    seen = []
+
+    async def mock_call(*args, **kwargs):
+        from pipeline.providers import InferenceResult
+        seen.append(kwargs.get("guided_choice"))
+        return InferenceResult("A", 100, 5, 0, 100.0, 50.0, None)
+
+    tagged_cfg = TaskConfig(task_id="medmcqa", max_output_tokens=64,
+                            task_type="classification", answer_mode="tagged")
+    with patch("eval_local.call_vllm", side_effect=mock_call):
+        asyncio.run(eval_local.run_eval(
+            _model_cfg(), "medmcqa", "zero-shot", tagged_cfg,
+            model_name="Qwen/Qwen2.5-0.5B-Instruct",
+            dry_run=False, smoke_test=False, eval_seed=0,
+        ))
+    assert seen and all(gc is None for gc in seen)
 
 
 def test_load_label_set_empty_list_returns_none(tmp_path, monkeypatch):

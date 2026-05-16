@@ -115,6 +115,38 @@ def test_near_dupes_identical_pair():
     assert result["example_pairs"][0][2] == 1.0
 
 
+def test_near_dupes_budget_cap_truncates(monkeypatch):
+    """When the candidate-pair budget is exhausted the scan stops and flags
+    `truncated` — guarding prepare against an unbounded run on a boilerplate-heavy
+    corpus (e.g. windowed legal contracts)."""
+    import pipeline.data_quality as dq
+    monkeypatch.setattr(dq, "_NEAR_DUP_BUDGET", 1)
+    text = "the quick brown fox jumps over the lazy dog"
+    others = [f"sentence {i} is entirely different here" for i in range(8)]
+    result = dq.find_near_dupes([text, text] + others)
+    assert result["truncated"] is True
+
+
+def test_near_dupes_not_truncated_under_budget():
+    """A small corpus stays well under the budget — truncated is False."""
+    from pipeline.data_quality import find_near_dupes
+    text = "the quick brown fox jumps over the lazy dog"
+    others = [f"sentence {i} is entirely different here" for i in range(8)]
+    result = find_near_dupes([text, text] + others)
+    assert result["truncated"] is False
+
+
+def test_cross_split_near_dupes_budget_cap_truncates(monkeypatch):
+    """The cross-split scan honours the same budget."""
+    import pipeline.data_quality as dq
+    monkeypatch.setattr(dq, "_NEAR_DUP_BUDGET", 1)
+    shared = "the quick brown fox jumps over the lazy dog today"
+    train = [shared] + [f"train doc {i} unrelated content" for i in range(8)]
+    test = [shared] + [f"test doc {i} unrelated content" for i in range(8)]
+    result = dq.cross_split_near_dupes(train, test, threshold=0.5)
+    assert result["truncated"] is True
+
+
 def test_near_dupes_dissimilar():
     from pipeline.data_quality import find_near_dupes
     texts = [

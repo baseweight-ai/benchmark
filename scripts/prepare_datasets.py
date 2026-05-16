@@ -51,6 +51,9 @@ class SamplingConfig(BaseModel):
     per_group_cap: Optional[int] = None # balanced: max examples per group
     min_per_group: int = 1              # stratified: floor per group
     seed: int = 42
+    # Optional boolean field to balance 50/50 on (e.g. has_answer): the sample
+    # is split evenly between the two groups, each independently stratified.
+    balance_by: Optional[str] = None
 
 
 class TaskConfig(BaseModel):
@@ -67,7 +70,12 @@ class TaskConfig(BaseModel):
     custom_label_names: Optional[list[str]] = None
     split_ratios: Optional[list[float]] = None
     split_seed: Optional[int] = None
+    # Sliding-window context management (CUAD): context_max_tokens is the window
+    # size in words, context_stride_tokens the step between windows, and
+    # max_chunks the cap on windows per test contract.
     context_max_tokens: Optional[int] = None
+    context_stride_tokens: Optional[int] = None
+    max_chunks: int = 12
     test_split: str = "test"
     train_sampling: Optional[SamplingConfig] = None
     test_sampling: Optional[SamplingConfig] = None
@@ -99,9 +107,15 @@ def format_user(prompt: dict, row: dict) -> str:
     return template.format(**fields)
 
 
-def format_assistant(prompt: dict, row: dict, label_names: Optional[list[str]] = None) -> str:
+def format_gold(prompt: dict, row: dict, label_names: Optional[list[str]] = None) -> str:
+    """Return the bare gold answer/label for a row.
+
+    This is the exact string a prediction is scored against (the eval label).
+    For `cot_letter` it is the answer letter only — no <thinking> block — since
+    that is what classify_errors extracts from the model output and compares.
+    """
     lf = prompt.get("label_format")
-    if lf == "letter":
+    if lf in ("letter", "cot_letter"):
         label_map = prompt.get("label_map", {"0": "A", "1": "B", "2": "C", "3": "D"})
         val = row.get(prompt.get("label_field", "cop"), 0)
         return label_map.get(str(val), str(val))
@@ -116,6 +130,37 @@ def format_assistant(prompt: dict, row: dict, label_names: Optional[list[str]] =
     return str(val)
 
 
+def format_assistant(prompt: dict, row: dict, label_names: Optional[list[str]] = None) -> str:
+    """Return the assistant training target for a row.
+
+    Identical to format_gold except for `cot_letter`, where the target is a
+    chain-of-thought (`<thinking>{explanation}</thinking>`) followed by the
+    answer tag (`<answer>{letter}</answer>`). Completion-only SFT then teaches
+    the model to reason inside <thinking> before committing to <answer>.
+    """
+    if prompt.get("label_format") == "cot_letter":
+        letter = format_gold(prompt, row, label_names)
+        exp = str(row.get(prompt.get("explanation_field", "exp"), "") or "").strip()
+        return f"<thinking>{exp}</thinking><answer>{letter}</answer>"
+    return format_gold(prompt, row, label_names)
+
+
+def format_eval_label(prompt: dict, row: dict, label_names: Optional[list[str]] = None):
+    """Return the gold answer(s) a prediction is scored against.
+
+    For extraction tasks a single question can have several equally-valid gold
+    spans, so this returns the full list of acceptable answers — token_f1 then
+    takes the max over them (SQuAD/CUAD-style multi-answer scoring). For
+    closed-set tasks it returns the single label string, same as format_gold.
+    """
+    if prompt.get("label_format") == "extractive":
+        answers = row.get(prompt.get("answer_field", "answers"), {})
+        texts = answers.get("text", []) if isinstance(answers, dict) else []
+        texts = [t for t in texts if t and str(t).strip()]
+        return texts or ["Not found."]
+    return format_gold(prompt, row, label_names)
+
+
 def to_chat(system: str, user: str, assistant: Optional[str] = None) -> dict:
     msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     if assistant is not None:
@@ -124,15 +169,18 @@ def to_chat(system: str, user: str, assistant: Optional[str] = None) -> dict:
 
 
 def get_label_set(prompt: dict, label_names: Optional[list[str]]) -> Optional[list[str]]:
-    """Return the closed output label set for this task, or None for free-form tasks.
+    """Return the closed answer set for this task, or None for free-form tasks.
 
-    Mirrors format_assistant: the labels are the exact strings the model is
-    trained/expected to emit. Consumers (eval, classify) use this for guided
-    decoding and format-violation checks. Order is preserved when known
-    (ClassLabel.names ordering) since it can carry semantic meaning.
+    The set holds the valid answers, not the whole output: for `verbatim`/`letter`
+    it is what the model emits directly; for `cot_letter` it is the valid
+    <answer> values (A/B/C/D), since the model emits a CoT around them. Written
+    to labels.json and consumed by classify_errors (format-violation checks) and,
+    for answer_mode==direct tasks only, by eval as the constrained-decoding set.
+    Order is preserved when known (ClassLabel.names ordering) as it can carry
+    semantic meaning.
     """
     lf = prompt.get("label_format")
-    if lf == "letter":
+    if lf in ("letter", "cot_letter"):
         label_map = prompt.get("label_map", {"0": "A", "1": "B", "2": "C", "3": "D"})
         # label_map values are the rendered tokens (A/B/C/D); de-dup while preserving order.
         seen: dict[str, None] = {}
@@ -154,10 +202,32 @@ def sample(
     total_cap: Optional[int] = None,
     per_group_cap: Optional[int] = None,
     min_per_group: int = 1,
+    balance_by: Optional[str] = None,
 ) -> list[dict]:
-    """Balanced: per_group_cap rows per group. Stratified: total_cap rows via LRM allocation."""
+    """Balanced: per_group_cap rows per group. Stratified: total_cap rows via LRM allocation.
+
+    balance_by: when set, the sample is first split 50/50 on this boolean field
+    (e.g. has_answer) — total_cap/2 rows from each side, each side independently
+    sampled by `strategy`/`stratify_by` — then interleaved.
+    """
     if not data:
         return []
+
+    if balance_by is not None:
+        if total_cap is None:
+            raise ValueError("balance_by requires total_cap")
+        partitions: dict[bool, list[dict]] = {True: [], False: []}
+        for row in data:
+            partitions[bool(row.get(balance_by))].append(row)
+        half = total_cap // 2
+        out: list[dict] = []
+        for key in (True, False):
+            out.extend(sample(
+                partitions[key], strategy, stratify_by, seed,
+                total_cap=half, per_group_cap=per_group_cap, min_per_group=min_per_group,
+            ))
+        random.Random(seed).shuffle(out)
+        return out
 
     rng = random.Random(seed)
 
@@ -218,13 +288,108 @@ def sample(
     raise ValueError(f"Unknown sampling strategy: {strategy!r}. Expected 'balanced' or 'stratified'.")
 
 
-# ── Context truncation ─────────────────────────────────────────────────────
+# ── Context-window management: sliding-window chunking ─────────────────────
 
-def truncate_context(text: str, max_tokens: int) -> str:
-    tokens = text.split()
-    if len(tokens) <= max_tokens:
-        return text
-    return " ".join(tokens[:max_tokens])
+def sliding_windows(
+    text: str, window: int, stride: int, max_chunks: Optional[int] = None
+) -> list[str]:
+    """Split text into overlapping fixed-size windows (whitespace-tokenised).
+
+    Each window is `window` words; consecutive windows start `stride` words
+    apart, so stride < window produces overlap. Returns at most `max_chunks`
+    windows when set. Text shorter than one window yields a single window.
+    """
+    if stride <= 0:
+        raise ValueError(f"stride must be positive, got {stride}")
+    words = text.split()
+    if len(words) <= window:
+        return [" ".join(words)]
+    chunks: list[str] = []
+    start = 0
+    while start < len(words):
+        chunks.append(" ".join(words[start:start + window]))
+        if start + window >= len(words):
+            break
+        if max_chunks is not None and len(chunks) >= max_chunks:
+            break
+        start += stride
+    return chunks
+
+
+def _answer_window(context: str, answer: str, window: int) -> str:
+    """Return a `window`-word slice of context positioned to contain `answer`.
+
+    Used for CUAD training positives — the gold clause must sit inside the
+    context for a completion-only SFT target to be learnable. Falls back to the
+    head window when the answer text cannot be located verbatim.
+    """
+    words = context.split()
+    if len(words) <= window:
+        return " ".join(words)
+    char_pos = context.find(answer)
+    if char_pos < 0:
+        return " ".join(words[:window])
+    word_idx = len(context[:char_pos].split())
+    # Start slightly before the clause so it keeps some left-context, while
+    # keeping the whole window inside the document.
+    start = max(0, min(word_idx - window // 8, len(words) - window))
+    return " ".join(words[start:start + window])
+
+
+def chunk_cuad_train(
+    rows: list[dict], window: int, stride: int, seed: int = 42
+) -> list[dict]:
+    """Reduce each CUAD training row to a single sliding-window example.
+
+    A positive question yields its answer-bearing window — a random grid window
+    that contains the clause, drawn from the same fixed grid the test side uses
+    so the clause sits at the same range of positions at train and eval (no
+    answer-centred position bias); an answer-snapped window is the fallback when
+    the clause fits no grid window. A no-answer question yields a random grid
+    window with target "Not found.". Abstention is taught by these real
+    no-answer questions — the dataset is balanced 50/50 by stratified sampling —
+    not by synthetic answer-free windows.
+    """
+    rng = random.Random(seed)
+    out: list[dict] = []
+    for r in rows:
+        context = r.get("context", "") or ""
+        answers = r.get("answers", {})
+        texts = answers.get("text", []) if isinstance(answers, dict) else []
+        gold = texts[0].strip() if texts and texts[0] else ""
+        windows = sliding_windows(context, window, stride)
+        if gold:
+            # Windows are whitespace-normalised (" ".join of split words);
+            # normalise the gold the same way so the substring test is reliable
+            # and the SFT target matches the window text verbatim.
+            gold_norm = " ".join(gold.split())
+            containing = [w for w in windows if gold_norm in w]
+            pos_window = rng.choice(containing) if containing else _answer_window(context, gold, window)
+            out.append({**r, "context": pos_window,
+                        "answers": {"text": [gold_norm], "answer_start": [0]}})
+        else:
+            out.append({**r, "context": rng.choice(windows),
+                        "answers": {"text": [], "answer_start": []}})
+    return out
+
+
+def chunk_cuad_test(
+    rows: list[dict], window: int, stride: int, max_chunks: int
+) -> list[dict]:
+    """Expand each CUAD test question into one row per sliding window.
+
+    Each emitted row carries a stable `_eval_id` of the form
+    `cuad_test_{q:04d}_chunk{c:02d}`. classify_errors strips the `_chunkNN`
+    suffix to aggregate the per-window predictions back to one score per
+    question.
+    """
+    out: list[dict] = []
+    for q_idx, r in enumerate(rows):
+        windows = sliding_windows(r.get("context", "") or "", window, stride, max_chunks)
+        for c_idx, w in enumerate(windows):
+            out.append({**r, "context": w,
+                        "_eval_id": f"cuad_test_{q_idx:04d}_chunk{c_idx:02d}"})
+    return out
 
 
 # ── JSONL writing ──────────────────────────────────────────────────────────
@@ -314,27 +479,55 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
         except Exception:
             label_names = cfg.custom_label_names
 
-    # ── CUAD: flatten SQuAD format and tag clause_type ────────────────────
+    # ── MedMCQA: keep single-answer questions; CoT needs an explanation ────
+    if cfg.task_id == "medmcqa":
+        def _is_single(r: dict) -> bool:
+            return str(r.get("choice_type", "")).strip().lower() == "single"
+        n_tr, n_te = len(train_rows), len(test_rows)
+        train_rows = [r for r in train_rows if _is_single(r)]
+        test_rows  = [r for r in test_rows  if _is_single(r)]
+        click.echo(f"  [medmcqa] choice_type=single filter: "
+                   f"train {n_tr}→{len(train_rows)}, test {n_te}→{len(test_rows)}")
+        # The CoT target embeds `exp` in the <thinking> block — a row with no
+        # explanation would teach an empty thinking block. Drop those from TRAIN
+        # only; the test set is scored on the answer letter and never needs `exp`.
+        n_exp = len(train_rows)
+        train_rows = [r for r in train_rows if str(r.get("exp", "") or "").strip()]
+        if len(train_rows) != n_exp:
+            click.echo(f"  [medmcqa] dropped {n_exp - len(train_rows)} train rows "
+                       f"with no explanation (CoT requires `exp`)")
+
+    # ── CUAD: flatten SQuAD format and sliding-window chunk the train side ──
     if cfg.task_id == "cuad":
-        click.echo(f"  [{cfg.task_id}] Flattening SQuAD format ({len(train_rows)} train, {len(test_rows)} test rows)...")
+        click.echo(f"  [cuad] Flattening SQuAD format "
+                   f"({len(train_rows)} train, {len(test_rows)} test rows)...")
         def flatten_squad(rows: list[dict]) -> list[dict]:
             out = []
             for row in rows:
-                ctx = truncate_context(row.get("context", ""), cfg.context_max_tokens or 1500)
+                # Keep full context — truncating here would drop clauses;
+                # sliding-window chunking handles the context budget instead.
+                ctx = row.get("context", "") or ""
                 answers = row.get("answers", {})
                 texts = answers.get("text", []) if isinstance(answers, dict) else []
                 question = row.get("question", "")
-                # chenghao/cuad_qa: question field IS the clause type name directly.
-                # Fall back to regex for older-format datasets where the question
-                # is a full sentence containing 'related to "Clause Name"'.
+                # The CUAD question is a templated sentence carrying the clause
+                # type in quotes (... related to "Governing Law" ...) — extract it.
                 m = _CUAD_CLAUSE_RE.search(question)
                 clause_type = m.group(1) if m else (question.strip() or "unknown")
+                # All valid gold spans retained — a CUAD question can have
+                # several equally-correct clause spans, and test scoring takes
+                # the max F1 over them (see format_eval_label / token_f1).
+                kept = [t for t in texts if t and t.strip()]
                 out.append({
                     "context": ctx,
                     "question": question,
-                    "answers": {"text": [texts[0]] if texts else [], "answer_start": [0] if texts else []},
-                    "id": row.get("id", ""),
                     "clause_type": clause_type,
+                    "answers": {"text": kept, "answer_start": [0] * len(kept)},
+                    "id": row.get("id", ""),
+                    # has_answer drives the 50/50 positive / no-answer balancing:
+                    # CUAD is a full contract x clause grid and roughly half of
+                    # the (contract, clause) pairs have no clause of that type.
+                    "has_answer": bool(kept),
                 })
             return out
         train_rows = flatten_squad(train_rows)
@@ -347,6 +540,19 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
                 f"({unknown_count / len(all_cuad):.1%}) have unknown clause_type — check _CUAD_CLAUSE_RE",
                 err=True,
             )
+        n_pos = sum(1 for r in all_cuad if r["has_answer"])
+        click.echo(f"  [cuad] {n_pos}/{len(all_cuad)} rows have an answer "
+                   f"({100 * n_pos / max(len(all_cuad), 1):.0f}%); the rest are no-answer questions")
+
+        # Sliding-window chunking, training side: one window per question — the
+        # answer-bearing window for a positive, a random window for a no-answer
+        # question. The 50/50 positive/no-answer balance is enforced by the
+        # stratified sampler (train_sampling.balance_by: has_answer).
+        cuad_window = cfg.context_max_tokens or 750
+        cuad_stride = cfg.context_stride_tokens or cuad_window
+        train_rows = chunk_cuad_train(train_rows, cuad_window, cuad_stride, seed=42)
+        click.echo(f"  [cuad] Train chunking: one {cuad_window}w window per question "
+                   f"({len(train_rows)} questions)")
 
     from pipeline.data_quality import (  # lazy — only needed at prepare time
         find_exact_dupes, flag_extreme_length, cross_split_near_dupes,
@@ -384,6 +590,33 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
             test_rows = sample(test_rows, **cfg.test_sampling.model_dump())
             raw_test_texts = [format_user(prompt, r) for r in test_rows]
             _log_distribution(test_rows, cfg.test_sampling.stratify_by, f"Test ({cfg.test_sampling.strategy})")
+
+    # CUAD: expand each test question into one prompt per sliding window. Both
+    # the sampled eval set (test.jsonl) and the full set (test_full.jsonl, which
+    # backs multi-seed resampling) are chunked; eval resamples whole questions
+    # so a question's windows always stay together.
+    if cfg.task_id == "cuad":
+        cuad_window = cfg.context_max_tokens or 750
+        cuad_stride = cfg.context_stride_tokens or cuad_window
+        n_questions = len(test_rows)
+        n_pos_q = sum(1 for r in test_rows if r.get("has_answer"))
+        test_rows = chunk_cuad_test(test_rows, cuad_window, cuad_stride, cfg.max_chunks)
+        raw_test_texts = [format_user(prompt, r) for r in test_rows]
+        if test_rows_full is not None:
+            # Balance the multi-seed pool 50/50 too, so each seed's question
+            # resample keeps the same positive/no-answer ratio as seed 0.
+            full_pos = [r for r in test_rows_full if r.get("has_answer")]
+            full_neg = [r for r in test_rows_full if not r.get("has_answer")]
+            k = min(len(full_pos), len(full_neg))
+            brng = random.Random(42)
+            brng.shuffle(full_pos)
+            brng.shuffle(full_neg)
+            test_rows_full = chunk_cuad_test(full_pos[:k] + full_neg[:k],
+                                             cuad_window, cuad_stride, cfg.max_chunks)
+        click.echo(f"  [cuad] Test sliding-window chunking: {n_questions} questions "
+                   f"({n_pos_q} answerable / {n_questions - n_pos_q} no-answer) → "
+                   f"{len(test_rows)} windowed prompts (window={cuad_window}w, "
+                   f"stride={cuad_stride}w, max {cfg.max_chunks} windows/contract)")
 
     click.echo(f"  [{cfg.task_id}] Cross-split deduplication ({len(train_rows)} train × {len(test_rows)} test)...")
     cross_res  = cross_split_near_dupes(raw_train_texts, raw_test_texts, threshold=0.9)
@@ -423,9 +656,17 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
             out.append(to_chat(system, user, asst))
         return out
 
+    def _eval_row_id(r: dict, i: int) -> str:
+        # Chunked tasks (CUAD) precompute a stable per-window id so chunks of one
+        # question stay linked; everything else uses positional enumeration.
+        return r.get("_eval_id") or f"{cfg.task_id}_test_{i:04d}"
+
     def fmt_labels(rows: list[dict]) -> list[dict]:
+        # format_eval_label, not format_assistant: the label is the gold answer
+        # a prediction is scored against — the answer letter for CoT tasks (not
+        # the <thinking> block), and the full list of valid spans for extraction.
         return [
-            {"id": f"{cfg.task_id}_test_{i:04d}", "label": format_assistant(prompt, r, label_names)}
+            {"id": _eval_row_id(r, i), "label": format_eval_label(prompt, r, label_names)}
             for i, r in enumerate(rows)
         ]
 
@@ -433,13 +674,10 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
         out = []
         for i, r in enumerate(rows):
             user = format_user(prompt, r)
-            d: dict = {
-                "id": f"{cfg.task_id}_test_{i:04d}",
+            out.append({
+                "id": _eval_row_id(r, i),
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            }
-            if cfg.task_id == "cuad":
-                d["context"] = r.get("context", "")
-            out.append(d)
+            })
         return out
 
     prefix = "smoke_" if smoke_test else ""
@@ -483,10 +721,17 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
     prep_test_texts = [
         m["content"] for r in fmt_test for m in r["messages"] if m["role"] == "user"
     ]
-    train_labels_prep = [
-        m["content"] for r in fmt_train for m in r["messages"] if m["role"] == "assistant"
-    ]
-    test_labels_prep = [r["label"] for r in fmt_labs]
+    # Label distributions are a classification concept. Extraction labels are
+    # free-form spans (a list of acceptable answers for CUAD) — not hashable and
+    # not a class vocabulary — so leave them out of the quality report.
+    if cfg.task_type == "classification":
+        train_labels_prep = [
+            m["content"] for r in fmt_train for m in r["messages"] if m["role"] == "assistant"
+        ]
+        test_labels_prep = [r["label"] for r in fmt_labs]
+    else:
+        train_labels_prep = None
+        test_labels_prep = None
 
     quality_report["prepared"] = {
         "train": analyze_split(prep_train_texts, train_labels_prep or None),
@@ -533,7 +778,12 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
             assistant_msg = next((m for m in msgs if m["role"] == "assistant"), None)
             if assistant_msg is None:
                 continue
-            label = assistant_msg["content"]
+            # Dedup on the answer, not the whole completion: a CoT target's
+            # <thinking> block is unique per row, so keying on raw content would
+            # never dedup and few-shot would lose its one-per-class coverage.
+            content = assistant_msg["content"]
+            answer_m = re.search(r"<answer>\s*(.*?)\s*</answer>", content, re.S)
+            label = answer_m.group(1).strip() if answer_m else content
             if label in seen_labels:
                 continue
             seen_labels.add(label)
