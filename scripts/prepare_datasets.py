@@ -27,7 +27,9 @@ from pydantic import BaseModel
 _load_from_disk_lock = threading.Lock()
 
 from checkpoint_utils import atomic_write_json
-from pipeline.cache import rows_sha
+from pipeline.cache import (
+    code_closure_hash, dict_hash, file_content_hash, inputs_changed, rows_sha, tree_hash,
+)
 from pipeline.config import get_tasks
 from pipeline.paths import prompt_path
 from pipeline.validation import check_contamination, reject_test_path, require_dir, validate_dataset
@@ -130,17 +132,36 @@ def format_gold(prompt: dict, row: dict, label_names: Optional[list[str]] = None
     return str(val)
 
 
+# Char cap on the <thinking> explanation in a cot_letter target. The raw
+# MedMCQA `exp` field has a heavy tail — some entries are multi-thousand-token
+# textbook dumps. Left uncapped, those targets exceed the eval-time
+# max_output_tokens budget (512), so generation is truncated before the
+# <answer> tag and at train time the answer tag can fall past max_seq_length.
+# ~1400 chars keeps the whole completion well under 512 tokens; only the long
+# tail (~p90+) is trimmed, at a word boundary so the target stays clean.
+_COT_EXP_MAX_CHARS = 1400
+
+# Minimum <thinking> explanation length for a usable CoT target. MedMCQA's
+# `exp` is frequently a placeholder (".") or a bare answer restatement
+# ("Methyldopa", "Ans. C"); 15 chars is the observed ceiling of those
+# non-reasoning values, so a shorter `exp` is dropped from training.
+_COT_EXP_MIN_CHARS = 15
+
+
 def format_assistant(prompt: dict, row: dict, label_names: Optional[list[str]] = None) -> str:
     """Return the assistant training target for a row.
 
     Identical to format_gold except for `cot_letter`, where the target is a
     chain-of-thought (`<thinking>{explanation}</thinking>`) followed by the
     answer tag (`<answer>{letter}</answer>`). Completion-only SFT then teaches
-    the model to reason inside <thinking> before committing to <answer>.
+    the model to reason inside <thinking> before committing to <answer>. The
+    explanation is length-capped (see _COT_EXP_MAX_CHARS).
     """
     if prompt.get("label_format") == "cot_letter":
         letter = format_gold(prompt, row, label_names)
         exp = str(row.get(prompt.get("explanation_field", "exp"), "") or "").strip()
+        if len(exp) > _COT_EXP_MAX_CHARS:
+            exp = exp[:_COT_EXP_MAX_CHARS].rsplit(" ", 1)[0].rstrip()
         return f"<thinking>{exp}</thinking><answer>{letter}</answer>"
     return format_gold(prompt, row, label_names)
 
@@ -433,6 +454,23 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
 
     require_dir(raw_dir, min_files=1, desc=f"raw data for {cfg.task_id}")
     prompt, prompt_sha = load_prompt(cfg.task_id)
+
+    # Skip-if-unchanged: re-derive only when the raw data, this task's config,
+    # the prompt, or the preparation code itself changed since the last run.
+    task_yaml = REPO_ROOT / "configs" / "tasks" / f"{cfg.task_id}.yaml"
+    fingerprint = dict_hash({
+        "code": code_closure_hash(Path(__file__)),
+        "raw": tree_hash(raw_dir),
+        "config": file_content_hash(task_yaml) if task_yaml.is_file() else "",
+        "prompt_sha": prompt_sha,
+        "smoke_test": smoke_test,
+    })
+    out_file = out_dir / ("smoke_test.jsonl" if smoke_test else "test.jsonl")
+    meta_file = out_dir / "dataset_meta.json"
+    if out_file.exists() and not inputs_changed(fingerprint, meta_file):
+        click.echo(f"  [{cfg.task_id}] SKIP: prepared data up-to-date (inputs unchanged)")
+        return
+
     system = prompt["system"]
     click.echo(f"  [{cfg.task_id}] Loading dataset from disk...")
     with _load_from_disk_lock:
@@ -488,14 +526,21 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
         test_rows  = [r for r in test_rows  if _is_single(r)]
         click.echo(f"  [medmcqa] choice_type=single filter: "
                    f"train {n_tr}→{len(train_rows)}, test {n_te}→{len(test_rows)}")
-        # The CoT target embeds `exp` in the <thinking> block — a row with no
-        # explanation would teach an empty thinking block. Drop those from TRAIN
-        # only; the test set is scored on the answer letter and never needs `exp`.
+        # The CoT target embeds `exp` in the <thinking> block. An empty `exp`
+        # teaches an empty thinking block; a too-short `exp` (placeholder ".",
+        # bare answer restatement) teaches a no-op reasoning step — both are
+        # degenerate CoT targets. Drop either from TRAIN only; the test set is
+        # scored on the answer letter and never needs `exp`.
+        exp_field = prompt.get("explanation_field", "exp")
         n_exp = len(train_rows)
-        train_rows = [r for r in train_rows if str(r.get("exp", "") or "").strip()]
+        train_rows = [
+            r for r in train_rows
+            if len(str(r.get(exp_field, "") or "").strip()) >= _COT_EXP_MIN_CHARS
+        ]
         if len(train_rows) != n_exp:
             click.echo(f"  [medmcqa] dropped {n_exp - len(train_rows)} train rows "
-                       f"with no explanation (CoT requires `exp`)")
+                       f"with no usable explanation (CoT needs an `exp` of "
+                       f">= {_COT_EXP_MIN_CHARS} chars)")
 
     # ── CUAD: flatten SQuAD format and sliding-window chunk the train side ──
     if cfg.task_id == "cuad":
@@ -725,9 +770,12 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
     # free-form spans (a list of acceptable answers for CUAD) — not hashable and
     # not a class vocabulary — so leave them out of the quality report.
     if cfg.task_type == "classification":
-        train_labels_prep = [
-            m["content"] for r in fmt_train for m in r["messages"] if m["role"] == "assistant"
-        ]
+        # Use the eval label (the bare class — the answer letter for cot_letter
+        # tasks like medmcqa), not the raw assistant completion. The completion
+        # embeds the <thinking> CoT, which makes every train "label" unique and
+        # forces label-KL to infinity; train and test label vocabularies must
+        # match for that metric to mean anything.
+        train_labels_prep = [format_eval_label(prompt, r, label_names) for r in src_train]
         test_labels_prep = [r["label"] for r in fmt_labs]
     else:
         train_labels_prep = None
@@ -753,6 +801,7 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
     atomic_write_json(
         {
             "task_id": cfg.task_id,
+            "input_hash": fingerprint,
             "prompt_sha": prompt_sha,
             "train_sha": rows_sha(fmt_train),
             "test_sha": rows_sha(fmt_test),

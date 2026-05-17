@@ -154,11 +154,17 @@ def cross_split_near_dupes(
     test_texts: list[str],
     threshold: float = 0.9,
     shingle_k: int = 3,
+    budget: Optional[int] = None,
 ) -> dict[str, Any]:
     """Find train indices whose content is near-identical to a test example.
 
     Uses threshold=0.9 by default (stricter than within-split) to avoid
     over-filtering train examples that are merely topically similar.
+
+    This is a correctness gate against train/eval leakage, so it runs the full
+    near-dup scan by default (budget=None). Passing a `budget` caps the number
+    of Jaccard comparisons for a lower-bound estimate; `truncated` then reports
+    whether the cap was hit.
     Returns train_indices_to_filter, exact_count, near_dup_count, example_pairs.
     """
     if not train_texts or not test_texts:
@@ -171,7 +177,15 @@ def cross_split_near_dupes(
     test_hashes = {_md5(t): j for j, t in enumerate(test_texts)}
     test_sh = [_shingles(t, shingle_k) for t in test_texts]
     n_test = len(test_texts)
-    test_index = _build_index(test_sh, n_test * _STOP_FRAC)
+    max_df = n_test * _STOP_FRAC
+    test_index = _build_index(test_sh, max_df)
+    # Distinct "stop" shingles excluded from the index (too common to discriminate).
+    # A shared stop-shingle is invisible to `overlap` below, so the prune bound
+    # allows for up to n_stop of them — keeping the prune exact (no missed pair).
+    _df: Counter = Counter()
+    for shs in test_sh:
+        _df.update(shs)
+    n_stop = sum(1 for c in _df.values() if c >= max_df)
 
     to_filter: list[int] = []
     exact_count = near_dup_count = 0
@@ -180,9 +194,8 @@ def cross_split_near_dupes(
     truncated = False
 
     for i, t in enumerate(train_texts):
-        if comparisons >= _NEAR_DUP_BUDGET:
-            truncated = True  # boilerplate-heavy corpus — stop after the budget
-            break
+        # Exact-overlap detection (O(1) per row) always runs; a missed exact
+        # cross-split dupe would survive into the train set and abort the run.
         h = _md5(t)
         if h in test_hashes:
             to_filter.append(i)
@@ -190,16 +203,29 @@ def cross_split_near_dupes(
             examples.append((i, test_hashes[h], 1.0))
             continue
 
-        si = _shingles(t, shingle_k)
-        cands: set[int] = set()
-        for sh in si:
-            cands.update(test_index.get(sh, []))
+        if budget is not None and comparisons >= budget:
+            truncated = True  # caller opted into a capped (lower-bound) scan
+            continue
 
-        for j in cands:
+        si = _shingles(t, shingle_k)
+        n_si = len(si)
+        # Index-visible shared-shingle count per candidate test doc.
+        overlap: dict[int, int] = defaultdict(int)
+        for sh in si:
+            for j in test_index.get(sh, []):
+                overlap[j] += 1
+
+        for j, shared in overlap.items():
+            # Jaccard >= t requires |A∩B| >= t*max(|A|,|B|); the true intersection
+            # is at most `shared + n_stop`. Skip any candidate that cannot reach t
+            # — survivors get an exact full-set Jaccard, so no near-dup is missed.
+            if shared + n_stop < threshold * max(n_si, len(test_sh[j])):
+                continue
             comparisons += 1
             sj = test_sh[j]
-            u = si | sj
-            jacc = len(si & sj) / len(u) if u else 1.0
+            inter = len(si & sj)
+            union = n_si + len(sj) - inter
+            jacc = inter / union if union else 1.0
             if jacc >= threshold:
                 to_filter.append(i)
                 near_dup_count += 1
@@ -324,6 +350,7 @@ def cross_split_stats(
         "exact_overlap": nd["exact_count"],
         "near_dup_pairs": nd["total"],
         "near_dup_threshold": 0.8,
+        "near_dup_truncated": nd["truncated"],
         "example_pairs": nd["example_pairs"],
     }
     if train_labels and test_labels:

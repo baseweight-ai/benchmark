@@ -136,15 +136,23 @@ def test_near_dupes_not_truncated_under_budget():
     assert result["truncated"] is False
 
 
-def test_cross_split_near_dupes_budget_cap_truncates(monkeypatch):
-    """The cross-split scan honours the same budget."""
+def test_cross_split_near_dupes_budget_cap_truncates():
+    """A caller-supplied budget caps the cross-split scan and flags truncated."""
     import pipeline.data_quality as dq
-    monkeypatch.setattr(dq, "_NEAR_DUP_BUDGET", 1)
     shared = "the quick brown fox jumps over the lazy dog today"
     train = [shared] + [f"train doc {i} unrelated content" for i in range(8)]
     test = [shared] + [f"test doc {i} unrelated content" for i in range(8)]
-    result = dq.cross_split_near_dupes(train, test, threshold=0.5)
+    result = dq.cross_split_near_dupes(train, test, threshold=0.5, budget=1)
     assert result["truncated"] is True
+
+
+def test_cross_split_near_dupes_uncapped_by_default():
+    """Default (budget=None) runs the full scan — the leakage gate never truncates."""
+    import pipeline.data_quality as dq
+    train = [f"train doc {i} unrelated content" for i in range(40)]
+    test = [f"test doc {i} unrelated content" for i in range(40)]
+    result = dq.cross_split_near_dupes(train, test, threshold=0.5)
+    assert result["truncated"] is False
 
 
 def test_near_dupes_dissimilar():

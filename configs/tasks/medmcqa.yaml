@@ -7,12 +7,13 @@ num_classes: 4
 metric_id: accuracy
 metric_label: "Accuracy"
 # Each question has exactly one correct option and the model emits exactly one
-# answer letter, so Accuracy = Exact-Match = Precision@1 are the same
-# 0/1-per-question quantity here. classify_errors reports metric_value (accuracy),
-# exact_match and precision_at_1; all three are identical by construction for a
-# single-best-answer MCQ. Answer choices are balanced A/B/C/D across questions,
-# so per-example accuracy also coincides with micro-F1 and macro-F1. Each
-# question is weighted equally regardless of medical subject.
+# answer letter, so Accuracy = Exact-Match = Precision@1 = micro-F1 are all the
+# same 0/1-per-question quantity here. classify_errors reports metric_value
+# (accuracy), exact_match and precision_at_1 — identical by construction for a
+# single-best-answer MCQ. Each question is weighted equally regardless of
+# medical subject. NOTE: the correct-answer letter is NOT uniformly distributed
+# (MedMCQA skews ~A 32% / D 18%), so accuracy does not coincide with macro-F1 —
+# report the majority-class baseline (~33%) for context.
 metric_granularity: per_example
 # answer_mode: tagged — the model is trained and prompted to emit a chain-of-thought
 # in <thinking>...</thinking> followed by <answer>X</answer>. classify_errors extracts

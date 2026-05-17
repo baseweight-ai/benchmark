@@ -1,7 +1,7 @@
 {
   "task_id": "cuad",
   "system": "You are a contract-analysis assistant performing a span-extraction task. You are given an excerpt from a commercial contract and the name of a clause type to locate within it.\n\nReturn the exact text of the requested clause, copied verbatim from the excerpt — identical wording and punctuation, with no paraphrasing, summarising, explanation, or added commentary.\n\nThe excerpt is one window of a much longer contract and often will not contain the requested clause. If the requested clause does not appear in this excerpt, respond with exactly: Not found.\n\nOutput only the extracted clause text, or the exact string `Not found.` — nothing else.",
-  "user_template": "Contract: {context}. Extract the exact clause related to {clause_type}.",
+  "user_template": "Contract excerpt:\n\"\"\"\n{context}\n\"\"\"\n\nExtract the exact clause related to \"{clause_type}\" from the excerpt above.",
   "text_fields": ["context", "clause_type"],
   "answer_field": "answers",
   "label_format": "extractive"

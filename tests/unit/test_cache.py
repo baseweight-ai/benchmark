@@ -4,12 +4,16 @@ import pytest
 from pathlib import Path
 
 from pipeline.cache import (
+    code_closure_hash,
     dict_hash,
     file_content_hash,
     inputs_changed,
     read_stored_hash,
+    record_fingerprint,
+    reuse_is_valid,
     rows_sha,
     training_inputs_hash,
+    tree_hash,
 )
 
 pytestmark = pytest.mark.unit
@@ -133,3 +137,130 @@ class TestInputsChanged:
         f = tmp_path / "meta.json"
         f.write_text(json.dumps({"input_hash": "old_hash"}))
         assert inputs_changed("new_hash", f) is True
+
+
+class TestCodeClosureHash:
+    def _scripts(self, tmp_path):
+        """a.py imports b.py; c.py is unrelated."""
+        (tmp_path / "a.py").write_text("import b\nimport os\n")
+        (tmp_path / "b.py").write_text("x = 1\n")
+        (tmp_path / "c.py").write_text("y = 1\n")
+        return tmp_path / "a.py"
+
+    def test_deterministic(self, tmp_path):
+        entry = self._scripts(tmp_path)
+        assert code_closure_hash(entry) == code_closure_hash(entry)
+
+    def test_changes_when_imported_module_changes(self, tmp_path):
+        entry = self._scripts(tmp_path)
+        h1 = code_closure_hash(entry)
+        (tmp_path / "b.py").write_text("x = 2\n")
+        assert code_closure_hash(entry) != h1
+
+    def test_stable_when_unrelated_module_changes(self, tmp_path):
+        entry = self._scripts(tmp_path)
+        h1 = code_closure_hash(entry)
+        (tmp_path / "c.py").write_text("y = 999\n")
+        assert code_closure_hash(entry) == h1
+
+    def test_changes_when_entry_changes(self, tmp_path):
+        entry = self._scripts(tmp_path)
+        h1 = code_closure_hash(entry)
+        entry.write_text("import b\n# edited\n")
+        assert code_closure_hash(entry) != h1
+
+    def test_follows_transitive_imports(self, tmp_path):
+        (tmp_path / "a.py").write_text("import b\n")
+        (tmp_path / "b.py").write_text("import d\n")
+        (tmp_path / "d.py").write_text("z = 1\n")
+        entry = tmp_path / "a.py"
+        h1 = code_closure_hash(entry)
+        (tmp_path / "d.py").write_text("z = 2\n")
+        assert code_closure_hash(entry) != h1
+
+    def test_resolves_package_submodule(self, tmp_path):
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("")
+        (pkg / "sub.py").write_text("v = 1\n")
+        (tmp_path / "a.py").write_text("from pkg import sub\n")
+        entry = tmp_path / "a.py"
+        h1 = code_closure_hash(entry)
+        (pkg / "sub.py").write_text("v = 2\n")
+        assert code_closure_hash(entry) != h1
+
+    def test_ignores_stdlib_imports(self, tmp_path):
+        (tmp_path / "a.py").write_text("import os\nimport json\n")
+        h = code_closure_hash(tmp_path / "a.py")
+        assert len(h) == 16
+        assert all(ch in "0123456789abcdef" for ch in h)
+
+
+class TestTreeHash:
+    def test_deterministic(self, tmp_path):
+        (tmp_path / "f1.txt").write_text("a")
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "f2.txt").write_text("b")
+        assert tree_hash(tmp_path) == tree_hash(tmp_path)
+
+    def test_changes_when_file_content_changes(self, tmp_path):
+        f = tmp_path / "f.txt"
+        f.write_text("a")
+        h1 = tree_hash(tmp_path)
+        f.write_text("b")
+        assert tree_hash(tmp_path) != h1
+
+    def test_changes_when_file_added(self, tmp_path):
+        (tmp_path / "f1.txt").write_text("a")
+        h1 = tree_hash(tmp_path)
+        (tmp_path / "f2.txt").write_text("b")
+        assert tree_hash(tmp_path) != h1
+
+    def test_missing_dir_is_stable(self, tmp_path):
+        missing = tmp_path / "nope"
+        assert tree_hash(missing) == tree_hash(missing)
+        assert len(tree_hash(missing)) == 16
+
+
+def _pred_pair(tmp_path):
+    """A completed prediction file and its (unused) partial-file path."""
+    out = tmp_path / "pred.jsonl"
+    out.write_text('{"id":1}\n')
+    return out, tmp_path / "pred.jsonl.partial"
+
+
+class TestReuseIsValid:
+    def test_true_when_output_exists_and_no_sidecar(self, tmp_path):
+        # Grandfathered: a pre-fingerprint output with no sidecar is reused.
+        out, pp = _pred_pair(tmp_path)
+        assert reuse_is_valid(out, pp, "fp123") is True
+
+    def test_true_when_fingerprint_matches(self, tmp_path):
+        out, pp = _pred_pair(tmp_path)
+        record_fingerprint(out, "fp123")
+        assert reuse_is_valid(out, pp, "fp123") is True
+
+    def test_false_when_output_missing(self, tmp_path):
+        out = tmp_path / "pred.jsonl"
+        assert reuse_is_valid(out, tmp_path / "pred.jsonl.partial", "fp123") is False
+
+    def test_false_and_discards_stale_on_mismatch(self, tmp_path):
+        out, pp = _pred_pair(tmp_path)
+        pp.write_text("partial\n")
+        record_fingerprint(out, "old_fp")
+        assert reuse_is_valid(out, pp, "new_fp") is False
+        assert not out.exists()
+        assert not pp.exists()
+        assert not out.with_suffix(".meta.json").exists()
+
+
+class TestRecordFingerprint:
+    def test_writes_readable_sidecar(self, tmp_path):
+        out = tmp_path / "pred.jsonl"
+        record_fingerprint(out, "abc123")
+        assert read_stored_hash(out.with_suffix(".meta.json")) == "abc123"
+
+    def test_creates_parent_dir(self, tmp_path):
+        out = tmp_path / "nested" / "deep" / "pred.jsonl"
+        record_fingerprint(out, "xyz")
+        assert read_stored_hash(out.with_suffix(".meta.json")) == "xyz"

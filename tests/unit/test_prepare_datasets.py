@@ -311,6 +311,23 @@ def test_format_assistant_cot_letter_strips_explanation_whitespace():
     assert out == "<thinking>spaced out</thinking><answer>B</answer>"
 
 
+def test_format_assistant_cot_letter_caps_long_explanation():
+    """A multi-thousand-char exp is trimmed so the completion fits the output budget."""
+    from prepare_datasets import _COT_EXP_MAX_CHARS
+    out = format_assistant(_COT_PROMPT, {"cop": 2, "exp": "word " * 5000})
+    assert out.startswith("<thinking>")
+    assert out.endswith("</thinking><answer>C</answer>")  # answer tag never trimmed
+    inner = out[len("<thinking>"):-len("</thinking><answer>C</answer>")]
+    assert 0 < len(inner) <= _COT_EXP_MAX_CHARS
+    assert not inner.endswith(" ")  # trimmed at a word boundary
+
+
+def test_format_assistant_cot_letter_short_explanation_untouched():
+    """An explanation under the cap passes through verbatim."""
+    out = format_assistant(_COT_PROMPT, {"cop": 0, "exp": "short reason"})
+    assert out == "<thinking>short reason</thinking><answer>A</answer>"
+
+
 def test_format_gold_matches_format_assistant_for_non_cot():
     """For verbatim/letter/extractive the training target IS the gold label."""
     for prompt, row in [

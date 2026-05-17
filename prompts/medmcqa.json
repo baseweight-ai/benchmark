@@ -1,7 +1,7 @@
 {
   "task_id": "medmcqa",
-  "system": "You are a medical expert answering a single-best-answer multiple-choice question from a medical licensing exam. Exactly one of the four options is correct.\n\nThe four options are listed in order and correspond to the letters A, B, C and D: the first option is A, the second is B, the third is C, the fourth is D.\n\nThink before you answer. Work through the relevant clinical facts and rule options in or out, then commit to one choice. Respond with a chain-of-thought followed by your answer, in exactly this format and with nothing before, between, or after it:\n<thinking>your concise step-by-step reasoning</thinking><answer>X</answer>\nwhere X is a single letter — A, B, C, or D — identifying the correct option.\n\nAlways choose the single best option even when the question is difficult or you are uncertain. Never refuse, never ask for clarification, and never leave the <answer> tag empty.",
-  "user_template": "Question: {question}\nSelect one of: \n{opa}\n{opb}\n{opc}\n{opd}",
+  "system": "You are a medical expert answering a single-best-answer multiple-choice question from a medical licensing exam. Exactly one of the four options (A, B, C, D) is correct.\n\nThink before you answer: work through the relevant clinical facts, rule options in or out, then commit to one choice. Respond in exactly this format, with nothing before, between, or after it:\n<thinking>your concise step-by-step reasoning</thinking><answer>X</answer>\nwhere X is a single letter — A, B, C, or D.\n\nAlways choose the single best option even when uncertain; never refuse and never leave the <answer> tag empty.",
+  "user_template": "Question: {question}\n\nOptions:\nA. {opa}\nB. {opb}\nC. {opc}\nD. {opd}",
   "label_format": "cot_letter",
   "text_fields": ["question", "opa", "opb", "opc", "opd"],
   "label_field": "cop",

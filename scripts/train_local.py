@@ -41,7 +41,7 @@ from checkpoint_utils import (
     training_log,
 )
 from utils import write_jsonl
-from pipeline.cache import inputs_changed, training_inputs_hash
+from pipeline.cache import code_closure_hash, inputs_changed, training_inputs_hash
 from pipeline.config import get_local_models, get_tasks
 from pipeline.hardware import check_allowed_gpu, get_current_gpu_name
 from pipeline.log import configure, get_logger
@@ -712,6 +712,9 @@ def train_one(
         "training": hashed_training,
         "seq_len": hw_cfg.seq_len,
         "load_in_4bit": hw_cfg.load_in_4bit,
+        # Closure of training code: a change to the loss, LoRA wiring, or any
+        # module train_local imports busts the hash and forces a retrain.
+        "code": code_closure_hash(Path(__file__)),
     })
     meta_path = log_dir / "metadata.json"
 

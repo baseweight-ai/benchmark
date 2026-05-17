@@ -20,6 +20,7 @@ from checkpoint_utils import append_jsonl, finalize_partial, load_partial_ids, p
 from utils import build_messages, load_jsonl, load_label_set as _load_label_set, question_id, rows_hash as _rows_hash, read_prompt_sha as _read_prompt_sha, seed_sample_questions
 from pipeline.config import get_model_conditions, get_openai_models, get_reasoning_capable, get_tasks
 from pipeline.log import configure, get_logger
+from pipeline.cache import code_closure_hash, dict_hash, record_fingerprint, reuse_is_valid
 from pipeline.paths import pred_path
 from pipeline.providers import call_openai  # noqa: F401  # re-exported for test patching
 
@@ -178,13 +179,32 @@ async def run_eval(
 
     cond_key = condition if eval_seed == 0 else f"{condition}_seed{eval_seed}"
     out_path = pred_path(REPO_ROOT, "api", model_id, task_id, cond_key)
-    if out_path.exists():
-        click.echo(f"  SKIP [{model_id}/{task_id}/{condition}]: already exists")
-        _log.info("eval skip", model=model_id, task=task_id, condition=condition,
-                  event="stage_skip", reason="already exists")
-        return
 
+    # Skip-if-unchanged: reuse the prediction file only when its fingerprint
+    # still matches. A stale file — changed test data, prompt, eval code,
+    # model, or generation config — is discarded and regenerated.
+    fingerprint = dict_hash({
+        "code": code_closure_hash(Path(__file__)),
+        "test_rows": _rows_hash(test_rows),
+        "prompt_sha": prompt_sha,
+        "few_shot_hash": few_shot_hash,
+        "label_set": load_label_set(task_id),
+        "condition": condition,
+        "eval_seed": eval_seed,
+        "model": model_str,
+        "max_output_tokens": task_cfg.max_output_tokens,
+        "task_type": task_cfg.task_type,
+        "answer_mode": task_cfg.answer_mode,
+        "reasoning_capable": REASONING_CAPABLE.get(model_id, False),
+    })
     pp = partial_path(out_path)
+    if reuse_is_valid(out_path, pp, fingerprint):
+        click.echo(f"  SKIP [{model_id}/{task_id}/{condition}]: up-to-date")
+        _log.info("eval skip", model=model_id, task=task_id, condition=condition,
+                  event="stage_skip", reason="fingerprint match")
+        return
+    record_fingerprint(out_path, fingerprint)
+
     completed_ids = load_partial_ids(pp)
     pending_rows = [r for r in test_rows if r.get("id", "") not in completed_ids]
 
