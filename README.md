@@ -165,6 +165,22 @@ python scripts/sync_artifacts.py --what all
 python scripts/sync_artifacts.py --what adapters --direction down
 ```
 
+## Limitations
+
+- **Hyperparameters are not exhaustively tuned.** LoRA rank, learning rate,
+  weight decay, and warmup are documented defaults (`configs/training/`), with
+  one principled per-task override (`configs/tasks/fpb.yaml`: a lower learning
+  rate and higher weight decay for that small dataset). They were chosen a
+  priori — never tuned on the test set — and not searched via a per-task sweep
+  or k-fold cross-validation. Within a run, the epoch checkpoint is selected by
+  `load_best_model_at_end` on a held-out, stratified validation split
+  (`val.jsonl`, produced by `prepare_datasets.py`). A fuller hyperparameter
+  search could yield modest gains, but the test sets are small enough that such
+  gains may fall within measurement noise.
+- **Test sets are modest in size.** Metrics are reported as mean ± spread
+  across `n_eval_seeds` resamples of the test set (`configs/run_defaults.yaml`)
+  to quantify sampling noise; single-seed numbers should not be over-interpreted.
+
 ## License
 
 Code: MIT. Model adapters follow each model's original license. Datasets: see individual dataset cards on HuggingFace.

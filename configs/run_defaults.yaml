@@ -9,7 +9,10 @@ api_models:
 
 smoke_test: false
 dry_run: false
-n_eval_seeds: 1
+# Test metrics are reported as mean ± spread across this many eval seeds.
+# Seed 0 uses the canonical test set; seeds 1+ resample from test_full.jsonl.
+# Each extra seed re-runs eval-local (GPU) and eval-api (OpenAI API spend).
+n_eval_seeds: 3
 
 timeouts:
   download_s: 1800

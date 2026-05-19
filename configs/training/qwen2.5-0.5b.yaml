@@ -1,11 +1,17 @@
 model_id: Qwen/Qwen2.5-0.5B-Instruct
 model_short: qwen2.5-0.5b
-max_seq_length: 256
+# Must fit the real task prompts — banking77/ledgar label lists and cuad
+# windows run 500–1200 tokens; a short limit truncates the training answer.
+max_seq_length: 2048
 load_in_4bit: false
 dtype: float32
 enable_thinking: null
 vllm_task: auto
 fallback_model_id: null
+# Chat-template turn markers for completion-only loss masking (ChatML).
+# Double-quoted so \n is parsed as a real newline.
+instruction_part: "<|im_start|>user\n"
+response_part: "<|im_start|>assistant\n"
 lora:
   rank: 4
   alpha: 8

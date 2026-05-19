@@ -40,7 +40,7 @@ from checkpoint_utils import (
     save_train_state,
     training_log,
 )
-from utils import write_jsonl
+from utils import load_jsonl, write_jsonl
 from pipeline.cache import code_closure_hash, inputs_changed, training_inputs_hash
 from pipeline.config import get_local_models, get_tasks
 from pipeline.hardware import check_allowed_gpu, get_current_gpu_name
@@ -83,6 +83,11 @@ class ModelConfig(BaseModel):
     dtype: str = "bfloat16"
     enable_thinking: Optional[bool] = None
     fallback_model_id: Optional[str] = None
+    # Chat-template turn markers used to mask prompt tokens for completion-only
+    # loss. Defaults are ChatML (Qwen, etc.); override per model when its
+    # chat template uses different turn delimiters.
+    instruction_part: str = "<|im_start|>user\n"
+    response_part: str = "<|im_start|>assistant\n"
     lora: dict = Field(default_factory=dict)
     training: dict = Field(default_factory=dict)
 
@@ -202,9 +207,17 @@ class ConfigFactory:
             lora_rank=model_cfg.lora.get("rank", 16),
             lora_alpha=model_cfg.lora.get("alpha", 32),
             seq_len=base_seq,
-            sft_extra={"save_strategy": "steps", "save_steps": 250, "save_total_limit": 3},
+            # save_strategy / eval_strategy come from the model config — they
+            # must agree for load_best_model_at_end, so keep only the disk cap
+            # here rather than overriding the configured save strategy.
+            sft_extra={"save_total_limit": 3},
         )
         if smoke_test:
+            # Smoke shrinks the model and LoRA for speed, but NOT seq_len:
+            # task prompts run 500–1200 tokens (banking77's 77-label list,
+            # cuad's contract window), so a shorter limit truncates the
+            # assistant answer off the end and completion-only loss collapses
+            # to all-masked. seq_len stays at the real per-task value.
             cfg = dc_replace(
                 cfg,
                 load_dtype=torch.float32,
@@ -212,7 +225,6 @@ class ConfigFactory:
                 use_grad_ckpt=False,
                 lora_rank=4,
                 lora_alpha=8,
-                seq_len=256,
                 sft_extra={"bf16": False, "save_strategy": "no"},
             )
         return cfg
@@ -290,6 +302,37 @@ def _analyze_training(
     return diag
 
 
+def _verify_completion_masking(train_ds, echo) -> None:
+    """Fail loudly if completion-only loss masking degenerated.
+
+    train_on_responses_only masks prompt tokens to -100 and leaves assistant
+    tokens supervised. If the configured instruction/response markers don't
+    match the model's chat template, masking silently degenerates into one of
+    two ruined runs: every token masked (zero loss, no learning) or no token
+    masked (loss over the whole prompt). Catch both before training, not after.
+
+    Masking is deterministic given the chat template, so example 0 is
+    representative of the whole split.
+    """
+    labels = train_ds[0]["labels"]
+    n = len(labels)
+    n_supervised = sum(1 for x in labels if x != -100)
+    if n_supervised == 0:
+        raise RuntimeError(
+            "Completion masking left no supervised tokens (all -100). The "
+            "response_part marker likely does not match the chat template — "
+            "check instruction_part/response_part in the model config."
+        )
+    if n_supervised == n:
+        raise RuntimeError(
+            "Completion masking left every token supervised — the prompt was "
+            "not masked. The instruction_part marker likely does not match the "
+            "chat template — check instruction_part/response_part in the model config."
+        )
+    echo(f"Completion masking verified: {n_supervised}/{n} tokens supervised "
+         f"({100 * n_supervised / n:.0f}%) in example 0")
+
+
 # ---------------------------------------------------------------------------
 # Core training logic (isolated for GC scoping)
 # ---------------------------------------------------------------------------
@@ -318,6 +361,7 @@ def run_training_task(
     # Heavy GPU libs imported here so the module is importable on CPU for tests
     import unsloth  # noqa: F401 — must come before transformers/peft
     from unsloth import FastModel
+    from unsloth.chat_templates import train_on_responses_only
     import datasets as hf_datasets
     from transformers import TrainerCallback
     from trl import SFTTrainer, SFTConfig
@@ -423,7 +467,12 @@ def run_training_task(
             step = state.global_step
             self._last_logged_step = step
             self._last_heartbeat = time.time()
-            loss = logs.get("loss", logs.get("train_loss"))
+            # Only per-step training logs (key "loss") count as step losses.
+            # The end-of-training summary log carries "train_loss" (the mean
+            # over all steps) — counting that as a step loss trips a phantom
+            # spike anomaly and skews the loss diagnostics, so ignore it here.
+            loss = logs.get("loss")
+            eval_loss = logs.get("eval_loss")
             lr = logs.get("learning_rate")
             grad_norm = logs.get("grad_norm")
 
@@ -453,6 +502,8 @@ def run_training_task(
             parts = self._progress_header(step)
             if loss is not None and not (math.isnan(loss) or math.isinf(loss)):
                 parts.append(f"loss={loss:.4f}")
+            if eval_loss is not None:
+                parts.append(f"eval_loss={eval_loss:.4f}")
             if lr is not None:
                 parts.append(f"lr={lr:.2e}")
             if grad_norm is not None and not (math.isnan(grad_norm) or math.isinf(grad_norm)):
@@ -469,41 +520,41 @@ def run_training_task(
             })
 
     echo(f"Loading dataset from {data_path} ...")
-    with open(data_path) as f:
-        rows = [json.loads(line) for line in f]
-    echo(f"{len(rows)} examples loaded")
+    train_rows = load_jsonl(data_path)
+    echo(f"{len(train_rows)} training examples loaded")
 
-    # Reserve last 10% for per-epoch validation loss monitoring (overfitting detection).
-    # Smoke test skips this to keep iterations fast.
-    val_n = max(1, len(rows) // 10) if not smoke_test and len(rows) >= 10 else 0
-    train_rows = rows[:-val_n] if val_n else rows
-    val_rows = rows[-val_n:] if val_n else []
-    if val_n:
-        echo(f"Val split: {len(train_rows)} train + {val_n} val (for overfitting detection)")
+    # Validation split: a prepared, versioned, stratified artifact — val.jsonl
+    # alongside train.jsonl (see prepare_datasets.py). Used for per-epoch eval
+    # and overfitting detection. Smoke runs skip eval, so they skip the val load.
+    val_rows: list[dict] = []
+    val_path = data_path.parent / "val.jsonl"
+    if not smoke_test and val_path.exists():
+        val_rows = load_jsonl(val_path)
+        echo(f"Validation split: {len(train_rows)} train + {len(val_rows)} val ({val_path.name})")
+    val_n = len(val_rows)
 
     train_ds = hf_datasets.Dataset.from_list(train_rows)
     val_ds = hf_datasets.Dataset.from_list(val_rows) if val_rows else None
 
-    # prompt-completion shape lets SFTTrainer apply completion_only_loss
-    # (gradients on assistant tokens only).
+    # Render each conversation to a single `text` field with the model's chat
+    # template. SFTTrainer tokenizes it; train_on_responses_only (below) then
+    # masks prompt tokens so loss is computed on assistant tokens only.
     template_kwargs = {}
     if model_cfg.enable_thinking is False:
         template_kwargs["enable_thinking"] = False
 
-    echo("Splitting messages into prompt/completion for completion-only loss...")
-    def to_prompt_completion(example):
+    echo("Applying chat template...")
+    def apply_template(example):
         msgs = example["messages"]
-        assistant_idx = next((i for i, m in enumerate(msgs) if m["role"] == "assistant"), -1)
-        if assistant_idx < 0:
+        if not any(m["role"] == "assistant" for m in msgs):
             raise ValueError(f"Training row has no assistant message: {msgs}")
-        row = {"prompt": msgs[:assistant_idx], "completion": msgs[assistant_idx:]}
-        if template_kwargs:
-            row["chat_template_kwargs"] = template_kwargs
-        return row
+        return {"text": tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=False, **template_kwargs,
+        )}
 
-    train_ds = train_ds.map(to_prompt_completion, remove_columns=train_ds.column_names)
+    train_ds = train_ds.map(apply_template, remove_columns=train_ds.column_names)
     if val_ds is not None:
-        val_ds = val_ds.map(to_prompt_completion, remove_columns=val_ds.column_names)
+        val_ds = val_ds.map(apply_template, remove_columns=val_ds.column_names)
     echo(f"Dataset ready: {len(train_ds)} train rows" + (f", {len(val_ds)} val rows" if val_ds else ""))
 
     training_cfg = dict(model_cfg.training)
@@ -531,7 +582,7 @@ def run_training_task(
         logging_nan_inf_filter=training_cfg.get("logging_nan_inf_filter", False),
         report_to=training_cfg.get("report_to", "none"),
         max_seq_length=hw_cfg.seq_len,
-        completion_only_loss=True,
+        dataset_text_field="text",
         packing=False,
     )
     sft_kwargs.update(hw_cfg.sft_extra)
@@ -565,6 +616,20 @@ def run_training_task(
         callbacks=[callback],
     )
 
+    # Completion-only loss: mask prompt tokens to -100 so gradients flow from
+    # assistant tokens only. Unsloth's patched SFTTrainer ignores TRL's
+    # `completion_only_loss` flag (its `_prepare_dataset` has no prompt/completion
+    # path), so masking is applied here, after tokenization, via the chat
+    # template's turn markers — and masks the eval split the same way.
+    echo(f"Masking prompts (loss on response only): "
+         f"instruction={model_cfg.instruction_part!r} response={model_cfg.response_part!r}")
+    trainer = train_on_responses_only(
+        trainer,
+        instruction_part=model_cfg.instruction_part,
+        response_part=model_cfg.response_part,
+    )
+    _verify_completion_masking(trainer.train_dataset, echo)
+
     echo("Starting trainer.train()...")
     t0 = time.time()
     result = trainer.train(
@@ -597,6 +662,12 @@ def run_training_task(
         for e in trainer.state.log_history if "eval_loss" in e
     ]
     val_losses = [e["eval_loss"] for e in eval_loss_history]
+    # trainer.train() returns training metrics only — the eval loss lives in the
+    # log history. Report the saved model's eval loss: trainer.state.best_metric
+    # when load_best_model_at_end reloaded the best epoch, else the final epoch.
+    if eval_loss is None and val_losses:
+        best = getattr(trainer.state, "best_metric", None)
+        eval_loss = round(best if best is not None else val_losses[-1], 6)
     training_diagnostics = _analyze_training(
         [v for _, v in callback.loss_steps], callback.anomalies, echo, val_losses=val_losses or None
     )
@@ -675,6 +746,22 @@ def run_training_task(
 # Orchestration
 # ---------------------------------------------------------------------------
 
+def _discard_stale_checkpoints(ckpt_dir: Path) -> int:
+    """Remove HF `checkpoint-*` dirs so a retrain cannot resume a superseded run.
+
+    Resume-from-checkpoint is for crash recovery within a single run. Once the
+    inputs change, the old checkpoints belong to a different model — and a
+    *finished* checkpoint is the trap: resuming it leaves zero steps to run, so
+    the "retrain" silently completes without training. Returns the count removed.
+    """
+    removed = 0
+    for d in sorted(ckpt_dir.glob("checkpoint-*")):
+        if d.is_dir():
+            shutil.rmtree(d, ignore_errors=True)
+            removed += 1
+    return removed
+
+
 def train_one(
     model_cfg: ModelConfig,
     task_cfg: TaskConfig,
@@ -712,6 +799,10 @@ def train_one(
         "training": hashed_training,
         "seq_len": hw_cfg.seq_len,
         "load_in_4bit": hw_cfg.load_in_4bit,
+        # Turn markers drive completion-only loss masking, so changing them
+        # changes the trained weights and must invalidate the cached run.
+        "instruction_part": model_cfg.instruction_part,
+        "response_part": model_cfg.response_part,
         # Closure of training code: a change to the loss, LoRA wiring, or any
         # module train_local imports busts the hash and forces a retrain.
         "code": code_closure_hash(Path(__file__)),
@@ -728,7 +819,12 @@ def train_one(
                 with open(meta_path) as f:
                     return json.load(f)
             return {}
-        echo("RETRAIN: inputs changed")
+        # Inputs changed: the prior run completed, so its checkpoints are a
+        # superseded model, not a crash to recover. Resuming the finished
+        # checkpoint would leave 0 steps to run and silently no-op the retrain.
+        n_cleared = _discard_stale_checkpoints(ckpt_dir)
+        echo("RETRAIN: inputs changed"
+             + (f" — discarded {n_cleared} stale checkpoint(s)" if n_cleared else ""))
 
     if dry_run:
         echo(f"[dry-run] Would train {model_cfg.model_id} on {data_path.name}")

@@ -44,6 +44,9 @@ def mock_ml_modules():
     mock_train_result = MagicMock()
     mock_train_result.metrics = {"eval_loss": 0.35}
     mock_trainer.train.return_value = mock_train_result
+    # train_on_responses_only adds masked `labels`; _verify_completion_masking
+    # inspects example 0 — supply a realistic partially-masked label list.
+    mock_trainer.train_dataset.__getitem__.return_value = {"labels": [-100, -100, 7, 8]}
 
     mock_model = MagicMock()
     mock_tokenizer = MagicMock()
@@ -55,6 +58,17 @@ def mock_ml_modules():
 
     mock_unsloth = MagicMock()
     mock_unsloth.FastModel = mock_fast_model_cls
+
+    # unsloth.chat_templates: a real submodule entry so train_local's
+    # `from unsloth.chat_templates import train_on_responses_only` resolves.
+    # The stub records its kwargs and returns the trainer unchanged (real
+    # prompt-masking needs a tokenized GPU dataset).
+    masking_calls: list[dict] = []
+    def _stub_train_on_responses_only(trainer, **kwargs):
+        masking_calls.append(kwargs)
+        return trainer
+    mock_chat_templates = ModuleType("unsloth.chat_templates")
+    mock_chat_templates.train_on_responses_only = _stub_train_on_responses_only
 
     mock_trl = MagicMock()
     mock_trl.SFTTrainer.return_value = mock_trainer
@@ -70,6 +84,7 @@ def mock_ml_modules():
 
     stubs = {
         "unsloth": mock_unsloth,
+        "unsloth.chat_templates": mock_chat_templates,
         "trl": mock_trl,
         "transformers": mock_transformers,
         "datasets": mock_datasets,
@@ -81,6 +96,7 @@ def mock_ml_modules():
             "tokenizer": mock_tokenizer,
             "fast_model_cls": mock_fast_model_cls,
             "train_result": mock_train_result,
+            "masking_calls": masking_calls,
         }
 
 
@@ -230,6 +246,31 @@ def test_train_one_passes_resume_checkpoint_to_trainer(train_env, tmp_checkpoint
     assert "checkpoint-5" in str(resume_arg)
 
 
+def test_train_one_retrain_discards_stale_checkpoints(train_env, tmp_checkpoints_root, mock_ml_modules):
+    """A completed prior run + changed inputs is a retrain: stale checkpoints
+    must be cleared so training starts fresh. Resuming a finished checkpoint
+    leaves 0 steps to run and silently no-ops the retrain."""
+    import train_local as train
+
+    e = train_env
+    # Prior run: complete, with metadata whose stored input_hash differs from
+    # whatever this run computes → inputs_changed → RETRAIN.
+    save_train_state("test-model", "toy", "lora", {"status": "complete", "eval_loss": 0.2})
+    meta_path = e["tmp_path"] / "results" / "training" / "local" / "test-model" / "toy" / "lora" / "metadata.json"
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path.write_text(json.dumps({"model_id": "test-model", "input_hash": "stale-hash"}))
+
+    ckpt_dir = checkpoint_dir("test-model", "toy", "lora")
+    ckpt_dir.mkdir(parents=True, exist_ok=True)  # save_train_state already created it
+    (ckpt_dir / "checkpoint-170").mkdir()
+
+    train.train_one(e["model_cfg"], e["task_cfg"], e["data_path"], dry_run=False)
+
+    assert not (ckpt_dir / "checkpoint-170").exists(), "stale checkpoint not cleared"
+    resume_arg = mock_ml_modules["trainer"].train.call_args.kwargs.get("resume_from_checkpoint")
+    assert resume_arg is None, "retrain must not resume a superseded checkpoint"
+
+
 def test_checkpoint_callback_updates_state(train_env, tmp_checkpoints_root, mock_ml_modules):
     """_CheckpointCallback.on_save must write epoch/step to train_state.json."""
     import train_local as train
@@ -275,6 +316,20 @@ def test_train_one_dry_run_writes_metadata_no_training(train_env, tmp_checkpoint
     assert result["n_train"] >= 0
     meta_path = e["tmp_path"] / "results" / "training" / "local" / "test-model" / "toy" / "lora" / "metadata.json"
     assert meta_path.exists()
+
+
+def test_train_one_applies_response_only_masking(train_env, tmp_checkpoints_root, mock_ml_modules):
+    """run_training_task masks prompts via train_on_responses_only, passing the
+    model config's chat-template turn markers — this is the completion-only loss."""
+    import train_local as train
+
+    e = train_env
+    train.train_one(e["model_cfg"], e["task_cfg"], e["data_path"], dry_run=False)
+
+    calls = mock_ml_modules["masking_calls"]
+    assert len(calls) == 1, "train_on_responses_only must be applied exactly once"
+    assert calls[0]["instruction_part"] == e["model_cfg"].instruction_part
+    assert calls[0]["response_part"] == e["model_cfg"].response_part
 
 
 # ── TaskConfig training_overrides ─────────────────────────────────────────────

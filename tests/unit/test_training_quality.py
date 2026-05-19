@@ -170,3 +170,87 @@ def test_apply_params_routes_lora_keys():
     # Base model unchanged
     assert base.lora["rank"] == 4
     assert base.model_short == "qwen2.5-0.5b"
+
+
+# ── _verify_completion_masking ─────────────────────────────────────────────────
+
+def _verify_masking(labels):
+    from train_local import _verify_completion_masking
+    _verify_completion_masking([{"labels": labels}], _noop)
+
+
+def test_completion_masking_ok_when_partially_masked():
+    # prompt masked (-100), response tokens supervised — the healthy case
+    _verify_masking([-100, -100, -100, 5, 6, 7])  # must not raise
+
+
+def test_completion_masking_raises_when_all_masked():
+    # every token -100 → zero loss; response marker missed the chat template
+    with pytest.raises(RuntimeError, match="no supervised tokens"):
+        _verify_masking([-100, -100, -100, -100])
+
+
+def test_completion_masking_raises_when_nothing_masked():
+    # no -100 → prompt not masked; instruction marker missed the chat template
+    with pytest.raises(RuntimeError, match="every token supervised"):
+        _verify_masking([3, 4, 5, 6])
+
+
+# ── Chat-template turn markers ─────────────────────────────────────────────────
+
+def test_model_config_marker_defaults_are_chatml():
+    from train_local import ModelConfig
+    cfg = ModelConfig(model_id="x", model_short="x")
+    assert cfg.instruction_part == "<|im_start|>user\n"
+    assert cfg.response_part == "<|im_start|>assistant\n"
+
+
+@pytest.mark.parametrize("model_id", ["qwen3-8b", "qwen2.5-0.5b"])
+def test_model_config_yaml_markers_parse_real_newlines(model_id):
+    """The YAML must double-quote the markers so `\\n` is parsed as a real
+    newline; a literal backslash-n would never match the tokenized template."""
+    import train_local
+    cfg = train_local.load_model_config(model_id)
+    assert cfg.instruction_part == "<|im_start|>user\n"
+    assert cfg.response_part == "<|im_start|>assistant\n"
+
+
+# ── ConfigFactory smoke-test seq_len ───────────────────────────────────────────
+
+def test_smoke_does_not_shrink_seq_len():
+    """Smoke must keep the real per-task seq_len. Task prompts run 500-1200
+    tokens, so a shrunken smoke limit truncates the assistant answer off the
+    end and completion-only loss collapses to all-masked (the bug this guards)."""
+    from train_local import ConfigFactory, load_model_config, load_task_config
+    model_cfg = load_model_config("qwen2.5-0.5b")  # the smoke model
+    for task_id in ("banking77", "cuad", "fpb", "ledgar", "medmcqa"):
+        task_cfg = load_task_config(task_id)
+        smoke = ConfigFactory.build(model_cfg, task_cfg, smoke_test=True)
+        prod = ConfigFactory.build(model_cfg, task_cfg, smoke_test=False)
+        assert smoke.seq_len == prod.seq_len, f"{task_id}: smoke shrank seq_len"
+    # cuad needs its longer-window override (2560) — even under smoke
+    cuad = ConfigFactory.build(model_cfg, load_task_config("cuad"), smoke_test=True)
+    assert cuad.seq_len == 2560
+
+
+def test_smoke_still_shrinks_model_and_lora():
+    """seq_len is the only thing smoke must NOT shrink — the model/LoRA/dtype
+    reductions for speed still apply."""
+    from train_local import ConfigFactory, load_model_config, load_task_config
+    smoke = ConfigFactory.build(load_model_config("qwen3-8b"),
+                                load_task_config("banking77"), smoke_test=True)
+    assert smoke.lora_rank == 4 and smoke.lora_alpha == 8
+    assert smoke.load_in_4bit is False
+
+
+# ── eval config ────────────────────────────────────────────────────────────────
+
+def test_qwen3_eval_config_supports_load_best():
+    """load_best_model_at_end requires eval and save strategies to agree, or HF
+    Trainer raises at construction. Also guards that eval stays on so the
+    held-out val split actually produces a loss (overfitting stays measurable)."""
+    from train_local import load_model_config
+    t = load_model_config("qwen3-8b").training
+    assert t["eval_strategy"] != "no", "eval must run to record validation loss"
+    if t.get("load_best_model_at_end"):
+        assert t["eval_strategy"] == t["save_strategy"]

@@ -81,6 +81,10 @@ class TaskConfig(BaseModel):
     test_split: str = "test"
     train_sampling: Optional[SamplingConfig] = None
     test_sampling: Optional[SamplingConfig] = None
+    # Fraction of the sampled training pool held out as a stratified validation
+    # split (val.jsonl), used for early stopping and overfitting detection.
+    val_ratio: float = 0.1
+    val_seed: int = 42
 
 
 def load_task_config(task_id: str) -> TaskConfig:
@@ -688,6 +692,26 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
         overlap = [r for r in test_rows if r.get("sentence", "") in train_sentences]
         assert not overlap, f"FPB: {len(overlap)} rows overlap between train and test after sampling"
 
+    # ── Carve a stratified validation split out of the training pool ───────
+    # A versioned, stratified val.jsonl beats a positional tail-slice at train
+    # time: every class is represented and the split is reproducible. Stratified
+    # on the same field train sampling used (and balanced the same way, if any).
+    val_rows: list[dict] = []
+    if not smoke_test and cfg.train_sampling and len(train_rows) >= 20:
+        val_n = round(len(train_rows) * cfg.val_ratio)
+        if val_n >= 1:
+            val_rows = sample(
+                train_rows, strategy="stratified",
+                stratify_by=cfg.train_sampling.stratify_by,
+                total_cap=val_n, seed=cfg.val_seed,
+                balance_by=cfg.train_sampling.balance_by,
+            )
+            # Partition by object identity: sample() returns the same dict
+            # objects, so id() removes exactly the rows drawn.
+            val_ids = {id(r) for r in val_rows}
+            train_rows = [r for r in train_rows if id(r) not in val_ids]
+            _log_distribution(val_rows, cfg.train_sampling.stratify_by, "Val (stratified)")
+
     # ── Smoke capping ─────────────────────────────────────────────────────
     src_train = train_rows[:SMOKE_TRAIN_N] if smoke_test else train_rows
     src_test  = test_rows[:SMOKE_TEST_N]  if smoke_test else test_rows
@@ -727,16 +751,18 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
 
     prefix = "smoke_" if smoke_test else ""
     fmt_train = fmt_rows(src_train)
+    fmt_val   = fmt_rows(val_rows)
     fmt_test  = fmt_test_prompts(src_test)
     fmt_labs  = fmt_labels(src_test)
 
-    _, invalid_train = validate_dataset(fmt_train)
+    train_and_val = fmt_train + fmt_val
+    _, invalid_train = validate_dataset(train_and_val)
     if invalid_train:
-        click.echo(f"  WARNING [{cfg.task_id}]: {len(invalid_train)} training rows failed validation", err=True)
+        click.echo(f"  WARNING [{cfg.task_id}]: {len(invalid_train)} train/val rows failed validation", err=True)
         for row in invalid_train[:3]:
             click.echo(f"    {row['validation_error']}", err=True)
 
-    contam_hits = check_contamination(fmt_train, fmt_test)
+    contam_hits = check_contamination(train_and_val, fmt_test)
     if contam_hits:
         click.echo(f"  WARNING [{cfg.task_id}]: {len(contam_hits)} training example(s) overlap test set", err=True)
         for hit in contam_hits[:3]:
@@ -751,6 +777,8 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
             )
 
     write_jsonl(fmt_train, out_dir / f"{prefix}train.jsonl")
+    if fmt_val:
+        write_jsonl(fmt_val, out_dir / "val.jsonl")
     write_jsonl(fmt_test,  out_dir / f"{prefix}test.jsonl")
     write_jsonl(fmt_labs,  out_dir / f"{prefix}test_labels.jsonl")
 
@@ -804,8 +832,10 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
             "input_hash": fingerprint,
             "prompt_sha": prompt_sha,
             "train_sha": rows_sha(fmt_train),
+            "val_sha": rows_sha(fmt_val) if fmt_val else None,
             "test_sha": rows_sha(fmt_test),
             "n_train": len(fmt_train),
+            "n_val": len(fmt_val),
             "n_test": len(fmt_test),
             "validation_errors": len(invalid_train),
             "contamination_hits": len(contam_hits),

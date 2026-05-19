@@ -6,6 +6,10 @@ dtype: "bfloat16"
 enable_thinking: false
 vllm_task: auto
 fallback_model_id: "Qwen/Qwen2.5-7B-Instruct"
+# Chat-template turn markers for completion-only loss masking (ChatML).
+# Double-quoted so \n is parsed as a real newline.
+instruction_part: "<|im_start|>user\n"
+response_part: "<|im_start|>assistant\n"
 lora:
   rank: 16
   alpha: 32
@@ -24,7 +28,8 @@ training:
   bf16: true
   seed: 42
   save_strategy: "epoch"
-  eval_strategy: "no"
-  load_best_model_at_end: false
+  eval_strategy: "epoch"           # evaluate the held-out val split each epoch
+  load_best_model_at_end: true     # keep the lowest-eval-loss epoch, not the last
+  metric_for_best_model: "eval_loss"
   logging_steps: 10
   report_to: "none"
