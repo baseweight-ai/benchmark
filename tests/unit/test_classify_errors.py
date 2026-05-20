@@ -13,6 +13,7 @@ from classify_errors import (
     compute_metric,
     extract_tagged_answer,
     get_valid_labels,
+    is_api_error,
     is_chunked,
     is_empty,
     is_format_violation,
@@ -161,6 +162,76 @@ def test_classify_classification_format_violation():
 
 def test_classify_classification_priority_empty_beats_refusal():
     assert classify_classification("", "positive", ["positive"]) == "empty"
+
+
+# ── is_api_error / api_error category ─────────────────────────────────────────
+
+@pytest.mark.parametrize("text", [
+    "ERROR: Error code: 400 - {'error': {'message': 'Unsupported parameter ...'}}",
+    "ERROR: Circuit 'openai' OPEN — 9 consecutive failure(s), cooldown 60.0s",
+    "ERROR: timeout",
+    "  ERROR: leading whitespace still counts",
+])
+def test_is_api_error_detects(text):
+    """eval_api / eval_local write 'ERROR: ...' on exception — we must detect
+    them so they don't pollute hallucination/format-violation metrics."""
+    assert is_api_error(text)
+
+
+@pytest.mark.parametrize("text", [
+    "positive",
+    "negative",
+    "An error in judgement",       # contains 'error' but not the sentinel prefix
+    "I cannot help with that",     # refusal, not transport failure
+    "",                            # empty, not api_error
+    "   ",
+])
+def test_is_api_error_does_not_overmatch(text):
+    assert not is_api_error(text)
+
+
+def test_classify_classification_api_error_beats_format_violation():
+    """API-error rows must not be classified as format_violation — an ERROR
+    string isn't in the label set, but counting it as a hallucination would
+    inflate the model's error rate with transport failures it never saw."""
+    result = classify_classification(
+        "ERROR: Error code: 400 - ...", "positive", ["positive", "negative"]
+    )
+    assert result == "api_error"
+
+
+def test_classify_extraction_api_error_first():
+    result = classify_extraction("ERROR: timeout", "The contract expires Jan 1")
+    assert result == "api_error"
+
+
+def test_compute_classification_metrics_api_errors_excluded_from_hallucination():
+    """An API failure isn't a model hallucination — it must not inflate
+    hallucination_rate, but must show up as api_error_rate."""
+    from classify_errors import compute_classification_metrics
+    rows = [
+        {"error_category": "correct", "ground_truth": "positive", "predicted_clean": "positive"},
+        {"error_category": "correct", "ground_truth": "negative", "predicted_clean": "negative"},
+        {"error_category": "api_error", "ground_truth": "neutral", "predicted_clean": "__INVALID__"},
+        {"error_category": "api_error", "ground_truth": "positive", "predicted_clean": "__INVALID__"},
+        {"error_category": "format_violation", "ground_truth": "positive", "predicted_clean": "__INVALID__"},
+    ]
+    out = compute_classification_metrics(rows, ["positive", "negative", "neutral"])
+    # api_error_rate is 2/5; hallucination is 1 format_violation out of 3 RESPONDED rows.
+    assert out["api_error_rate"] == pytest.approx(2 / 5, abs=1e-4)
+    assert out["hallucination_rate"] == pytest.approx(1 / 3, abs=1e-4)
+
+
+def test_compute_classification_metrics_all_api_error_yields_none_halluc():
+    """When the provider is fully down, every row is api_error and there are
+    no model responses to compute hallucination over — rate must be None."""
+    from classify_errors import compute_classification_metrics
+    rows = [
+        {"error_category": "api_error", "ground_truth": "positive", "predicted_clean": "__INVALID__"},
+    ] * 5
+    out = compute_classification_metrics(rows, ["positive", "negative", "neutral"])
+    assert out["api_error_rate"] == 1.0
+    assert out["hallucination_rate"] is None  # nothing responded — no rate definable
 
 
 def test_classify_classification_case_mismatch_is_format_violation_not_correct():
@@ -625,6 +696,75 @@ def test_aggregate_seed_summaries_missing_classification_metrics_returns_none():
     assert agg["macro_f1"] is None
     assert agg["weighted_f1"] is None
     assert agg["hallucination_rate"] is None
+
+
+# ── seed-0 inclusion in main() aggregation ────────────────────────────────────
+
+def test_classify_main_includes_seed0_in_agg(tmp_path, monkeypatch):
+    """When *_seed*.jsonl files exist alongside the unsuffixed condition file,
+    the base file IS seed 0 and must be aggregated with the resamples — the
+    _agg.json must therefore report n_seeds equal to base + resamples."""
+    import json as _json
+    import classify_errors as ce
+    from click.testing import CliRunner
+
+    # 3-seed predictions: bare = seed 0, _seed1, _seed2
+    pred_dir = tmp_path / "results" / "predictions" / "local" / "test-model" / "fpb"
+    pred_dir.mkdir(parents=True)
+    sys_msg = "Classify."
+    labels = ["positive", "negative", "neutral"]
+
+    def _rows(correct_prefix: int) -> list[dict]:
+        """N rows; the first `correct_prefix` are correct, rest are wrong."""
+        out = []
+        n = 6
+        for i in range(n):
+            gt = labels[i % 3]
+            pred = gt if i < correct_prefix else labels[(i + 1) % 3]
+            out.append({
+                "id": f"fpb_test_{i:04d}",
+                "model": "test-model",
+                "condition": "zero-shot",
+                "eval_seed": 0,
+                "input": "x",
+                "output": pred,
+                "ground_truth": gt,
+                "input_tokens": 10, "output_tokens": 2, "reasoning_tokens": 0,
+                "latency_ms": 100.0, "ttft_ms": 50.0, "avg_logprob": -0.1,
+                "timestamp": "2026-05-20T00:00:00Z",
+            })
+        return out
+
+    for suffix, n_correct in [("", 6), ("_seed1", 4), ("_seed2", 5)]:
+        (pred_dir / f"zero-shot{suffix}.jsonl").write_text(
+            "\n".join(_json.dumps(r) for r in _rows(n_correct)) + "\n"
+        )
+
+    # Minimal task config + label set.
+    cfg_dir = tmp_path / "configs" / "tasks"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "fpb.yaml").write_text(
+        "task_id: fpb\ntask_type: classification\nmetric_id: accuracy\n"
+        "metric_granularity: per_example\nanswer_mode: direct\n"
+    )
+    prep_dir = tmp_path / "data" / "prepared" / "fpb"
+    prep_dir.mkdir(parents=True)
+    (prep_dir / "labels.json").write_text(_json.dumps(labels))
+
+    monkeypatch.setattr(ce, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ce, "ALL_TASKS", ["fpb"])
+
+    runner = CliRunner()
+    res = runner.invoke(ce.main, ["--task", "fpb", "--source", "local", "--model", "test-model"])
+    assert res.exit_code == 0, res.output
+
+    agg_path = tmp_path / "results" / "summaries" / "local" / "test-model" / "fpb" / "zero-shot_agg.json"
+    assert agg_path.exists(), f"agg file missing: {res.output}"
+    agg = _json.load(agg_path.open())
+    assert agg["n_seeds"] == 3, f"expected 3 seeds, got {agg['n_seeds']} (seed 0 dropped?)"
+    # Three accuracies: 6/6, 4/6, 5/6 = [1.0, 0.667, 0.833]
+    expected_values = sorted([1.0, round(4 / 6, 4), round(5 / 6, 4)])
+    assert sorted(agg["seed_metric_values"]) == expected_values
 
 
 def test_aggregate_seed_summaries_handles_missing_reasoning_fields():

@@ -76,8 +76,13 @@ async def _openai_once(
     if response_format is not None:
         extra["response_format"] = response_format
 
+    # `max_completion_tokens` is the v1 chat-completions parameter — accepted
+    # by every current OpenAI chat model and required by reasoning-class ones
+    # (gpt-5.4-*, o-series). The legacy `max_tokens` 400s on reasoning models,
+    # so we use the new name everywhere.
     stream = await client.chat.completions.create(
-        model=model_str, messages=messages, temperature=0, max_tokens=max_tokens,
+        model=model_str, messages=messages, temperature=0,
+        max_completion_tokens=max_tokens,
         stream=True, stream_options={"include_usage": True},
         logprobs=True,
         **extra,

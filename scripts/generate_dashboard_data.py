@@ -204,12 +204,30 @@ def load_summary(source: str, model_short: str, task_id: str, condition: str,
     return None
 
 
-def discover_summaries(smoke: bool = False) -> list[tuple[str, str, str, str]]:
+def discover_summaries(
+    smoke: bool = False,
+    allowed_models: Optional[set[str]] = None,
+) -> list[tuple[str, str, str, str]]:
     """Return (source, model, task, condition) for base condition files only.
 
     Skips seed-specific (*_seedN.json) and aggregated (*_agg.json) files —
     load_summary() will transparently return the agg variant when it exists.
+
+    allowed_models: when set, only summaries whose model_id is in the set are
+    returned. Used to scope the dashboard to the current pipeline cohort —
+    stale summaries on disk from earlier configurations (e.g. an old smoke
+    model run before the namespace split) are then ignored. None disables
+    filtering (back-compat for callers that just want everything).
     """
+    from pipeline.config import get_prod_model_ids, get_smoke_model_ids
+    if allowed_models is None:
+        allowed_models = get_smoke_model_ids() if smoke else get_prod_model_ids()
+
+    # Defensive: an explicitly-empty cohort would have walked every directory
+    # only to skip every model. Short-circuit before touching the filesystem.
+    if not allowed_models:
+        return []
+
     summaries_root = REPO_ROOT / "results" / smoke_seg(smoke) / "summaries"
     found = []
     if not summaries_root.exists():
@@ -219,6 +237,8 @@ def discover_summaries(smoke: bool = False) -> list[tuple[str, str, str, str]]:
             continue
         for model_dir in sorted(source_dir.iterdir()):
             if not model_dir.is_dir():
+                continue
+            if allowed_models and model_dir.name not in allowed_models:
                 continue
             for task_dir in sorted(model_dir.iterdir()):
                 if not task_dir.is_dir():
@@ -259,6 +279,13 @@ def build_result(
     # Legacy summaries lack these — fall back so answer + reasoning = output.
     total_reasoning = summary.get("total_reasoning_tokens", 0) or 0 if summary else 0
     total_answer = summary.get("total_answer_tokens", total_output) if summary else 0
+    # Envelope-aware accounting (tiktoken-counted bare label for API rows that
+    # used response_format). None for legacy summaries that never recorded it
+    # and for local rows that don't use a JSON envelope. The complement is
+    # surfaced as `envelope_overhead_tokens` so cost comparisons can subtract
+    # the JSON wrapper cost when the user wants apples-to-apples.
+    total_answer_only = summary.get("total_answer_only_tokens") if summary else None
+    total_envelope_overhead = summary.get("total_envelope_overhead_tokens") if summary else None
     avg_latency_ms = summary.get("avg_latency_ms") if summary else None
     eval_wall_time_s = summary.get("eval_wall_time_s") if summary else None
     ttft_p50 = summary.get("ttft_p50_ms") if summary else None
@@ -349,6 +376,7 @@ def build_result(
     macro_f1 = summary.get("macro_f1") if summary else None
     weighted_f1 = summary.get("weighted_f1") if summary else None
     hallucination_rate = summary.get("hallucination_rate") if summary else None
+    api_error_rate = summary.get("api_error_rate") if summary else None
     # Extraction-task metrics (None for classification tasks).
     answer_detection_f1 = summary.get("answer_detection_f1") if summary else None
     precision_at_80_recall = summary.get("precision_at_80_recall") if summary else None
@@ -383,6 +411,7 @@ def build_result(
         "macro_f1": macro_f1,
         "weighted_f1": weighted_f1,
         "hallucination_rate": hallucination_rate,
+        "api_error_rate": api_error_rate,
         "answer_detection_f1": answer_detection_f1,
         "precision_at_80_recall": precision_at_80_recall,
         "aupr": aupr,
@@ -431,6 +460,11 @@ def build_result(
         "total_output_tokens": total_output if summary else None,
         "total_reasoning_tokens": total_reasoning if summary else None,
         "total_answer_tokens": total_answer if summary else None,
+        # Envelope-aware counts (currently populated by eval_api when
+        # response_format is set; None elsewhere). Lets cost comparisons
+        # subtract the JSON wrapper overhead the API adds.
+        "total_answer_only_tokens": total_answer_only if summary else None,
+        "total_envelope_overhead_tokens": total_envelope_overhead if summary else None,
         "avg_input_tokens": avg_input_tokens,
         "avg_output_tokens": avg_output_tokens,
         "avg_reasoning_tokens": avg_reasoning_tokens,
@@ -503,8 +537,22 @@ def _sign_flip_p_value(gains: list[float], n_perm: int = 5000) -> Optional[float
     return round(count / n_perm, 4)
 
 
+# Minimum eval-set size for a row to count toward headline comparisons.
+# Anchored to prepare_datasets.SMOKE_TEST_N so the threshold tracks the
+# smoke-row size automatically: any row with at least 5× a smoke run is a
+# real eval (smallest production test set is ≥150).
+from prepare_datasets import SMOKE_TEST_N as _SMOKE_TEST_N
+_MIN_REAL_EVAL_N = _SMOKE_TEST_N * 5
+
+
 def _comparison(results: list[dict], fine_family: str, fine_cond: str, base_family: str, base_cond: str) -> dict:
-    """Compute tasks_won, cost_per_correct_ratio, accuracy gain for one comparison pair."""
+    """Compute tasks_won, cost_per_correct_ratio, accuracy gain for one comparison pair.
+
+    Rows with `n_predictions < _MIN_REAL_EVAL_N` are excluded — they're smoke
+    artefacts or partial runs and would otherwise contribute spurious 0.0-vs-0.0
+    pairs to averages. The per-task breakdown likewise only contains tasks
+    where both sides have a real evaluation.
+    """
     best_fine: dict[str, float] = {}
     best_base: dict[str, float] = {}
     fine_cp1k: dict[str, list[float]] = {}
@@ -512,6 +560,13 @@ def _comparison(results: list[dict], fine_family: str, fine_cond: str, base_fami
 
     for r in results:
         if r["metric_value"] is None:
+            continue
+        # Skip smoke / partial rows: a real eval has >> _MIN_REAL_EVAL_N rows
+        # (≥150 for our smallest task), smoke runs have ≤10. Filter only when
+        # n_predictions is explicitly recorded — back-compat for unit tests
+        # and legacy result rows that don't carry the field.
+        n_pred = r.get("n_predictions")
+        if n_pred is not None and n_pred < _MIN_REAL_EVAL_N:
             continue
         tid = r["task_id"]
         mv = r["metric_value"]
@@ -863,7 +918,11 @@ def _load_task_baselines() -> dict[str, dict]:
     return baselines
 
 
-def merge_results(fresh: list[dict], existing_path: Path) -> list[dict]:
+def merge_results(
+    fresh: list[dict],
+    existing_path: Path,
+    allowed_models: Optional[set[str]] = None,
+) -> list[dict]:
     """Merge fresh results into existing ones, keyed by (model_id, task_id, condition).
 
     Per key:
@@ -871,21 +930,30 @@ def merge_results(fresh: list[dict], existing_path: Path) -> list[dict]:
       - else existing non-null value is preserved.
     Plus: keys present in existing but absent from fresh are kept verbatim, so a
     pipeline that only recomputes some (m,t,c) sections does not delete the rest.
+
+    allowed_models: when set, rows from either side whose model_id is outside
+    the cohort are skipped — keeps stale rows from earlier pipeline
+    configurations (e.g. renamed smoke models) out of the published JSON.
     """
     try:
         with open(existing_path) as f:
             existing = json.load(f)
     except Exception:
-        return fresh
+        return [r for r in fresh if allowed_models is None or r["model_id"] in allowed_models]
+
+    def _in_cohort(r: dict) -> bool:
+        return allowed_models is None or r.get("model_id") in allowed_models
 
     existing_map = {
         (r["model_id"], r["task_id"], r["condition"]): r
-        for r in existing.get("results", [])
+        for r in existing.get("results", []) if _in_cohort(r)
     }
-    fresh_keys = {(r["model_id"], r["task_id"], r["condition"]) for r in fresh}
+    fresh_keys = {(r["model_id"], r["task_id"], r["condition"]) for r in fresh if _in_cohort(r)}
 
     merged = []
     for r in fresh:
+        if not _in_cohort(r):
+            continue
         key = (r["model_id"], r["task_id"], r["condition"])
         prior = existing_map.get(key)
         if r["metric_value"] is None and prior is not None and prior.get("metric_value") is not None:
@@ -1042,8 +1110,10 @@ def main(
     # this run produces new data for them; --replace forces a clean rebuild.
     merge = not replace
     if merge:
+        from pipeline.config import get_prod_model_ids, get_smoke_model_ids
+        allowed_models = get_smoke_model_ids() if smoke_test else get_prod_model_ids()
         fresh = data["results"]
-        merged = merge_results(fresh, out_path)
+        merged = merge_results(fresh, out_path, allowed_models=allowed_models)
         fresh_map = {(r["model_id"], r["task_id"], r["condition"]): r for r in fresh}
         n_preserved = sum(1 for r in merged if fresh_map.get((r["model_id"], r["task_id"], r["condition"])) is not r)
         if n_preserved:

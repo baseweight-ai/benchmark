@@ -24,6 +24,48 @@ from pipeline.cache import code_closure_hash, dict_hash, record_fingerprint, reu
 from pipeline.paths import pred_path, prepared_path
 from pipeline.providers import call_openai  # noqa: F401  # re-exported for test patching
 
+
+# ── Token accounting helpers ───────────────────────────────────────────────
+
+from functools import lru_cache
+
+
+@lru_cache(maxsize=8)
+def _tiktoken_encoder(model_str: str):
+    """Return a tiktoken encoder for `model_str`, falling back to cl100k_base
+    when the model is unknown to tiktoken (newer-than-tiktoken IDs like
+    gpt-5.4-mini). None when tiktoken itself is unavailable."""
+    try:
+        import tiktoken
+    except ImportError:
+        return None
+    try:
+        return tiktoken.encoding_for_model(model_str)
+    except KeyError:
+        try:
+            return tiktoken.get_encoding("o200k_base")
+        except Exception:
+            return tiktoken.get_encoding("cl100k_base")
+
+
+def count_answer_tokens(answer_text: str, model_str: str) -> Optional[int]:
+    """Token count of the bare answer text, with the JSON envelope stripped.
+
+    Used to surface `envelope_overhead_tokens = output_tokens - answer_only -
+    reasoning` so cost comparisons across (response_format on / response_format
+    off) regimes are apples-to-apples. Returns None when tiktoken is missing
+    or the answer is empty.
+    """
+    if not answer_text:
+        return 0
+    enc = _tiktoken_encoder(model_str)
+    if enc is None:
+        return None
+    try:
+        return len(enc.encode(answer_text))
+    except Exception:
+        return None
+
 _log = get_logger("eval-api")
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -284,6 +326,7 @@ async def run_eval(
     async def process_row(row: dict) -> None:
         msgs = build_messages(row, few_shot, condition)
         ground_truth = row.get("label", "")
+        api_error = False
         try:
             text, in_tok, out_tok, reasoning_tok, lat, ttft, avg_logprob = await call_openai(
                 client, model_str, msgs, task_cfg.max_output_tokens, semaphore,
@@ -298,8 +341,18 @@ async def run_eval(
             text, in_tok, out_tok, reasoning_tok, lat, ttft, avg_logprob = (
                 f"ERROR: {exc}", 0, 0, 0, 0, 0.0, None
             )
+            api_error = True
         totals[0] += in_tok
         totals[1] += out_tok
+        # Envelope-aware accounting: count tokens of the (unwrapped) answer
+        # text so the JSON envelope a response_format adds doesn't inflate the
+        # apples-to-apples cost comparison vs constrained-decoding local runs.
+        # For unconstrained outputs this just re-counts the response text
+        # (close to the API-reported answer_tokens, modulo tokenizer drift).
+        if api_error:
+            answer_only = 0
+        else:
+            answer_only = count_answer_tokens(text, model_str)
         result = {
             "id": row.get("id", ""),
             "model": model_id,
@@ -313,6 +366,11 @@ async def run_eval(
             "input_tokens": in_tok,
             "output_tokens": out_tok,
             "reasoning_tokens": reasoning_tok,
+            # Tokens of just the unwrapped answer. The complement
+            # (output_tokens − reasoning_tokens − answer_only_tokens) is the
+            # JSON envelope overhead and is surfaced separately downstream.
+            # None when tiktoken can't tokenise (rare).
+            "answer_only_tokens": answer_only,
             "latency_ms": lat,
             "ttft_ms": ttft,
             "avg_logprob": avg_logprob,

@@ -28,6 +28,7 @@
 #   --clean          Delete prior outputs for selected steps/model/task, then run
 #   --dry-run        Pass --dry-run to all supporting scripts
 #   --test-sampling  Run download+prepare with full production data to verify sampling. --task still applies.
+#   --skip-env-check Bypass the conda-env-vs-environment.yml drift check (debugging only)
 #   -h, --help       Show this message
 
 set -euo pipefail
@@ -61,6 +62,7 @@ MODEL_OVERRIDE=""   # explicit --model; empty = use resolved default below
 CLEAN=false
 DRY_RUN=false
 FROM_STAGE=""
+SKIP_ENV_CHECK=false
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -90,9 +92,10 @@ while [[ $# -gt 0 ]]; do
         --task)        TASK="$2";              shift 2 ;;
         --model)       MODEL_OVERRIDE="$2";    shift 2 ;;
         --from)        FROM_STAGE="$2";        ANY_STEP=true; shift 2 ;;
-        --clean)         CLEAN=true;             shift ;;
-        --dry-run)       DRY_RUN=true;           shift ;;
-        --test-sampling) TEST_SAMPLING=true;     shift ;;
+        --clean)            CLEAN=true;             shift ;;
+        --dry-run)          DRY_RUN=true;           shift ;;
+        --test-sampling)    TEST_SAMPLING=true;     shift ;;
+        --skip-env-check)   SKIP_ENV_CHECK=true;    shift ;;
         -h|--help)     usage ;;
         *) echo "Unknown argument: $1" >&2; usage ;;
     esac
@@ -229,10 +232,67 @@ _read_env_key() {
     fi
 }
 
+# Reproducibility gate: every run verifies the active env matches the one
+# start.sh built from environment.yml. Two checks:
+#   (1) environment.yml hash vs the stamp start.sh recorded — flags edits
+#       to the YAML that bypassed setup.
+#   (2) `pip list` hash vs the snapshot start.sh took post-build — flags
+#       in-place `pip install`/`pip uninstall`/`conda install` that drifted
+#       the env from its declared state.
+# Either drift is a hard fail with a resolution recipe (no auto-fix —
+# resolution is the user's choice: start.sh updates in place,
+# start.sh --recreate-env rebuilds from scratch). Bypass for debugging
+# with --skip-env-check.
+_env_check() {
+    local env_yml="${REPO_ROOT}/environment.yml"
+    local yaml_stamp="${REPO_ROOT}/.setup_stamp"
+    local pip_stamp="${REPO_ROOT}/.env_pip_hash"
+    local issues=()
+
+    if [[ -f "$yaml_stamp" ]]; then
+        local cur_yml cached_yml
+        cur_yml="$(md5sum "$env_yml" | awk '{print $1}')"
+        cached_yml="$(cat "$yaml_stamp")"
+        if [[ "$cur_yml" != "$cached_yml" ]]; then
+            issues+=("environment.yml has been edited since the env was last (re)built")
+        fi
+    fi
+
+    if [[ -f "$pip_stamp" ]] && [[ -x "${CONDA_ENV_PREFIX}/bin/pip" ]]; then
+        local cur_pip cached_pip
+        cur_pip="$("${CONDA_ENV_PREFIX}/bin/pip" list --format=freeze 2>/dev/null \
+                    | LC_ALL=C sort | md5sum | awk '{print $1}')"
+        cached_pip="$(cat "$pip_stamp")"
+        if [[ "$cur_pip" != "$cached_pip" ]]; then
+            issues+=("Installed packages drifted from the snapshot start.sh took (pip install/uninstall outside setup)")
+        fi
+    fi
+
+    if (( ${#issues[@]} > 0 )); then
+        {
+            echo
+            echo "  [pipeline] FAIL  Conda env does not match environment.yml:"
+            for i in "${issues[@]}"; do
+                echo "  [pipeline]   - ${i}"
+            done
+            echo "  [pipeline]"
+            echo "  [pipeline] Resolve with one of:"
+            echo "  [pipeline]   ./start.sh                    # update env in place to match environment.yml"
+            echo "  [pipeline]   ./start.sh --recreate-env     # rebuild from scratch"
+            echo "  [pipeline]"
+            echo "  [pipeline] To bypass during debugging:     ./run.sh --skip-env-check ..."
+        } >&2
+        return 1
+    fi
+}
+
 # If setup will (re)create the env we don't need Python yet; resolve after setup.
 # In every other case the env must already exist.
 if [[ "$DO_SETUP" == false ]]; then
     _resolve_python
+    if [[ "$SKIP_ENV_CHECK" == false ]]; then
+        _env_check || exit 1
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -322,6 +382,17 @@ if [[ "$CLEAN" == true ]]; then
 
     if [[ "$DO_SETUP" == true ]]; then
         if [[ -d "${CONDA_ENV_PREFIX}/conda-meta" ]]; then
+            # `conda env remove` refuses to delete the currently-active env.
+            # The shell that invoked run.sh typically has the env activated
+            # (our auto-activate hook in ~/.bashrc), so CONDA_PREFIX is
+            # inherited here. Deactivate in-place — this script sourced
+            # conda.sh, so `conda deactivate` mutates our process env — then
+            # remove. The outer shell is unaffected (process isolation); the
+            # env is recreated by start.sh below.
+            if [[ "${CONDA_PREFIX:-}" == "${CONDA_ENV_PREFIX}" ]]; then
+                echo "  [pipeline] Deactivating ${CONDA_ENV_PREFIX} so it can be removed..."
+                conda deactivate || true
+            fi
             echo "  [pipeline] Removing conda env at ${CONDA_ENV_PREFIX}..."
             _run_tagged "pipeline" conda env remove --prefix "${CONDA_ENV_PREFIX}" -y
         fi

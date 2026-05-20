@@ -18,6 +18,7 @@ venv/
 # Conda env (lives inside the repo)
 .conda-envs/
 .setup_stamp
+.env_pip_hash
 environment.lock.yml
 condaenv.*.requirements.txt
 

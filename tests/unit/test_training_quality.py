@@ -11,7 +11,7 @@ _noop = lambda msg: None  # silent echo for tests
 # ── _analyze_training ──────────────────────────────────────────────────────────
 
 def _diag(losses, anomalies=None):
-    from train_local import _analyze_training
+    from pipeline.trainers import analyze_training as _analyze_training
     return _analyze_training(losses, anomalies or [], _noop)
 
 
@@ -81,7 +81,7 @@ def test_short_sequence_skips_diverge_and_plateau():
 # ── Overfitting detection (val_losses param) ───────────────────────────────────
 
 def _diag_with_val(losses, val_losses, anomalies=None):
-    from train_local import _analyze_training
+    from pipeline.trainers import analyze_training as _analyze_training
     return _analyze_training(losses, anomalies or [], _noop, val_losses=val_losses)
 
 
@@ -124,6 +124,40 @@ def test_overfitting_not_detected_when_val_loss_rises_less_than_5pct():
     # val loss rises <5% — within noise, not flagged
     d = _diag_with_val([1.0, 0.8, 0.6, 0.5], val_losses=[1.0, 1.01, 1.02, 1.03])
     assert d["overfitting_detected"] is False
+
+
+def test_overfitting_not_detected_single_noise_spike_at_end():
+    """A single tall spike at the end that recovers (or hasn't recovered yet)
+    is noise, not overfitting. The smoothed-tail check should suppress it —
+    one outlier in three doesn't move the median. Regression guard for the
+    'last-value-vs-min' brittleness the previous heuristic had."""
+    d = _diag_with_val(
+        [1.0, 0.8, 0.6, 0.5, 0.4, 0.3],
+        val_losses=[0.04, 0.04, 0.04, 0.04, 0.10],
+    )
+    assert d["overfitting_detected"] is False
+
+
+def test_overfitting_not_detected_when_best_is_last():
+    """Monotonically-decreasing val_loss: the minimum is the LAST point. The
+    model is still improving — must never be flagged as overfit, even though
+    every earlier point is above the min. Regression guard for naive
+    'tail-vs-min' framings (which would flag this incorrectly)."""
+    d = _diag_with_val(
+        [1.0, 0.8, 0.6, 0.5],
+        val_losses=[1.0, 0.9, 0.85, 0.8],
+    )
+    assert d["overfitting_detected"] is False
+
+
+def test_overfitting_detected_with_sustained_post_best_drift():
+    """Two consecutive post-best values above the +5% threshold → sustained
+    drift, not noise. This is the case the heuristic exists to catch."""
+    d = _diag_with_val(
+        [1.0, 0.8, 0.6, 0.5, 0.4, 0.3],
+        val_losses=[0.046, 0.046, 0.038, 0.080, 0.055],
+    )
+    assert d["overfitting_detected"] is True
 
 
 def test_overfitting_none_when_fewer_than_2_val_epochs():
@@ -193,7 +227,7 @@ def test_apply_params_routes_lora_keys():
 # ── _verify_completion_masking ─────────────────────────────────────────────────
 
 def _verify_masking(labels):
-    from train_local import _verify_completion_masking
+    from pipeline.trainers import verify_completion_masking as _verify_completion_masking
     _verify_completion_masking([{"labels": labels}], _noop)
 
 
@@ -277,19 +311,19 @@ def test_qwen3_eval_config_supports_load_best():
 # ── eval cadence + early stopping ──────────────────────────────────────────────
 
 def test_eval_save_steps_basic():
-    from train_local import eval_save_steps
+    from pipeline.trainers import eval_save_steps
     # 600 examples / effective batch 16 → 38 steps/epoch; 3 evals/epoch → 12.
     assert eval_save_steps(600, 16, 3) == 12
 
 
 def test_eval_save_steps_floor_is_one():
-    from train_local import eval_save_steps
+    from pipeline.trainers import eval_save_steps
     # Tiny dataset: fewer steps than evals_per_epoch → at least 1, never 0.
     assert eval_save_steps(12, 16, 3) == 1
 
 
 def test_eval_save_steps_scales_with_cadence():
-    from train_local import eval_save_steps
+    from pipeline.trainers import eval_save_steps
     # Same dataset, more evals/epoch → smaller eval_steps.
     assert eval_save_steps(1600, 16, 1) == 100
     assert eval_save_steps(1600, 16, 4) == 25
@@ -316,13 +350,13 @@ def test_qwen3_early_stopping_configured():
 # ── Loss spike detection (extracted from _CheckpointCallback) ──────────────────
 
 def test_detect_loss_spike_needs_5_priors():
-    from train_local import _detect_loss_spike
+    from pipeline.trainers import detect_loss_spike as _detect_loss_spike
     # Fewer than 5 priors → no baseline → no spike, even if loss is huge.
     assert _detect_loss_spike(99.0, [1.0, 1.0, 1.0, 1.0]) is None
 
 
 def test_detect_loss_spike_fires_above_3x():
-    from train_local import _detect_loss_spike
+    from pipeline.trainers import detect_loss_spike as _detect_loss_spike
     # mean5 = 0.1, loss = 0.4 → 4× mean → spike.
     spike = _detect_loss_spike(0.4, [0.1, 0.1, 0.1, 0.1, 0.1])
     assert spike is not None
@@ -332,13 +366,13 @@ def test_detect_loss_spike_fires_above_3x():
 
 
 def test_detect_loss_spike_no_fire_at_3x():
-    from train_local import _detect_loss_spike
+    from pipeline.trainers import detect_loss_spike as _detect_loss_spike
     # loss == 3 × mean5 exactly → strict >, so NOT a spike.
     assert _detect_loss_spike(0.3, [0.1, 0.1, 0.1, 0.1, 0.1]) is None
 
 
 def test_detect_loss_spike_zero_mean_skips():
-    from train_local import _detect_loss_spike
+    from pipeline.trainers import detect_loss_spike as _detect_loss_spike
     # Degenerate: mean5 == 0 → can't compute a meaningful ratio, no spike.
     assert _detect_loss_spike(1.0, [0.0, 0.0, 0.0, 0.0, 0.0]) is None
 

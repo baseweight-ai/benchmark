@@ -27,10 +27,14 @@ models:
       pinned_version: gpt-5.4-mini
       conditions: [zero-shot, 5-shot]
       reasoning_capable: true
+    # gpt-5.4-nano is the --smoke-test stand-in. Tagged smoke: true so the
+    # prod dashboard excludes its rows; eval_api.py still finds it via
+    # SMOKE_MODELS list.
     - id: gpt-5.4-nano
       pinned_version: gpt-5.4-nano
       conditions: [zero-shot, 5-shot]
       reasoning_capable: true
+      smoke: true
 
 stages:
   - id: download

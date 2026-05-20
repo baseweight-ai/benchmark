@@ -89,9 +89,15 @@ _EXPECTED_GRANULARITY: dict[str, str] = {
 # Maps per-example error_category → broad semantic failure type.
 # Allows coarser cross-task analysis ("how often does the model confuse facts?"
 # vs "how often does it refuse or ignore instructions?") without rerunning classify.
+#
+# api_error is distinct from instruction_following_failure: the model never got
+# to respond — the request errored or the circuit breaker was open. Folding
+# transport failures into hallucination/format violations would inflate those
+# metrics and slander the model for an outage it never saw.
 _SEMANTIC_ERROR_TYPE: dict[str, str] = {
     "correct":          "correct",
     "not_applicable":   "correct",            # model correctly identified no answer
+    "api_error":        "provider_error",     # request errored before the model could respond
     "empty":            "instruction_following_failure",
     "format_violation": "instruction_following_failure",
     "refusal":          "safety_or_alignment_refusal",
@@ -164,6 +170,18 @@ def token_f1(prediction: str, ground_truth) -> float:
     return 2 * precision * recall / (precision + recall)
 
 
+def is_api_error(text: str) -> bool:
+    """True when an output is a recorded exception, not a model response.
+
+    eval_api / eval_local write `ERROR: ...` into the output field when a
+    provider call raises (HTTP 4xx, transport failure, circuit breaker open).
+    These rows must be distinguished from format violations or hallucinations —
+    the model never got to answer, so blaming it for the failure is wrong.
+    """
+    s = (text or "").lstrip()
+    return s.startswith("ERROR:") or s.startswith("ERROR ")
+
+
 def is_empty(text: str) -> bool:
     return not text.strip()
 
@@ -213,13 +231,20 @@ def extract_tagged_answer(text: str) -> str:
 # ── Classification task error classification ───────────────────────────────
 
 def classify_classification(prediction: str, ground_truth: str, valid_labels: Optional[list[str]] = None) -> str:
-    """Priority: empty > refusal > format_violation > correct > wrong_class.
+    """Priority: api_error > empty > refusal > format_violation > correct > wrong_class.
 
-    Correctness is strict, case-sensitive equality. With guided_choice active,
-    the model's output is constrained to one of the exact label strings, so
-    `prediction == ground_truth` is the right test — no lowercasing, no
-    punctuation stripping, no whitespace collapse.
+    api_error comes first because a provider failure means the model never
+    answered — counting that as a format violation would inflate
+    hallucination_rate and instruction_following_failure with transport
+    outages.
+
+    Correctness for non-error rows is strict, case-sensitive equality. With
+    guided_choice active, the model's output is constrained to one of the exact
+    label strings, so `prediction == ground_truth` is the right test — no
+    lowercasing, no punctuation stripping, no whitespace collapse.
     """
+    if is_api_error(prediction):
+        return "api_error"
     if is_empty(prediction):
         return "empty"
     if is_refusal(prediction):
@@ -234,12 +259,16 @@ def classify_classification(prediction: str, ground_truth: str, valid_labels: Op
 # ── Extraction task error classification ──────────────────────────────────
 
 def classify_extraction(prediction: str, ground_truth, f1_threshold_partial: float = 0.5) -> str:
-    """Priority: empty > format_violation > correct > partial > hallucinated > not_applicable.
+    """Priority: api_error > empty > format_violation > correct > partial > hallucinated > not_applicable.
 
+    api_error comes first (provider failure, not a model output). The rest
+    of the priority order matches single-answer extraction scoring.
     ground_truth may be a list of valid gold spans (a CUAD question can have
     several); the prediction is then classified against whichever span it
     matches best (max-F1), mirroring multi-answer extraction scoring.
     """
+    if is_api_error(prediction):
+        return "api_error"
     if isinstance(ground_truth, list):
         ground_truth = (max(ground_truth, key=lambda g: token_f1(prediction, g))
                         if ground_truth else "")
@@ -335,6 +364,13 @@ def aggregate_seed_summaries(summaries: list[dict]) -> dict:
         vals = [s[key] for s in summaries if s.get(key) is not None]
         return round(sum(vals) / len(vals), 4) if vals else None
 
+    def _sum_optional(key: str) -> Optional[int]:
+        # Sum across only the seeds that recorded the field. None when no
+        # seed has it (e.g. legacy summaries, or local conditions without an
+        # envelope-wrapping response_format).
+        vals = [s[key] for s in summaries if s.get(key) is not None]
+        return sum(vals) if vals else None
+
     return {
         "model": base.get("model"),
         "task_id": base.get("task_id"),
@@ -354,6 +390,7 @@ def aggregate_seed_summaries(summaries: list[dict]) -> dict:
         "macro_f1": _mean_field("macro_f1"),
         "weighted_f1": _mean_field("weighted_f1"),
         "hallucination_rate": _mean_field("hallucination_rate"),
+        "api_error_rate": _mean_field("api_error_rate"),
         "answer_detection_precision": _mean_field("answer_detection_precision"),
         "answer_detection_recall": _mean_field("answer_detection_recall"),
         "answer_detection_f1": _mean_field("answer_detection_f1"),
@@ -366,6 +403,8 @@ def aggregate_seed_summaries(summaries: list[dict]) -> dict:
         "total_output_tokens": sum(s.get("total_output_tokens", 0) or 0 for s in summaries),
         "total_reasoning_tokens": sum(s.get("total_reasoning_tokens", 0) or 0 for s in summaries),
         "total_answer_tokens": sum(s.get("total_answer_tokens", 0) or 0 for s in summaries),
+        "total_answer_only_tokens": _sum_optional("total_answer_only_tokens"),
+        "total_envelope_overhead_tokens": _sum_optional("total_envelope_overhead_tokens"),
         "error_counts": dict(all_counts),
         "semantic_error_counts": dict(all_semantic_counts),
         "prompt_sha": base.get("prompt_sha"),
@@ -405,7 +444,7 @@ def aggregate_chunk_predictions(predictions: list[dict]) -> list[dict]:
         groups[base].append(r)
 
     def _errored(c: dict) -> bool:
-        return str(c.get("output", "")).startswith("ERROR:")
+        return is_api_error(c.get("output", ""))
 
     aggregated: list[dict] = []
     for base in order:
@@ -498,13 +537,7 @@ def compute_classification_metrics(
     """
     n = len(classified_rows)
     if n == 0:
-        return {
-            "exact_match": None,
-            "precision_at_1": None,
-            "macro_f1": None,
-            "weighted_f1": None,
-            "hallucination_rate": None,
-        }
+        return {k: None for k in _CLASSIFICATION_METRIC_KEYS}
 
     correct = sum(1 for r in classified_rows if r.get("error_category") == "correct")
     exact_match = round(correct / n, 4)
@@ -521,6 +554,13 @@ def compute_classification_metrics(
         macro = None
         weighted = None
 
+    # hallucination_rate measures the model's tendency to invent labels —
+    # transport failures (api_error) never reached the model, so they're
+    # excluded from BOTH numerator and denominator. Reported separately as
+    # api_error_rate so a broken provider stays visible.
+    api_errors = sum(1 for r in classified_rows if r.get("error_category") == "api_error")
+    api_error_rate = round(api_errors / n, 4)
+
     if valid_labels is None:
         hallucination = None
     else:
@@ -528,7 +568,8 @@ def compute_classification_metrics(
             1 for r in classified_rows
             if r.get("error_category") == "format_violation"
         )
-        hallucination = round(format_violations / n, 4)
+        responded = n - api_errors
+        hallucination = round(format_violations / responded, 4) if responded else None
 
     return {
         "exact_match": exact_match,
@@ -536,6 +577,7 @@ def compute_classification_metrics(
         "macro_f1": macro,
         "weighted_f1": weighted,
         "hallucination_rate": hallucination,
+        "api_error_rate": api_error_rate,
     }
 
 
@@ -548,6 +590,14 @@ _EXTRACTION_METRIC_KEYS = (
 
 # token-F1 at/above which an extraction counts as a real "hit" for Precision@Recall.
 _EXTRACTION_HIT_THRESHOLD = 0.5
+
+
+# Keys returned by compute_classification_metrics. Defined once so the
+# zero-row early return and the non-empty path can't drift apart silently.
+_CLASSIFICATION_METRIC_KEYS = (
+    "exact_match", "precision_at_1", "macro_f1", "weighted_f1",
+    "hallucination_rate", "api_error_rate",
+)
 
 
 def compute_extraction_metrics(classified_rows: list[dict]) -> dict:
@@ -645,8 +695,17 @@ def classify_predictions(
             cat = classify_classification(scored, gt, valid_labels)
             enriched["error_category"] = cat
             # predicted_clean is the (extracted) prediction for valid rows,
-            # "__INVALID__" sentinel otherwise. Used by F1 — strict match.
-            enriched["predicted_clean"] = scored if cat not in ("empty", "refusal", "format_violation") else "__INVALID__"
+            # "__INVALID__" sentinel for everything that didn't yield a usable
+            # label — empty / refusal / format_violation / api_error. F1 treats
+            # the sentinel as a strict mismatch, so transport failures count
+            # against the model in the headline metric (intentionally — a
+            # benchmark that hides API downtime as "didn't happen" would be
+            # misleading), but `hallucination_rate` excludes them via
+            # compute_classification_metrics (api errors aren't hallucinations).
+            enriched["predicted_clean"] = (
+                scored if cat not in ("empty", "refusal", "format_violation", "api_error")
+                else "__INVALID__"
+            )
             if task_cfg.answer_mode == "tagged":
                 enriched["parsed_answer"] = scored
 
@@ -730,6 +789,10 @@ def process_model_task_condition(
         classification_metrics = {
             "exact_match": None, "precision_at_1": None, "macro_f1": None,
             "weighted_f1": None, "hallucination_rate": None,
+            "api_error_rate": round(
+                sum(1 for r in classified if r.get("error_category") == "api_error")
+                / max(1, len(classified)), 4
+            ),
         }
 
     if task_cfg.task_type == "extraction":
@@ -754,6 +817,20 @@ def process_model_task_condition(
     total_output_tokens = sum(r.get("output_tokens", 0) for r in predictions)
     total_reasoning_tokens = sum(r.get("reasoning_tokens", 0) or 0 for r in predictions)
     total_answer_tokens = total_output_tokens - total_reasoning_tokens
+    # When the API wraps answers in a JSON envelope (response_format), the
+    # API-reported output_tokens include the wrapper. answer_only_tokens
+    # (counted via tiktoken in eval_api) holds the bare-label count; the
+    # complement is the envelope overhead. Local (guided_choice) and free-form
+    # outputs don't emit a JSON wrapper, so envelope_overhead is ~0 there.
+    has_answer_only = any("answer_only_tokens" in r for r in predictions)
+    total_answer_only_tokens = (
+        sum(r.get("answer_only_tokens", 0) or 0 for r in predictions)
+        if has_answer_only else None
+    )
+    total_envelope_overhead_tokens = (
+        max(0, total_answer_tokens - total_answer_only_tokens)
+        if total_answer_only_tokens is not None else None
+    )
 
     logprobs = [r["avg_logprob"] for r in predictions if r.get("avg_logprob") is not None]
     avg_logprob = round(sum(logprobs) / len(logprobs), 4) if logprobs else None
@@ -786,15 +863,21 @@ def process_model_task_condition(
         semantic_counts[row.get("semantic_error_type", "unknown")] += 1
 
     n = len(predictions)
-    # Derived compliance/error rates
+    # Derived compliance/error rates. Denominator is responses (n − api_errors),
+    # not total — a transport failure isn't a refusal/empty/format-violation by
+    # the model. api_error_rate stays as fraction of total so the provider's
+    # error rate stays visible.
+    api_error_n = counts.get("api_error", 0)
+    responded = max(1, n - api_error_n)
     format_violation_n = counts.get("format_violation", 0)
     refusal_n = counts.get("refusal", 0)
     empty_n = counts.get("empty", 0)
     partial_n = counts.get("partial", 0)
-    format_compliance_rate = round(1 - format_violation_n / n, 4) if n else None
-    refusal_rate = round(refusal_n / n, 4) if n else None
-    empty_rate = round(empty_n / n, 4) if n else None
-    partial_rate = round(partial_n / n, 4) if n else None
+    format_compliance_rate = round(1 - format_violation_n / responded, 4) if n else None
+    refusal_rate = round(refusal_n / responded, 4) if n else None
+    empty_rate = round(empty_n / responded, 4) if n else None
+    partial_rate = round(partial_n / responded, 4) if n else None
+    api_error_rate = round(api_error_n / n, 4) if n else None
 
     # Per-class breakdown (classification only — used for reporting without rerunning)
     per_class_metrics: Optional[dict] = None
@@ -837,6 +920,7 @@ def process_model_task_condition(
         "macro_f1": classification_metrics["macro_f1"],
         "weighted_f1": classification_metrics["weighted_f1"],
         "hallucination_rate": classification_metrics["hallucination_rate"],
+        "api_error_rate": api_error_rate,
         # Extraction-only fields below are None for classification tasks.
         "answer_detection_precision": extraction_metrics["answer_detection_precision"],
         "answer_detection_recall": extraction_metrics["answer_detection_recall"],
@@ -858,6 +942,8 @@ def process_model_task_condition(
         "total_output_tokens": total_output_tokens,
         "total_reasoning_tokens": total_reasoning_tokens,
         "total_answer_tokens": total_answer_tokens,
+        "total_answer_only_tokens": total_answer_only_tokens,
+        "total_envelope_overhead_tokens": total_envelope_overhead_tokens,
         "avg_logprob": avg_logprob,
         "p10_logprob": p10_logprob,
         "eval_wall_time_s": eval_wall_time_s,
@@ -960,6 +1046,12 @@ def main(model: str, task: str, condition: str, source: str, dry_run: bool, smok
 
                 all_conds = list(conditions) + [c for c in seed_conds if c not in conditions]
 
+                # Base conditions that have ANY seed1+ resamples. For those bases
+                # the unsuffixed result IS seed 0 and must be aggregated alongside
+                # seed1+ — otherwise headline mean/std/CI are computed on
+                # seeds 1+2 only (silently dropping seed 0).
+                bases_with_resamples = {c.split("_seed")[0] for c in seed_conds}
+
                 # Track summaries by base condition for aggregation
                 seed_summaries: dict[str, list[dict]] = defaultdict(list)
 
@@ -971,10 +1063,14 @@ def main(model: str, task: str, condition: str, source: str, dry_run: bool, smok
                         if result is not None:
                             processed += 1
                             all_summaries.append(result)
-                            # Collect seed summaries for aggregation
-                            base_cond = cond.split("_seed")[0] if "_seed" in cond else None
-                            if base_cond:
-                                seed_summaries[base_cond].append(result)
+                            # Seed1+ files contribute under their stripped base; the
+                            # unsuffixed file contributes under itself only when seed
+                            # resamples exist for that base (i.e. this is seed 0 of
+                            # a multi-seed run, not a single-seed condition).
+                            if "_seed" in cond:
+                                seed_summaries[cond.split("_seed")[0]].append(result)
+                            elif cond in bases_with_resamples:
+                                seed_summaries[cond].append(result)
                     except Exception as exc:
                         click.echo(f"  ERROR [{src}/{ms}/{tid}/{cond}]: {exc}", err=True)
                         import traceback; traceback.print_exc()

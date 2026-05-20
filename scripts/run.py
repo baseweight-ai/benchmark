@@ -244,7 +244,18 @@ def main(
     """Run pipeline stages as a dependency-aware DAG."""
     configure(REPO_ROOT)
 
-    cfg = RunConfig.from_yaml(Path(config_path)) if config_path else RunConfig()
+    # `configs/run_defaults.yaml` is the source of truth for documented
+    # defaults (n_eval_seeds, timeouts, etc.). When no --config is passed,
+    # load it explicitly — otherwise the Python dataclass defaults silently
+    # diverge from the YAML the user reads in the repo. An explicit --config
+    # always wins, including when a sweep or test points at a different YAML.
+    default_cfg_path = REPO_ROOT / "configs" / "run_defaults.yaml"
+    if config_path:
+        cfg = RunConfig.from_yaml(Path(config_path))
+    elif default_cfg_path.is_file():
+        cfg = RunConfig.from_yaml(default_cfg_path)
+    else:
+        cfg = RunConfig()
     for attr, val in (("smoke_test", smoke_test), ("dry_run", dry_run)):
         if val:
             setattr(cfg, attr, True)

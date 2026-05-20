@@ -67,6 +67,29 @@ else
     curl -fsSL https://claude.ai/install.sh | bash
 fi
 
+# ---------------------------------------------------------------------------
+# 2b. Persist Claude Code state across pod restarts.
+#
+# Claude Code hardcodes ~/.claude/ and ~/.claude.json — no env override.
+# On RunPod-style hosts, $HOME is ephemeral but /workspace is the persistent
+# volume, so memory, conversation transcripts, plugins, and credentials are
+# lost on every restart. Symlink both paths to the persistent volume so
+# subsequent sessions resume with full context.
+#
+# Idempotent: only acts when the persistent state exists AND the link doesn't.
+# Never overwrites a real directory in $HOME (would clobber a live session).
+# ---------------------------------------------------------------------------
+CLAUDE_STATE_DIR="/workspace/.claude-state"
+CLAUDE_STATE_JSON="/workspace/.claude-state.json"
+if [ -d "${CLAUDE_STATE_DIR}" ] && [ ! -e "${HOME}/.claude" ]; then
+    ln -s "${CLAUDE_STATE_DIR}" "${HOME}/.claude"
+    echo "==> Restored ${HOME}/.claude → ${CLAUDE_STATE_DIR}"
+fi
+if [ -f "${CLAUDE_STATE_JSON}" ] && [ ! -e "${HOME}/.claude.json" ]; then
+    ln -s "${CLAUDE_STATE_JSON}" "${HOME}/.claude.json"
+    echo "==> Restored ${HOME}/.claude.json → ${CLAUDE_STATE_JSON}"
+fi
+
 "${MINICONDA_DIR}/bin/conda" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main >/dev/null 2>&1 || true
 "${MINICONDA_DIR}/bin/conda" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r    >/dev/null 2>&1 || true
 
@@ -105,6 +128,15 @@ if [ "$env_changed" = true ]; then
     conda run --prefix "${ENV_PREFIX}" pip uninstall -y torchao 2>/dev/null || true
     echo "${env_hash}" > "${STAMP_FILE}"
 fi
+
+# ---------------------------------------------------------------------------
+# Drift baseline — snapshot `pip list` so run.sh can fail loudly if anything
+# is installed into / removed from the env after setup. The stamp above only
+# tracks environment.yml edits; this catches drift in the env itself.
+# ---------------------------------------------------------------------------
+"${ENV_PREFIX}/bin/pip" list --format=freeze 2>/dev/null \
+    | LC_ALL=C sort | md5sum | awk '{print $1}' \
+    > "${REPO_ROOT}/.env_pip_hash"
 
 # ---------------------------------------------------------------------------
 # 4. Activate-hook: export cache env vars whenever the env is activated.

@@ -30,8 +30,11 @@ pytestmark = pytest.mark.smoke
 
 REPO_ROOT = Path(__file__).parent.parent
 
+# Prod API model — gpt-5.4-nano is tagged `smoke: true` in pipeline.yaml and
+# is excluded from the prod dashboard cohort, so this integration test (which
+# writes into the prod namespace, not results/smoke/) uses the prod model.
 TASK_ID = "fpb"
-MODEL_ID = "gpt-5.4-nano"
+MODEL_ID = "gpt-5.4-mini"
 CONDITION = "zero-shot"
 N = 8  # toy dataset size
 
