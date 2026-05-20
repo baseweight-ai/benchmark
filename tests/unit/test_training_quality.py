@@ -102,6 +102,24 @@ def test_overfitting_detected_when_val_loss_rises():
     assert d["overfitting_detected"] is True
 
 
+def test_overfitting_detected_when_val_loss_rises_after_dip():
+    # U-shaped val curve: loss bottoms mid-run, then climbs >5% above that
+    # minimum while train loss keeps falling. The final value (0.044) still
+    # sits below the noisy first epoch (0.046), so a first-vs-last check misses
+    # it — only the minimum-based reference catches this. Regression guard.
+    d = _diag_with_val([1.0, 0.8, 0.6, 0.5, 0.4],
+                       val_losses=[0.046, 0.046, 0.038, 0.042, 0.044])
+    assert d["overfitting_detected"] is True
+
+
+def test_overfitting_not_detected_when_dip_recovers_within_5pct():
+    # Val loss dips then drifts up, but the final value stays within 5% of the
+    # minimum — within noise, not flagged as overfitting.
+    d = _diag_with_val([1.0, 0.8, 0.6, 0.5],
+                       val_losses=[0.050, 0.040, 0.041, 0.0415])
+    assert d["overfitting_detected"] is False
+
+
 def test_overfitting_not_detected_when_val_loss_rises_less_than_5pct():
     # val loss rises <5% — within noise, not flagged
     d = _diag_with_val([1.0, 0.8, 0.6, 0.5], val_losses=[1.0, 1.01, 1.02, 1.03])
@@ -254,3 +272,106 @@ def test_qwen3_eval_config_supports_load_best():
     assert t["eval_strategy"] != "no", "eval must run to record validation loss"
     if t.get("load_best_model_at_end"):
         assert t["eval_strategy"] == t["save_strategy"]
+
+
+# ── eval cadence + early stopping ──────────────────────────────────────────────
+
+def test_eval_save_steps_basic():
+    from train_local import eval_save_steps
+    # 600 examples / effective batch 16 → 38 steps/epoch; 3 evals/epoch → 12.
+    assert eval_save_steps(600, 16, 3) == 12
+
+
+def test_eval_save_steps_floor_is_one():
+    from train_local import eval_save_steps
+    # Tiny dataset: fewer steps than evals_per_epoch → at least 1, never 0.
+    assert eval_save_steps(12, 16, 3) == 1
+
+
+def test_eval_save_steps_scales_with_cadence():
+    from train_local import eval_save_steps
+    # Same dataset, more evals/epoch → smaller eval_steps.
+    assert eval_save_steps(1600, 16, 1) == 100
+    assert eval_save_steps(1600, 16, 4) == 25
+
+
+def test_qwen3_schedule_is_length_insensitive():
+    """Early stopping keeps a mid-run checkpoint; the LR schedule must be flat
+    after warmup so the kept checkpoint is not a half-decayed snapshot."""
+    from train_local import load_model_config
+    t = load_model_config("qwen3-8b").training
+    assert t["lr_scheduler_type"] in ("constant", "constant_with_warmup")
+
+
+def test_qwen3_early_stopping_configured():
+    """Epoch count is empirical: rigorous setup needs sub-epoch eval +
+    EarlyStoppingCallback patience, not a fixed num_train_epochs."""
+    from train_local import load_model_config
+    t = load_model_config("qwen3-8b").training
+    assert t["eval_strategy"] == "steps", "eval per-epoch is too coarse for early stopping"
+    assert t.get("evals_per_epoch", 0) >= 1
+    assert t.get("early_stopping_patience", 0) >= 1
+
+
+# ── Loss spike detection (extracted from _CheckpointCallback) ──────────────────
+
+def test_detect_loss_spike_needs_5_priors():
+    from train_local import _detect_loss_spike
+    # Fewer than 5 priors → no baseline → no spike, even if loss is huge.
+    assert _detect_loss_spike(99.0, [1.0, 1.0, 1.0, 1.0]) is None
+
+
+def test_detect_loss_spike_fires_above_3x():
+    from train_local import _detect_loss_spike
+    # mean5 = 0.1, loss = 0.4 → 4× mean → spike.
+    spike = _detect_loss_spike(0.4, [0.1, 0.1, 0.1, 0.1, 0.1])
+    assert spike is not None
+    assert spike["type"] == "spike"
+    assert spike["value"] == 0.4
+    assert spike["mean5"] == 0.1
+
+
+def test_detect_loss_spike_no_fire_at_3x():
+    from train_local import _detect_loss_spike
+    # loss == 3 × mean5 exactly → strict >, so NOT a spike.
+    assert _detect_loss_spike(0.3, [0.1, 0.1, 0.1, 0.1, 0.1]) is None
+
+
+def test_detect_loss_spike_zero_mean_skips():
+    from train_local import _detect_loss_spike
+    # Degenerate: mean5 == 0 → can't compute a meaningful ratio, no spike.
+    assert _detect_loss_spike(1.0, [0.0, 0.0, 0.0, 0.0, 0.0]) is None
+
+
+# ── Resume decision (input_hash-aware) ─────────────────────────────────────────
+
+def test_resume_decision_no_prior_state_is_fresh():
+    from train_local import _resume_decision
+    assert _resume_decision(None, "abc") == "fresh"
+    assert _resume_decision({}, "abc") == "fresh"
+
+
+def test_resume_decision_complete_matching_hash_skips():
+    from train_local import _resume_decision
+    state = {"status": "complete", "input_hash": "abc"}
+    assert _resume_decision(state, "abc") == "skip"
+
+
+def test_resume_decision_in_progress_matching_hash_resumes():
+    from train_local import _resume_decision
+    state = {"status": "in_progress", "input_hash": "abc"}
+    assert _resume_decision(state, "abc") == "resume"
+
+
+def test_resume_decision_stale_hash_forces_retrain():
+    from train_local import _resume_decision
+    state = {"status": "complete", "input_hash": "old"}
+    assert _resume_decision(state, "new") == "stale"
+
+
+def test_resume_decision_missing_hash_is_stale():
+    """Legacy train_state.json files (pre-input_hash) must force a retrain —
+    we can't prove inputs match, so conservatively assume they don't."""
+    from train_local import _resume_decision
+    state = {"status": "in_progress"}   # no input_hash recorded
+    assert _resume_decision(state, "abc") == "stale"

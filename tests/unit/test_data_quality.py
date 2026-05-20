@@ -430,3 +430,32 @@ def test_cross_split_stats_exact_overlap_counted():
     test  = [shared, "unique test text here indeed now"]
     result = cross_split_stats(train, test, None, None)
     assert result["exact_overlap"] >= 1
+
+
+# ── validate_raw_counts — fails loud when raw is truncated ─────────────────────
+
+def test_validate_raw_counts_passes_when_counts_meet_threshold():
+    from pipeline.data_quality import validate_raw_counts
+    # Dict-of-lists stands in for HuggingFace DatasetDict — len() works the same.
+    ds = {"train": [None] * 4000, "test": [None] * 1000}
+    validate_raw_counts(ds, "fpb")   # fpb threshold: train >= 3000; passes
+
+
+def test_validate_raw_counts_raises_when_below_threshold():
+    from pipeline.data_quality import validate_raw_counts
+    ds = {"train": [None] * 12, "test": [None] * 5}  # smoke-sized
+    with pytest.raises(RuntimeError, match="clobbered by a smoke download"):
+        validate_raw_counts(ds, "fpb")
+
+
+def test_validate_raw_counts_unknown_task_is_noop():
+    from pipeline.data_quality import validate_raw_counts
+    # Tasks without an EXPECTED_COUNTS entry get no validation — silently pass.
+    validate_raw_counts({"train": [None] * 1}, "no_such_task")
+
+
+def test_validate_raw_counts_missing_split_skipped():
+    """A split listed in EXPECTED_COUNTS but absent from ds is skipped, not raised."""
+    from pipeline.data_quality import validate_raw_counts
+    ds = {"train": [None] * 4000}   # fpb expects train; no test split here
+    validate_raw_counts(ds, "fpb")

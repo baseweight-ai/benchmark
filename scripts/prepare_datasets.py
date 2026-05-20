@@ -31,7 +31,8 @@ from pipeline.cache import (
     code_closure_hash, dict_hash, file_content_hash, inputs_changed, rows_sha, tree_hash,
 )
 from pipeline.config import get_tasks
-from pipeline.paths import prompt_path
+from pipeline.data_quality import validate_raw_counts
+from pipeline.paths import prepared_path, prompt_path, raw_path
 from pipeline.validation import check_contamination, reject_test_path, require_dir, validate_dataset
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -81,9 +82,11 @@ class TaskConfig(BaseModel):
     test_split: str = "test"
     train_sampling: Optional[SamplingConfig] = None
     test_sampling: Optional[SamplingConfig] = None
-    # Fraction of the sampled training pool held out as a stratified validation
-    # split (val.jsonl), used for early stopping and overfitting detection.
-    val_ratio: float = 0.1
+    # Size of the held-out validation split (val.jsonl), used for epoch
+    # selection and overfitting detection. Carved before train_sampling from
+    # the raw deduped train pool, so it never reduces the training set; sized
+    # by an absolute count, not a fraction of a deliberately-capped train pool.
+    val_size: int = 256
     val_seed: int = 42
 
 
@@ -448,8 +451,8 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
     label = " (smoke)" if smoke_test else ""
     click.echo(f"\n[{cfg.task_id}] Processing {cfg.task_name}{label}...")
 
-    raw_dir = REPO_ROOT / "data" / "raw" / cfg.task_id
-    out_dir = REPO_ROOT / "data" / "prepared" / cfg.task_id
+    raw_dir = raw_path(REPO_ROOT, cfg.task_id, smoke=smoke_test)
+    out_dir = prepared_path(REPO_ROOT, cfg.task_id, smoke=smoke_test)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if dry_run:
@@ -480,6 +483,10 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
     with _load_from_disk_lock:
         ds = load_from_disk(str(raw_dir))
     click.echo(f"  [{cfg.task_id}] Dataset loaded — splits: {list(ds.keys())}")
+    # Sanity-check raw row counts against EXPECTED_COUNTS. Smoke is exempt:
+    # its TINY_TRAIN/TINY_TEST rows are deliberately well below the thresholds.
+    if not smoke_test:
+        validate_raw_counts(ds, cfg.task_id)
 
     # ── Split into train / test ────────────────────────────────────────────
     if cfg.task_id == "fpb":
@@ -681,36 +688,40 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
         "cross_split_removed":       len(cross_drop),
     }
 
+    # ── Carve the validation split BEFORE train sampling ──────────────────
+    # val.jsonl is drawn from the deduped train pool *before* train_sampling
+    # applies its cap, so the cap is honoured in full and the held-out split
+    # never shrinks the training set. It mirrors train_sampling's strategy (so
+    # train and val share a class distribution) but is sized by an absolute
+    # val_size: the train pool is deliberately capped small for this benchmark,
+    # so the val split must not be a mere fraction of it.
+    val_rows: list[dict] = []
+    if not smoke_test and cfg.train_sampling and cfg.val_size and len(train_rows) > cfg.val_size:
+        ts = cfg.train_sampling
+        val_kwargs = ts.model_dump()
+        val_kwargs["seed"] = cfg.val_seed   # val split's own seed (independent, reproducible)
+        if ts.strategy == "balanced":
+            n_groups = len({r.get(ts.stratify_by) for r in train_rows}) or 1
+            val_kwargs["per_group_cap"] = max(1, cfg.val_size // n_groups)
+        else:
+            val_kwargs["total_cap"] = cfg.val_size
+        val_rows = sample(train_rows, **val_kwargs)
+        # Partition by object identity: sample() returns the same dict objects,
+        # so id() removes exactly the rows drawn — train and val stay disjoint.
+        val_ids = {id(r) for r in val_rows}
+        train_rows = [r for r in train_rows if id(r) not in val_ids]
+        _log_distribution(val_rows, ts.stratify_by, "Val")
+
     if not smoke_test:
         if cfg.train_sampling:
             train_rows = sample(train_rows, **cfg.train_sampling.model_dump())
             _log_distribution(train_rows, cfg.train_sampling.stratify_by, f"Train ({cfg.train_sampling.strategy})")
 
-    # ── FPB: assert no overlap between train and test ─────────────────────
+    # ── FPB: assert no train/val row overlaps the test set ────────────────
     if cfg.task_id == "fpb" and not smoke_test:
-        train_sentences = {r.get("sentence", "") for r in train_rows}
+        train_sentences = {r.get("sentence", "") for r in train_rows + val_rows}
         overlap = [r for r in test_rows if r.get("sentence", "") in train_sentences]
-        assert not overlap, f"FPB: {len(overlap)} rows overlap between train and test after sampling"
-
-    # ── Carve a stratified validation split out of the training pool ───────
-    # A versioned, stratified val.jsonl beats a positional tail-slice at train
-    # time: every class is represented and the split is reproducible. Stratified
-    # on the same field train sampling used (and balanced the same way, if any).
-    val_rows: list[dict] = []
-    if not smoke_test and cfg.train_sampling and len(train_rows) >= 20:
-        val_n = round(len(train_rows) * cfg.val_ratio)
-        if val_n >= 1:
-            val_rows = sample(
-                train_rows, strategy="stratified",
-                stratify_by=cfg.train_sampling.stratify_by,
-                total_cap=val_n, seed=cfg.val_seed,
-                balance_by=cfg.train_sampling.balance_by,
-            )
-            # Partition by object identity: sample() returns the same dict
-            # objects, so id() removes exactly the rows drawn.
-            val_ids = {id(r) for r in val_rows}
-            train_rows = [r for r in train_rows if id(r) not in val_ids]
-            _log_distribution(val_rows, cfg.train_sampling.stratify_by, "Val (stratified)")
+        assert not overlap, f"FPB: {len(overlap)} rows overlap between train/val and test after sampling"
 
     # ── Smoke capping ─────────────────────────────────────────────────────
     src_train = train_rows[:SMOKE_TRAIN_N] if smoke_test else train_rows

@@ -19,6 +19,7 @@ import yaml
 from pydantic import BaseModel
 
 from checkpoint_utils import atomic_write_json
+from pipeline.paths import smoke_seg, training_meta_path
 
 litellm.suppress_debug_info = True
 
@@ -188,8 +189,9 @@ def compute_tco_12mo(
         return (training_cost or 0.0) + inference_cost
 
 
-def load_summary(source: str, model_short: str, task_id: str, condition: str) -> Optional[dict]:
-    summaries_root = REPO_ROOT / "results" / "summaries" / source / model_short / task_id
+def load_summary(source: str, model_short: str, task_id: str, condition: str,
+                 smoke: bool = False) -> Optional[dict]:
+    summaries_root = REPO_ROOT / "results" / smoke_seg(smoke) / "summaries" / source / model_short / task_id
     # Prefer aggregated multi-seed summary when it exists.
     agg_path = summaries_root / f"{condition}_agg.json"
     if agg_path.exists():
@@ -202,13 +204,13 @@ def load_summary(source: str, model_short: str, task_id: str, condition: str) ->
     return None
 
 
-def discover_summaries() -> list[tuple[str, str, str, str]]:
+def discover_summaries(smoke: bool = False) -> list[tuple[str, str, str, str]]:
     """Return (source, model, task, condition) for base condition files only.
 
     Skips seed-specific (*_seedN.json) and aggregated (*_agg.json) files —
     load_summary() will transparently return the agg variant when it exists.
     """
-    summaries_root = REPO_ROOT / "results" / "summaries"
+    summaries_root = REPO_ROOT / "results" / smoke_seg(smoke) / "summaries"
     found = []
     if not summaries_root.exists():
         return found
@@ -229,8 +231,9 @@ def discover_summaries() -> list[tuple[str, str, str, str]]:
     return found
 
 
-def load_training_meta(source: str, model_short: str, task_id: str, condition: str) -> Optional[dict]:
-    path = REPO_ROOT / "results" / "training" / source / model_short / task_id / condition / "metadata.json"
+def load_training_meta(source: str, model_short: str, task_id: str, condition: str,
+                       smoke: bool = False) -> Optional[dict]:
+    path = training_meta_path(REPO_ROOT, source, model_short, task_id, condition, smoke=smoke)
     if not path.exists():
         return None
     with open(path) as f:
@@ -747,10 +750,10 @@ def _print_run_report(data: dict) -> None:
     click.echo(sep)
 
 
-def _write_snapshot(data: dict, repo_root: Path, run_id: str) -> Path:
+def _write_snapshot(data: dict, repo_root: Path, run_id: str, smoke: bool = False) -> Path:
     """Write an immutable snapshot of results.json for this run."""
     from pipeline.paths import snapshot_path
-    snap = snapshot_path(repo_root, run_id)
+    snap = snapshot_path(repo_root, run_id, smoke=smoke)
     snap.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(data, snap)
     return snap
@@ -825,6 +828,9 @@ def _load_task_baselines() -> dict[str, dict]:
     baselines: dict[str, dict] = {}
     for task_id in ALL_TASKS:
         qr_path = REPO_ROOT / "data" / "prepared" / task_id / "quality_report.json"
+        # NB: build_dashboard_data's caller (main) sets smoke when needed; the
+        # qr_path here is shared with non-smoke (test_full.jsonl quality report
+        # is task-level metadata, not a run output) so it stays in data/prepared/.
         try:
             with open(qr_path) as f:
                 qr = json.load(f)
@@ -858,10 +864,13 @@ def _load_task_baselines() -> dict[str, dict]:
 
 
 def merge_results(fresh: list[dict], existing_path: Path) -> list[dict]:
-    """Merge fresh results with existing ones.
+    """Merge fresh results into existing ones, keyed by (model_id, task_id, condition).
 
-    For each (model_id, task_id, condition), the fresh value wins if it has
-    metric_value; otherwise the existing non-null value is preserved.
+    Per key:
+      - fresh value wins if non-null (overwrites that section);
+      - else existing non-null value is preserved.
+    Plus: keys present in existing but absent from fresh are kept verbatim, so a
+    pipeline that only recomputes some (m,t,c) sections does not delete the rest.
     """
     try:
         with open(existing_path) as f:
@@ -873,6 +882,8 @@ def merge_results(fresh: list[dict], existing_path: Path) -> list[dict]:
         (r["model_id"], r["task_id"], r["condition"]): r
         for r in existing.get("results", [])
     }
+    fresh_keys = {(r["model_id"], r["task_id"], r["condition"]) for r in fresh}
+
     merged = []
     for r in fresh:
         key = (r["model_id"], r["task_id"], r["condition"])
@@ -881,6 +892,14 @@ def merge_results(fresh: list[dict], existing_path: Path) -> list[dict]:
             merged.append(prior)
         else:
             merged.append(r)
+
+    # Sections this run did not recompute stay verbatim — partial-task pipelines
+    # (a single-model retrain, an eval-api-only refresh) must not silently
+    # delete the rest of the benchmark.
+    for key, prior in existing_map.items():
+        if key not in fresh_keys:
+            merged.append(prior)
+
     return merged
 
 
@@ -919,6 +938,7 @@ def _summarise_hardware(results: list[dict]) -> dict:
 def build_dashboard_data(
     daily_volume: int = 10000,
     gpu_hourly_rate_override: Optional[float] = None,
+    smoke: bool = False,
 ) -> dict:
     """Assemble full BenchmarkData JSON.
 
@@ -926,6 +946,10 @@ def build_dashboard_data(
     for this render. Lets you re-generate results.json with an ICP-realistic
     rate (e.g. AWS A10G on-demand) without re-running eval — the cost formulas
     are linear in the rate, so a fresh dashboard render is enough.
+
+    smoke: when True, read summaries from results/smoke/summaries/ so a smoke
+    pipeline dashboard renders against its own (throwaway) data rather than
+    the published benchmark.
     """
     # Reset per-render so monkeypatch'd REPO_ROOT in tests doesn't see
     # cached values from a previous invocation with a different repo root.
@@ -939,11 +963,11 @@ def build_dashboard_data(
         )
 
     results = []
-    for source, model_id, task_id, condition in discover_summaries():
-        summary = load_summary(source, model_id, task_id, condition)
+    for source, model_id, task_id, condition in discover_summaries(smoke=smoke):
+        summary = load_summary(source, model_id, task_id, condition, smoke=smoke)
         training_meta = None
         if condition == "lora":
-            training_meta = load_training_meta(source, model_id, task_id, condition)
+            training_meta = load_training_meta(source, model_id, task_id, condition, smoke=smoke)
         result = build_result(model_id, task_id, condition, summary, training_meta, pricing, daily_volume)
         results.append(result)
 
@@ -973,24 +997,28 @@ def build_dashboard_data(
 @click.option("--out", default=None, help="Output path (default: data/benchmark/results.json in site)")
 @click.option("--run-id", "run_id", default=None, help="Run ID for immutable snapshot (from pipeline manifest)")
 @click.option("--also-benchmark-repo", is_flag=True, help="Also write to dashboard-data/results.json in benchmark repo")
-@click.option("--merge", is_flag=True, help="Preserve existing results where new run has no data (matched by model+task+condition)")
+@click.option("--replace", is_flag=True,
+              help="Replace results.json entirely. Default is to merge new results into existing per (model, task, condition).")
 @click.option("--export-tables", is_flag=True, help="Also write CSV and Markdown tables to results/tables/")
 @click.option("--gpu-hourly-rate", "gpu_hourly_rate", default=None, type=float,
               help="Override self_hosted.gpu_hourly_rate for this render only — useful for re-rendering under an alternative ICP-realistic rate (e.g. AWS spot). Pricing.yaml is unchanged.")
 @click.option("--dry-run", is_flag=True)
+@click.option("--smoke-test", is_flag=True,
+              help="Render dashboard for a smoke pipeline; routes outputs (including dashboard-data/results.json) under a smoke namespace.")
 def main(
     daily_volume: int,
     out: Optional[str],
     run_id: Optional[str],
     also_benchmark_repo: bool,
-    merge: bool,
+    replace: bool,
     export_tables: bool,
     gpu_hourly_rate: Optional[float],
     dry_run: bool,
+    smoke_test: bool,
 ) -> None:
     """Generate dashboard results.json from summaries."""
     from datetime import datetime, timezone
-    data = build_dashboard_data(daily_volume, gpu_hourly_rate_override=gpu_hourly_rate)
+    data = build_dashboard_data(daily_volume, gpu_hourly_rate_override=gpu_hourly_rate, smoke=smoke_test)
 
     # Surface hardware-consistency warning prominently — easy to miss in JSON.
     hw_warning = data.get("hardware", {}).get("hardware_warning")
@@ -1010,6 +1038,9 @@ def main(
     default_out = site_root / "data" / "benchmark" / "results.json"
     out_path = Path(out) if out else default_out
 
+    # Merge is the default — existing per-(m,t,c) sections are preserved unless
+    # this run produces new data for them; --replace forces a clean rebuild.
+    merge = not replace
     if merge:
         fresh = data["results"]
         merged = merge_results(fresh, out_path)
@@ -1046,12 +1077,14 @@ def main(
         click.echo(f"  Also written to {default_out}")
 
     if also_benchmark_repo:
-        repo_out = REPO_ROOT / "dashboard-data" / "results.json"
+        # Smoke routes to dashboard-data/smoke/ so a smoke render cannot
+        # overwrite the published (committed) benchmark dashboard.
+        repo_out = REPO_ROOT / "dashboard-data" / smoke_seg(smoke_test) / "results.json"
         atomic_write_json(data, repo_out)
         click.echo(f"  Also written to {repo_out}")
 
     if run_id:
-        snap = _write_snapshot(data, REPO_ROOT, run_id)
+        snap = _write_snapshot(data, REPO_ROOT, run_id, smoke=smoke_test)
         click.echo(f"  Snapshot written to {snap}")
 
     if export_tables:

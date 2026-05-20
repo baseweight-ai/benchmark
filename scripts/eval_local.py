@@ -27,7 +27,7 @@ from pipeline.config import get_local_models, get_tasks
 from pipeline.hardware import check_allowed_gpu, get_current_gpu_name
 from pipeline.log import configure, get_logger
 from pipeline.cache import code_closure_hash, dict_hash, record_fingerprint, reuse_is_valid, tree_hash
-from pipeline.paths import adapter_path, pred_path
+from pipeline.paths import adapter_path, pred_path, prepared_path, training_meta_path
 from pipeline.providers import call_vllm  # noqa: F401  # re-exported for test patching
 from pipeline.validation import reject_test_path, require_jsonl
 
@@ -83,7 +83,7 @@ def load_model_config(model_id: str) -> ModelConfig:
 
 
 def get_test_path(task_id: str, smoke_test: bool) -> Path:
-    prepared = REPO_ROOT / "data" / "prepared" / task_id
+    prepared = prepared_path(REPO_ROOT, task_id, smoke=smoke_test)
     return prepared / ("smoke_test.jsonl" if smoke_test else "test.jsonl")
 
 
@@ -103,7 +103,7 @@ def load_test_rows(task_id: str, smoke_test: bool, eval_seed: int = 0) -> list[d
 
     When eval_seed > 0 and test_full.jsonl exists, resamples the full set.
     """
-    prepared = REPO_ROOT / "data" / "prepared" / task_id
+    prepared = prepared_path(REPO_ROOT, task_id, smoke=smoke_test)
     suffix = "smoke_" if smoke_test else ""
     base_path = prepared / f"{suffix}test.jsonl"
     full_path = prepared / "test_full.jsonl"
@@ -132,8 +132,8 @@ def load_test_rows(task_id: str, smoke_test: bool, eval_seed: int = 0) -> list[d
     return prompts
 
 
-def _pred_path(model_short: str, task_id: str, condition: str) -> Path:
-    return pred_path(REPO_ROOT, "local", model_short, task_id, condition)
+def _pred_path(model_short: str, task_id: str, condition: str, smoke: bool = False) -> Path:
+    return pred_path(REPO_ROOT, "local", model_short, task_id, condition, smoke=smoke)
 
 
 def get_few_shot(task_id: str, model_short: str, smoke_test: bool) -> list[dict]:
@@ -145,7 +145,7 @@ def get_few_shot(task_id: str, model_short: str, smoke_test: bool) -> list[dict]
     versioned via prompt_sha + train_sha, so few_shot_hash changes track upstream
     data changes correctly.
     """
-    prepared = REPO_ROOT / "data" / "prepared" / task_id
+    prepared = prepared_path(REPO_ROOT, task_id, smoke=smoke_test)
     if not smoke_test:
         curated = prepared / "few_shot.jsonl"
         if curated.exists():
@@ -155,7 +155,7 @@ def get_few_shot(task_id: str, model_short: str, smoke_test: bool) -> list[dict]
         train_path = prepared / "smoke_train.jsonl"
     else:
         train_path = prepared / "train.jsonl"
-        meta_path = REPO_ROOT / "results" / "training" / "local" / model_short / task_id / "lora" / "metadata.json"
+        meta_path = training_meta_path(REPO_ROOT, "local", model_short, task_id, "lora", smoke=smoke_test)
         if meta_path.exists():
             with open(meta_path) as f:
                 meta = json.load(f)
@@ -331,7 +331,7 @@ async def run_eval(
 
     test_path = get_test_path(task_id, smoke_test)
     few_shot = get_few_shot(task_id, model_cfg.model_short, smoke_test)
-    prompt_sha = _read_prompt_sha(REPO_ROOT / "data" / "prepared" / task_id)
+    prompt_sha = _read_prompt_sha(prepared_path(REPO_ROOT, task_id, smoke=smoke_test))
     few_shot_hash = _rows_hash(few_shot) if few_shot else None
 
     if not test_path.exists():
@@ -344,10 +344,7 @@ async def run_eval(
     cond_key = condition if eval_seed == 0 else f"{condition}_seed{eval_seed}"
     if concurrency != MAX_CONCURRENCY:
         cond_key = f"{cond_key}_bs{concurrency}"
-    out_path = (
-        REPO_ROOT / "results" / "predictions" / "local"
-        / model_cfg.model_short / task_id / f"{cond_key}.jsonl"
-    )
+    out_path = pred_path(REPO_ROOT, "local", model_cfg.model_short, task_id, cond_key, smoke=smoke_test)
 
     if dry_run:
         click.echo(f"  [dry-run] Would eval {model_cfg.model_short} on {task_id}/{condition} ({len(test_rows)} examples)")
@@ -366,7 +363,7 @@ async def run_eval(
         "eval_seed": eval_seed,
         "concurrency": concurrency,
         "model": model_cfg.model_id,
-        "adapter": (tree_hash(adapter_path(REPO_ROOT, model_cfg.model_short, task_id, "lora"))
+        "adapter": (tree_hash(adapter_path(REPO_ROOT, model_cfg.model_short, task_id, "lora", smoke=smoke_test))
                     if condition == "lora" else None),
         "max_output_tokens": task_cfg.max_output_tokens,
         "task_type": task_cfg.task_type,
@@ -575,7 +572,7 @@ def main(model: Optional[str], task: str, condition: str, eval_seed: int,
         lora_modules: dict[str, Path] = {}
         if "lora" in conditions:
             for tid in task_cfgs:
-                ap = adapter_path(REPO_ROOT, model_cfg.model_short, tid, "lora")
+                ap = adapter_path(REPO_ROOT, model_cfg.model_short, tid, "lora", smoke=smoke_test)
                 if ap.exists():
                     lora_modules[f"adapter_{tid}"] = ap
                 else:
@@ -597,7 +594,7 @@ def main(model: Optional[str], task: str, condition: str, eval_seed: int,
                     continue  # already reported above
                 model_name = f"adapter_{tid}" if cond == "lora" else model_cfg.model_id
                 for conc in concurrencies:
-                    if not dry_run and _pred_path(model_cfg.model_short, tid, _cond_key_for(cond, conc)).exists():
+                    if not dry_run and _pred_path(model_cfg.model_short, tid, _cond_key_for(cond, conc), smoke=smoke_test).exists():
                         click.echo(f"  SKIP [{mid}/{tid}/{_cond_key_for(cond, conc)}]: already complete")
                         continue
                     pending.append((tid, cond, task_cfg, model_name, conc))

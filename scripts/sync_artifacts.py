@@ -148,12 +148,15 @@ def sync_predictions(api, dry_run: bool) -> int:
 
 def sync_checkpoints(api, dry_run: bool) -> int:
     # Full HF Trainer checkpoints live in the repo and persist with it;
-    # only train_state.json is uploaded as an offsite backup.
+    # only train_state.json is uploaded as an offsite backup. Smoke-namespaced
+    # checkpoints (under checkpoints/smoke/) are skipped — smoke runs are
+    # throwaway and must never pollute the offsite backup.
     root = CHECKPOINTS_ROOT
     if not root.exists():
         click.echo("  No checkpoint state found — skipping")
         return 0
-    return _sync_files(api, root, list(root.rglob("train_state.json")), "checkpoints", PREDICTIONS_REPO, "dataset", "Checkpoint state", dry_run)
+    files = [f for f in root.rglob("train_state.json") if "smoke" not in f.parts]
+    return _sync_files(api, root, files, "checkpoints", PREDICTIONS_REPO, "dataset", "Checkpoint state", dry_run)
 
 
 def sync_summaries(api, dry_run: bool) -> int:

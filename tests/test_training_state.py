@@ -151,12 +151,17 @@ def train_env(tmp_path, monkeypatch, tmp_checkpoints_root):
 
 # ── Tests ──────────────────────────────────────────────────────────────────────
 
-def test_train_one_skips_complete_condition(train_env, tmp_checkpoints_root):
-    """If train_state.json says 'complete', train_one returns without training."""
+def test_train_one_skips_complete_condition(train_env, tmp_checkpoints_root, monkeypatch):
+    """If train_state.json says 'complete' AND its input_hash matches the
+    current run, train_one returns without training. Missing or mismatched
+    input_hash is handled by test_train_one_retrain_discards_stale_checkpoints."""
     import train_local as train
 
     e = train_env
-    save_train_state("test-model", "toy", "lora", {"status": "complete", "eval_loss": 0.2})
+    # Pin the input_hash so the prior train_state can record a matching value.
+    monkeypatch.setattr(train, "training_inputs_hash", lambda *a, **kw: "test-hash")
+    save_train_state("test-model", "toy", "lora",
+                     {"status": "complete", "eval_loss": 0.2, "input_hash": "test-hash"})
 
     # Write dummy metadata so the early-return has something to load
     meta_path = e["tmp_path"] / "results" / "training" / "local" / "test-model" / "toy" / "lora" / "metadata.json"

@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from checkpoint_utils import atomic_write_json
 from utils import is_chunked, load_jsonl, load_label_set, question_id, write_jsonl as _write_jsonl
 from pipeline.config import get_tasks
-from pipeline.paths import classified_path, pred_path, summary_path
+from pipeline.paths import classified_path, pred_path, smoke_seg, summary_path
 
 REPO_ROOT = Path(__file__).parent.parent
 ALL_TASKS: list[str] = get_tasks()
@@ -674,12 +674,13 @@ def process_model_task_condition(
     valid_labels: Optional[list[str]],
     dry_run: bool,
     source: str = "local",
+    smoke: bool = False,
 ) -> Optional[dict]:
     """Classify one predictions file and write summary.
 
     condition is the filename stem, which may include a _seedN suffix.
     """
-    input_path = pred_path(REPO_ROOT, source, model_short, task_id, condition)
+    input_path = pred_path(REPO_ROOT, source, model_short, task_id, condition, smoke=smoke)
     # Logical condition name strips any _seedN suffix for storage in summary.
     base_condition = condition.split("_seed")[0] if "_seed" in condition else condition
     label = f"{source}/{model_short}/{task_id}/{condition}"
@@ -705,7 +706,7 @@ def process_model_task_condition(
 
     classified, counts = classify_predictions(predictions, task_cfg, valid_labels)
 
-    classified_out = classified_path(REPO_ROOT, source, model_short, task_id, condition)
+    classified_out = classified_path(REPO_ROOT, source, model_short, task_id, condition, smoke=smoke)
     _write_jsonl(classified, classified_out)
 
     # Enforce consistency between metric_id and the declared metric_granularity.
@@ -868,7 +869,7 @@ def process_model_task_condition(
     summary["axis_scores"] = compute_axis_scores(summary, task_cfg.eval_axes, _get_axis_definitions())
 
     # condition_key is the filename stem (may include _seedN suffix)
-    summary_out = summary_path(REPO_ROOT, source, model_short, task_id, condition)
+    summary_out = summary_path(REPO_ROOT, source, model_short, task_id, condition, smoke=smoke)
     atomic_write_json(summary, summary_out)
     metric_str = f"{metric_value:.4f}" if metric_value is not None else "N/A"
     click.echo(f"  [{label}] {task_cfg.metric_id}={metric_str} counts={counts}")
@@ -912,9 +913,11 @@ def _print_classify_summary(summaries: list[dict]) -> None:
 @click.option("--condition", default="all", help="Condition or 'all'")
 @click.option("--source", default="all", help="Prediction source: local|api|all")
 @click.option("--dry-run", is_flag=True)
-def main(model: str, task: str, condition: str, source: str, dry_run: bool) -> None:
+@click.option("--smoke-test", is_flag=True,
+              help="Classify smoke-namespaced predictions; outputs stay under results/smoke/.")
+def main(model: str, task: str, condition: str, source: str, dry_run: bool, smoke_test: bool) -> None:
     """Classify prediction errors and compute primary metrics."""
-    pred_root = REPO_ROOT / "results" / "predictions"
+    pred_root = REPO_ROOT / "results" / smoke_seg(smoke_test) / "predictions"
     sources = ["local", "api", "lm_eval"] if source == "all" else [source]
 
     task_ids = ALL_TASKS if task == "all" else [task]
@@ -963,7 +966,7 @@ def main(model: str, task: str, condition: str, source: str, dry_run: bool) -> N
                 for cond in all_conds:
                     try:
                         result = process_model_task_condition(
-                            ms, tid, cond, task_cfg, valid_labels, dry_run, source=src
+                            ms, tid, cond, task_cfg, valid_labels, dry_run, source=src, smoke=smoke_test
                         )
                         if result is not None:
                             processed += 1
@@ -986,7 +989,7 @@ def main(model: str, task: str, condition: str, source: str, dry_run: bool) -> N
                     try:
                         agg = aggregate_seed_summaries(seed_summs)
                         agg["condition"] = base_cond
-                        agg_out = summary_path(REPO_ROOT, src, ms, tid, f"{base_cond}_agg")
+                        agg_out = summary_path(REPO_ROOT, src, ms, tid, f"{base_cond}_agg", smoke=smoke_test)
                         atomic_write_json(agg, agg_out)
                         click.echo(
                             f"  [{src}/{ms}/{tid}/{base_cond}] aggregated {len(seed_summs)} seeds → "

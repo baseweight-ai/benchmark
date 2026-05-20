@@ -12,6 +12,45 @@ import click
 from scipy.special import rel_entr
 from scipy.stats import ks_2samp
 
+
+# ── Raw-dataset row count thresholds ───────────────────────────────────────────
+
+# Minimum row counts for each task's raw splits, used by prepare_datasets to
+# fail loudly when a real (non-smoke) prepare reads from a truncated raw
+# artifact — e.g. a stale smoke download. Numbers are lower bounds set well
+# below actual published dataset sizes.
+EXPECTED_COUNTS: dict[str, dict[str, int]] = {
+    "banking77": {"train": 8000,  "test": 2000},
+    "cuad":      {"train": 10000, "test": 1000},
+    "ledgar":    {"train": 50000, "test": 5000},
+    "fpb":       {"train": 3000},
+    "medmcqa":   {"train": 100000, "test": 4000},
+}
+
+
+def validate_raw_counts(ds, task_id: str) -> None:
+    """Raise loudly if any raw split is below its EXPECTED_COUNTS minimum.
+
+    Use in prepare on a non-smoke run: if the raw artifact was overwritten by
+    a smoke download (the silent-corruption bug), the row counts will be far
+    below the published sizes. A no-op for tasks without a recorded expectation,
+    and for splits not present in the dataset."""
+    expected = EXPECTED_COUNTS.get(task_id)
+    if not expected:
+        return
+    for split, n_min in expected.items():
+        if split not in ds:
+            continue
+        actual = len(ds[split])
+        if actual < n_min:
+            raise RuntimeError(
+                f"[{task_id}] Raw split '{split}' has only {actual} rows, "
+                f"expected >= {n_min}. The raw dataset at data/raw/{task_id}/ "
+                f"may have been clobbered by a smoke download. Re-run "
+                f"`python scripts/download_data.py --task {task_id}` to restore it."
+            )
+
+
 # ── Length statistics ──────────────────────────────────────────────────────────
 
 def _percentile(s: list[float], p: float) -> float:

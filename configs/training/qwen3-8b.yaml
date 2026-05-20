@@ -18,7 +18,9 @@ lora:
   use_rslora: true
 training:
   learning_rate: 2.0e-4
-  lr_scheduler_type: "cosine"
+  # Flat LR after warmup (no cosine decay): early stopping keeps a mid-run
+  # checkpoint, which must not be a half-decayed snapshot.
+  lr_scheduler_type: "constant_with_warmup"
   warmup_ratio: 0.05
   weight_decay: 0.01
   optim: "adamw_8bit"
@@ -27,9 +29,14 @@ training:
   max_grad_norm: 1.0
   bf16: true
   seed: 42
-  save_strategy: "epoch"
-  eval_strategy: "epoch"           # evaluate the held-out val split each epoch
-  load_best_model_at_end: true     # keep the lowest-eval-loss epoch, not the last
+  # Epoch count is empirical: train up to the get_epochs() cap, but evaluate the
+  # held-out val split several times per epoch and let EarlyStoppingCallback
+  # stop once val loss stops improving — so the cap rarely binds.
+  eval_strategy: "steps"
+  save_strategy: "steps"           # must match eval_strategy for load_best
+  evals_per_epoch: 3               # eval_steps = steps_per_epoch / this
+  early_stopping_patience: 3       # evals with no improvement before stopping
+  load_best_model_at_end: true     # keep the lowest-eval-loss checkpoint
   metric_for_best_model: "eval_loss"
   logging_steps: 10
   report_to: "none"

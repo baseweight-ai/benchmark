@@ -23,7 +23,11 @@ _ALL_STAGE_IDS = [
     "download", "prepare",
     "train-local",
     "eval-local", "eval-api",
-    "classify", "dashboard", "catalog",
+    # "classify" is the user-facing alias; it expands to classify-local +
+    # classify-api in _build_stages so each source can be scoped to its own
+    # model (local_model vs api_model differ).
+    "classify", "classify-local", "classify-api",
+    "dashboard", "catalog",
 ]
 
 _STATUS_ICON = {
@@ -97,18 +101,30 @@ def _build_stages(cfg: RunConfig, selected_ids: list[str], run_id: str | None = 
             description=f"Evaluate base API models zero-shot and 5-shot ({api_model}).",
         ),
         Stage(
-            id="classify",
-            cmd=[py, str(SCRIPTS / "classify_errors.py"), *task, *dry],
-            depends_on=["eval-local", "eval-api"],
+            id="classify-local",
+            # Per-source split so each classify run is scoped to its source's
+            # model (local_model and api_model differ — one --model can't
+            # filter both correctly).
+            cmd=[py, str(SCRIPTS / "classify_errors.py"), *task,
+                 "--source", "local", "--model", local_model, *smoke, *dry],
+            depends_on=["eval-local"],
             compute="cpu",
             timeout_s=t.classify_s,
-            requires_all_deps=True,
-            description="Classify prediction errors and generate per-task summaries.",
+            description="Classify local prediction errors (scoped to the local model).",
+        ),
+        Stage(
+            id="classify-api",
+            cmd=[py, str(SCRIPTS / "classify_errors.py"), *task,
+                 "--source", "api", "--model", api_model, *smoke, *dry],
+            depends_on=["eval-api"],
+            compute="cpu",
+            timeout_s=t.classify_s,
+            description="Classify API prediction errors (scoped to the API model).",
         ),
         Stage(
             id="dashboard",
-            cmd=[py, str(SCRIPTS / "generate_dashboard_data.py"), *run_id_flag, *dry],
-            depends_on=["classify"],
+            cmd=[py, str(SCRIPTS / "generate_dashboard_data.py"), *run_id_flag, *smoke, *dry],
+            depends_on=["classify-local", "classify-api"],
             compute="cpu",
             timeout_s=t.dashboard_s,
             description="Aggregate results into dashboard JSON for the web UI.",
@@ -123,10 +139,16 @@ def _build_stages(cfg: RunConfig, selected_ids: list[str], run_id: str | None = 
         ),
     ]
 
-    # Inject per-seed eval stages for seeds 1..n_eval_seeds-1
+    # "classify" is a user-facing alias for both per-source classify stages.
     working_ids = list(selected_ids)
+    if "classify" in working_ids:
+        idx = working_ids.index("classify")
+        working_ids = working_ids[:idx] + ["classify-local", "classify-api"] + working_ids[idx + 1:]
+
+    # Inject per-seed eval stages for seeds 1..n_eval_seeds-1
     if cfg.n_eval_seeds > 1:
-        classify_stage = next((s for s in all_stages if s.id == "classify"), None)
+        classify_local = next((s for s in all_stages if s.id == "classify-local"), None)
+        classify_api = next((s for s in all_stages if s.id == "classify-api"), None)
         for n in range(1, cfg.n_eval_seeds):
             if "eval-local" in working_ids:
                 sid = f"eval-local-seed{n}"
@@ -139,8 +161,8 @@ def _build_stages(cfg: RunConfig, selected_ids: list[str], run_id: str | None = 
                     timeout_s=t.eval_local_s,
                 ))
                 working_ids.append(sid)
-                if classify_stage:
-                    classify_stage.depends_on.append(sid)
+                if classify_local:
+                    classify_local.depends_on.append(sid)
             if "eval-api" in working_ids:
                 sid = f"eval-api-seed{n}"
                 all_stages.append(Stage(
@@ -152,8 +174,8 @@ def _build_stages(cfg: RunConfig, selected_ids: list[str], run_id: str | None = 
                     timeout_s=t.eval_api_s,
                 ))
                 working_ids.append(sid)
-                if classify_stage:
-                    classify_stage.depends_on.append(sid)
+                if classify_api:
+                    classify_api.depends_on.append(sid)
 
     selected = [s for s in all_stages if s.id in working_ids]
     selected_set = {s.id for s in selected}

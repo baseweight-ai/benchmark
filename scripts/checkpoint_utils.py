@@ -84,15 +84,16 @@ def load_partial_ids(pp: Path) -> set[str]:
 
 # ── Training checkpoint helpers ───────────────────────────────────────────────
 
-def checkpoint_dir(model_short: str, task_id: str, condition: str) -> Path:
-    return CHECKPOINTS_ROOT / model_short / task_id / condition
+def checkpoint_dir(model_short: str, task_id: str, condition: str, smoke: bool = False) -> Path:
+    base = (CHECKPOINTS_ROOT / "smoke") if smoke else CHECKPOINTS_ROOT
+    return base / model_short / task_id / condition
 
 
 def find_hf_resume_checkpoint(
-    model_short: str, task_id: str, condition: str
+    model_short: str, task_id: str, condition: str, smoke: bool = False
 ) -> Optional[Path]:
     """Return the latest HF Trainer checkpoint directory, or None."""
-    ckpt_dir = checkpoint_dir(model_short, task_id, condition)
+    ckpt_dir = checkpoint_dir(model_short, task_id, condition, smoke=smoke)
     if not ckpt_dir.exists():
         return None
     candidates = sorted(
@@ -103,17 +104,17 @@ def find_hf_resume_checkpoint(
 
 
 def save_train_state(
-    model_short: str, task_id: str, condition: str, state: dict
+    model_short: str, task_id: str, condition: str, state: dict, smoke: bool = False
 ) -> None:
     """Atomically write training state to the network volume."""
-    path = checkpoint_dir(model_short, task_id, condition) / "train_state.json"
+    path = checkpoint_dir(model_short, task_id, condition, smoke=smoke) / "train_state.json"
     atomic_write_json({**state, "saved_at": time.time()}, path)
 
 
 def load_train_state(
-    model_short: str, task_id: str, condition: str
+    model_short: str, task_id: str, condition: str, smoke: bool = False
 ) -> Optional[dict]:
-    path = checkpoint_dir(model_short, task_id, condition) / "train_state.json"
+    path = checkpoint_dir(model_short, task_id, condition, smoke=smoke) / "train_state.json"
     if not path.exists():
         return None
     with open(path) as f:

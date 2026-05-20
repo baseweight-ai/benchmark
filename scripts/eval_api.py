@@ -21,7 +21,7 @@ from utils import build_messages, load_jsonl, load_label_set as _load_label_set,
 from pipeline.config import get_model_conditions, get_openai_models, get_reasoning_capable, get_tasks
 from pipeline.log import configure, get_logger
 from pipeline.cache import code_closure_hash, dict_hash, record_fingerprint, reuse_is_valid
-from pipeline.paths import pred_path
+from pipeline.paths import pred_path, prepared_path
 from pipeline.providers import call_openai  # noqa: F401  # re-exported for test patching
 
 _log = get_logger("eval-api")
@@ -113,6 +113,50 @@ def parse_constrained_label(text: str) -> str:
     return text
 
 
+def _eval_fingerprint(
+    *,
+    test_rows_hash: str,
+    prompt_sha: str,
+    few_shot_hash: Optional[str],
+    label_set: Optional[list[str]],
+    condition: str,
+    eval_seed: int,
+    model_str: str,
+    reasoning_capable: bool,
+    max_output_tokens: int,
+    task_type: str,
+    answer_mode: str,
+) -> str:
+    """Cache key for an API eval. Grouped so each section is auditable:
+        code             — the eval/script closure (catches sampling-param
+                           changes like temperature=0 → 0.7 in providers.py,
+                           which don't appear as args here).
+        data             — test rows, prompt, few-shot exemplars, label set.
+        model_properties — the model and the request shape it sees.
+        run              — condition + eval seed (which prompt variant / sample).
+    A change in any field re-evals; nothing else does."""
+    return dict_hash({
+        "code": code_closure_hash(Path(__file__)),
+        "data": {
+            "test_rows": test_rows_hash,
+            "prompt_sha": prompt_sha,
+            "few_shot_hash": few_shot_hash,
+            "label_set": label_set,
+        },
+        "model_properties": {
+            "model": model_str,
+            "reasoning_capable": reasoning_capable,
+            "max_output_tokens": max_output_tokens,
+            "task_type": task_type,
+            "answer_mode": answer_mode,
+        },
+        "run": {
+            "condition": condition,
+            "eval_seed": eval_seed,
+        },
+    })
+
+
 async def run_eval(
     model_id: str,
     task_id: str,
@@ -123,7 +167,7 @@ async def run_eval(
     eval_seed: int = 0,
 ) -> None:
     """Evaluate one model/task/condition combination."""
-    prepared = REPO_ROOT / "data" / "prepared" / task_id
+    prepared = prepared_path(REPO_ROOT, task_id, smoke=smoke_test)
     suffix = "smoke_" if smoke_test else ""
     base_test_path = prepared / f"{suffix}test.jsonl"
     full_test_path = prepared / "test_full.jsonl"
@@ -178,25 +222,24 @@ async def run_eval(
         return
 
     cond_key = condition if eval_seed == 0 else f"{condition}_seed{eval_seed}"
-    out_path = pred_path(REPO_ROOT, "api", model_id, task_id, cond_key)
+    out_path = pred_path(REPO_ROOT, "api", model_id, task_id, cond_key, smoke=smoke_test)
 
     # Skip-if-unchanged: reuse the prediction file only when its fingerprint
-    # still matches. A stale file — changed test data, prompt, eval code,
-    # model, or generation config — is discarded and regenerated.
-    fingerprint = dict_hash({
-        "code": code_closure_hash(Path(__file__)),
-        "test_rows": _rows_hash(test_rows),
-        "prompt_sha": prompt_sha,
-        "few_shot_hash": few_shot_hash,
-        "label_set": load_label_set(task_id),
-        "condition": condition,
-        "eval_seed": eval_seed,
-        "model": model_str,
-        "max_output_tokens": task_cfg.max_output_tokens,
-        "task_type": task_cfg.task_type,
-        "answer_mode": task_cfg.answer_mode,
-        "reasoning_capable": REASONING_CAPABLE.get(model_id, False),
-    })
+    # still matches. The hash groups data, model_properties, run, and code —
+    # see _eval_fingerprint above.
+    fingerprint = _eval_fingerprint(
+        test_rows_hash=_rows_hash(test_rows),
+        prompt_sha=prompt_sha,
+        few_shot_hash=few_shot_hash,
+        label_set=load_label_set(task_id),
+        condition=condition,
+        eval_seed=eval_seed,
+        model_str=model_str,
+        reasoning_capable=REASONING_CAPABLE.get(model_id, False),
+        max_output_tokens=task_cfg.max_output_tokens,
+        task_type=task_cfg.task_type,
+        answer_mode=task_cfg.answer_mode,
+    )
     pp = partial_path(out_path)
     if reuse_is_valid(out_path, pp, fingerprint):
         click.echo(f"  SKIP [{model_id}/{task_id}/{condition}]: up-to-date")

@@ -26,7 +26,10 @@ os.environ.setdefault("UNSLOTH_DISABLE_AUTO_PADDING_FREE", "1")
 from dotenv import load_dotenv
 load_dotenv()
 
-# ML libs imported lazily inside run_training_task — keeps module importable on CPU for tests
+# Heavy ML libs (unsloth, trl, datasets) imported lazily inside run_training_task
+# to keep this module CPU-importable for tests. transformers is CPU-safe, so
+# TrainerCallback can be a module-level base class for _CheckpointCallback below.
+from transformers import EarlyStoppingCallback, TrainerCallback
 
 import click
 import yaml
@@ -41,11 +44,11 @@ from checkpoint_utils import (
     training_log,
 )
 from utils import load_jsonl, write_jsonl
-from pipeline.cache import code_closure_hash, inputs_changed, training_inputs_hash
+from pipeline.cache import code_closure_hash, training_inputs_hash
 from pipeline.config import get_local_models, get_tasks
 from pipeline.hardware import check_allowed_gpu, get_current_gpu_name
 from pipeline.log import configure, get_logger
-from pipeline.paths import adapter_path, training_meta_path
+from pipeline.paths import adapter_path, prepared_path, training_meta_path
 from pipeline.validation import reject_test_path, require_jsonl
 from pipeline.versioning import git_sha as _git_sha
 
@@ -140,6 +143,11 @@ def _compute_dtype_str(model) -> str:
 
 
 def get_epochs(n_examples: int) -> int:
+    """Upper bound on epochs by dataset size — a cap, not the trained length.
+
+    When a validation split exists, EarlyStoppingCallback usually ends the run
+    well before this; it is the safety ceiling for the no-overfit case.
+    """
     if n_examples <= 200:
         return 10
     if n_examples <= 1000:
@@ -147,17 +155,18 @@ def get_epochs(n_examples: int) -> int:
     return 3
 
 
+def eval_save_steps(n_train: int, eff_batch: int, evals_per_epoch: int) -> int:
+    """Steps between evaluations: a fixed number of evals per epoch, so the
+    validation optimum stays locatable for early stopping at any dataset size."""
+    steps_per_epoch = math.ceil(n_train / max(1, eff_batch))
+    return max(1, steps_per_epoch // max(1, evals_per_epoch))
+
+
 def count_jsonl(path: Path) -> int:
     if not path.exists():
         return 0
     with open(path) as f:
         return sum(1 for _ in f)
-
-
-def _resolve_prepared(task_id: str, filename: str) -> Optional[Path]:
-    """Return path to a prepared data file, or None if absent."""
-    p = REPO_ROOT / "data" / "prepared" / task_id / filename
-    return p if p.exists() else None
 
 
 def get_or_create_cap(data_dir: Path, n: int, ctx: str = "") -> Path:
@@ -286,12 +295,18 @@ def _analyze_training(
             diag["plateaued"] = True
             echo(f"NOTE: loss plateaued — Q3={q3_mean:.4f}, Q4={q4_mean:.4f} ({rel_change * 100:.2f}% change)")
 
-    # Overfitting: validation loss rises >5% while training loss fell — only assessable
-    # when a validation split was reserved during training (val_losses provided).
+    # Overfitting: by the final epoch, validation loss has climbed >5% above its
+    # best (minimum) value while training loss kept falling. The reference is the
+    # minimum, not the first epoch — a U-shaped val curve whose best generalization
+    # point is mid-run still overfits even when the last epoch sits below the
+    # (noisy) first one. Only assessable when a validation split was reserved
+    # during training (val_losses provided).
     if val_losses and len(val_losses) >= 2:
-        if val_losses[-1] > val_losses[0] * 1.05 and improvement > 0:
+        best_val = min(val_losses)
+        if val_losses[-1] > best_val * 1.05 and improvement > 0:
             diag["overfitting_detected"] = True
-            echo(f"WARNING: overfitting — val_loss {val_losses[0]:.4f} → {val_losses[-1]:.4f} "
+            echo(f"WARNING: overfitting — val_loss bottomed at {best_val:.4f} then rose "
+                 f"to {val_losses[-1]:.4f} (+{(val_losses[-1] / best_val - 1) * 100:.1f}%) "
                  f"while train_loss fell {improvement * 100:.1f}%")
         else:
             diag["overfitting_detected"] = False
@@ -333,6 +348,157 @@ def _verify_completion_masking(train_ds, echo) -> None:
          f"({100 * n_supervised / n:.0f}%) in example 0")
 
 
+def _detect_loss_spike(loss: float, recent: list[float], threshold: float = 3.0) -> Optional[dict]:
+    """Flag a loss value as a spike when > `threshold` × the mean of the last 5
+    recorded losses. Returns the anomaly dict or None; needs 5 priors for a
+    baseline (None before that) and ignores degenerate mean5 <= 0."""
+    if len(recent) < 5:
+        return None
+    mean5 = sum(recent[-5:]) / 5
+    if mean5 <= 0 or loss <= threshold * mean5:
+        return None
+    return {"type": "spike", "value": round(loss, 4), "mean5": round(mean5, 4)}
+
+
+def _resume_decision(prior_state: Optional[dict], current_input_hash: str) -> str:
+    """Decide what to do with an existing train_state given the current inputs.
+
+    Returns one of:
+      "fresh"  — no prior state; start training (no resume, no discard).
+      "skip"   — prior run completed with matching input_hash; can no-op.
+      "resume" — prior run in-progress with matching input_hash; safe to resume.
+      "stale"  — prior input_hash missing or different; discard checkpoints and
+                 retrain from scratch. Treating "missing" as stale keeps legacy
+                 train_state.json files (pre-input_hash) on the conservative
+                 side: when we can't prove inputs match, retrain.
+    """
+    if not prior_state:
+        return "fresh"
+    if prior_state.get("input_hash") != current_input_hash:
+        return "stale"
+    return "skip" if prior_state.get("status") == "complete" else "resume"
+
+
+class _CheckpointCallback(TrainerCallback):
+    """Trainer callback for progress logging, GPU-util sampling, anomaly
+    detection (NaN/Inf, loss spikes), and periodic train_state.json saves.
+
+    Module-level so its helpers (_detect_loss_spike) can be unit-tested
+    independently of the heavy Unsloth/TRL imports the rest of run_training_task
+    pulls in. The constructor takes the per-run identifiers it needs to write
+    train_state.json on each checkpoint save, including the input_hash so the
+    next run can detect stale checkpoints (see _resume_decision)."""
+
+    def __init__(self, echo, model_short: str, task_id: str, input_hash: str, smoke: bool = False):
+        self._echo = echo
+        self._model_short = model_short
+        self._task_id = task_id
+        self._input_hash = input_hash
+        self._smoke = smoke
+        self.gpu_util_samples: list[float] = []
+        self.loss_steps: list[tuple[int, float]] = []
+        self.anomalies: list[dict] = []
+        self._train_start: float = 0.0
+        self._total_steps: int = 0
+        self._last_heartbeat: float = 0.0
+        self._last_logged_step: int = -1
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        now = time.time()
+        self._train_start = now
+        self._last_heartbeat = now
+        self._total_steps = state.max_steps
+        self._echo(f"Training started: {state.max_steps} steps")
+
+    def _eta_str(self, step: int) -> str:
+        if step <= 0 or self._total_steps <= 0:
+            return ""
+        elapsed = time.time() - self._train_start
+        secs_per_step = elapsed / step
+        remaining = (self._total_steps - step) * secs_per_step
+        if remaining < 60:
+            return f"ETA ~{int(remaining)}s"
+        return f"ETA ~{int(remaining / 60)}m"
+
+    def _progress_header(self, step: int) -> list[str]:
+        pct = int(100 * step / self._total_steps) if self._total_steps else 0
+        parts = [f"step {step}/{self._total_steps} ({pct}%)"]
+        eta = self._eta_str(step)
+        if eta:
+            parts.append(eta)
+        return parts
+
+    def on_step_end(self, args, state, control, **kwargs):
+        step = state.global_step
+        now = time.time()
+        if now - self._last_heartbeat >= 60 and step != self._last_logged_step:
+            elapsed_min = (now - self._train_start) / 60
+            parts = self._progress_header(step) + [f"elapsed {elapsed_min:.1f}m"]
+            self._echo("... " + " | ".join(parts))
+            self._last_heartbeat = now
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        try:
+            self.gpu_util_samples.append(torch.cuda.utilization())
+        except Exception:
+            pass
+        if not logs:
+            return
+        step = state.global_step
+        self._last_logged_step = step
+        self._last_heartbeat = time.time()
+        # Only per-step training logs (key "loss") count as step losses.
+        # The end-of-training summary log carries "train_loss" (the mean
+        # over all steps) — counting that as a step loss trips a phantom
+        # spike anomaly and skews the loss diagnostics, so ignore it here.
+        loss = logs.get("loss")
+        eval_loss = logs.get("eval_loss")
+        lr = logs.get("learning_rate")
+        grad_norm = logs.get("grad_norm")
+
+        # ── Gradient norm ─────────────────────────────────────────────
+        if grad_norm is not None and (math.isnan(grad_norm) or math.isinf(grad_norm)):
+            self._echo(f"FATAL: NaN/Inf grad_norm at step {step} — halting training")
+            self.anomalies.append({"step": step, "type": "nan_grad_norm"})
+            control.should_training_stop = True
+
+        # ── Loss anomalies ────────────────────────────────────────────
+        if loss is not None:
+            if math.isnan(loss) or math.isinf(loss):
+                self._echo(f"FATAL: NaN/Inf loss at step {step} — halting training")
+                self.anomalies.append({"step": step, "type": "nan_loss"})
+                control.should_training_stop = True
+            else:
+                spike = _detect_loss_spike(loss, [v for _, v in self.loss_steps[-5:]])
+                if spike is not None:
+                    self._echo(f"WARNING: loss spike at step {step}: "
+                               f"{spike['value']:.4f} (5-step mean={spike['mean5']:.4f})")
+                    self.anomalies.append({"step": step, **spike})
+                self.loss_steps.append((step, loss))
+
+        # ── Progress line ─────────────────────────────────────────────
+        parts = self._progress_header(step)
+        if loss is not None and not (math.isnan(loss) or math.isinf(loss)):
+            parts.append(f"loss={loss:.4f}")
+        if eval_loss is not None:
+            parts.append(f"eval_loss={eval_loss:.4f}")
+        if lr is not None:
+            parts.append(f"lr={lr:.2e}")
+        if grad_norm is not None and not (math.isnan(grad_norm) or math.isinf(grad_norm)):
+            parts.append(f"grad={grad_norm:.3f}")
+        self._echo(" | ".join(parts))
+
+    def on_save(self, args, state, control, **kwargs):
+        save_train_state(self._model_short, self._task_id, CONDITION, {
+            "status": "in_progress",
+            "epoch": state.epoch,
+            "global_step": state.global_step,
+            "best_metric": state.best_metric,
+            "best_model_checkpoint": state.best_model_checkpoint,
+            "input_hash": self._input_hash,
+        }, smoke=self._smoke)
+
+
 # ---------------------------------------------------------------------------
 # Core training logic (isolated for GC scoping)
 # ---------------------------------------------------------------------------
@@ -363,7 +529,6 @@ def run_training_task(
     from unsloth import FastModel
     from unsloth.chat_templates import train_on_responses_only
     import datasets as hf_datasets
-    from transformers import TrainerCallback
     from trl import SFTTrainer, SFTConfig
 
     task_id = task_cfg.task_id
@@ -413,112 +578,6 @@ def run_training_task(
     weight_dtype_str = "4bit" if hw_cfg.load_in_4bit else load_dtype_str
     echo(f"Precision: load_dtype={load_dtype_str}, compute_dtype={compute_dtype_str}, weight_dtype={weight_dtype_str}")
 
-    class _CheckpointCallback(TrainerCallback):
-        def __init__(self):
-            self.gpu_util_samples: list[float] = []
-            self.loss_steps: list[tuple[int, float]] = []
-            self.anomalies: list[dict] = []
-            self._train_start: float = 0.0
-            self._total_steps: int = 0
-            self._last_heartbeat: float = 0.0
-            self._last_logged_step: int = -1
-
-        def on_train_begin(self, args, state, control, **kwargs):
-            now = time.time()
-            self._train_start = now
-            self._last_heartbeat = now
-            self._total_steps = state.max_steps
-            echo(f"Training started: {state.max_steps} steps")
-
-        def _eta_str(self, step: int) -> str:
-            if step <= 0 or self._total_steps <= 0:
-                return ""
-            elapsed = time.time() - self._train_start
-            secs_per_step = elapsed / step
-            remaining = (self._total_steps - step) * secs_per_step
-            if remaining < 60:
-                return f"ETA ~{int(remaining)}s"
-            return f"ETA ~{int(remaining / 60)}m"
-
-        def _progress_header(self, step: int) -> list[str]:
-            pct = int(100 * step / self._total_steps) if self._total_steps else 0
-            parts = [f"step {step}/{self._total_steps} ({pct}%)"]
-            eta = self._eta_str(step)
-            if eta:
-                parts.append(eta)
-            return parts
-
-        def on_step_end(self, args, state, control, **kwargs):
-            step = state.global_step
-            now = time.time()
-            if now - self._last_heartbeat >= 60 and step != self._last_logged_step:
-                elapsed_min = (now - self._train_start) / 60
-                parts = self._progress_header(step) + [f"elapsed {elapsed_min:.1f}m"]
-                echo("... " + " | ".join(parts))
-                self._last_heartbeat = now
-
-        def on_log(self, args, state, control, logs=None, **kwargs):
-            try:
-                self.gpu_util_samples.append(torch.cuda.utilization())
-            except Exception:
-                pass
-            if not logs:
-                return
-            step = state.global_step
-            self._last_logged_step = step
-            self._last_heartbeat = time.time()
-            # Only per-step training logs (key "loss") count as step losses.
-            # The end-of-training summary log carries "train_loss" (the mean
-            # over all steps) — counting that as a step loss trips a phantom
-            # spike anomaly and skews the loss diagnostics, so ignore it here.
-            loss = logs.get("loss")
-            eval_loss = logs.get("eval_loss")
-            lr = logs.get("learning_rate")
-            grad_norm = logs.get("grad_norm")
-
-            # ── Gradient norm ─────────────────────────────────────────────
-            if grad_norm is not None and (math.isnan(grad_norm) or math.isinf(grad_norm)):
-                echo(f"FATAL: NaN/Inf grad_norm at step {step} — halting training")
-                self.anomalies.append({"step": step, "type": "nan_grad_norm"})
-                control.should_training_stop = True
-
-            # ── Loss anomalies ────────────────────────────────────────────
-            if loss is not None:
-                if math.isnan(loss) or math.isinf(loss):
-                    echo(f"FATAL: NaN/Inf loss at step {step} — halting training")
-                    self.anomalies.append({"step": step, "type": "nan_loss"})
-                    control.should_training_stop = True
-                else:
-                    recent = [v for _, v in self.loss_steps[-5:]]
-                    if len(recent) == 5:
-                        mean5 = sum(recent) / 5
-                        if mean5 > 0 and loss > 3.0 * mean5:
-                            echo(f"WARNING: loss spike at step {step}: {loss:.4f} (5-step mean={mean5:.4f})")
-                            self.anomalies.append({"step": step, "type": "spike",
-                                                   "value": round(loss, 4), "mean5": round(mean5, 4)})
-                    self.loss_steps.append((step, loss))
-
-            # ── Progress line ─────────────────────────────────────────────
-            parts = self._progress_header(step)
-            if loss is not None and not (math.isnan(loss) or math.isinf(loss)):
-                parts.append(f"loss={loss:.4f}")
-            if eval_loss is not None:
-                parts.append(f"eval_loss={eval_loss:.4f}")
-            if lr is not None:
-                parts.append(f"lr={lr:.2e}")
-            if grad_norm is not None and not (math.isnan(grad_norm) or math.isinf(grad_norm)):
-                parts.append(f"grad={grad_norm:.3f}")
-            echo(" | ".join(parts))
-
-        def on_save(self, args, state, control, **kwargs):
-            save_train_state(model_cfg.model_short, task_id, CONDITION, {
-                "status": "in_progress",
-                "epoch": state.epoch,
-                "global_step": state.global_step,
-                "best_metric": state.best_metric,
-                "best_model_checkpoint": state.best_model_checkpoint,
-            })
-
     echo(f"Loading dataset from {data_path} ...")
     train_rows = load_jsonl(data_path)
     echo(f"{len(train_rows)} training examples loaded")
@@ -561,6 +620,21 @@ def run_training_task(
     if task_cfg.training_overrides:
         training_cfg.update(task_cfg.training_overrides)
         echo(f"Task overrides applied: {task_cfg.training_overrides}")
+    # Evaluation cadence + early stopping. A held-out val split makes the epoch
+    # count empirical: evaluate several times per epoch so the val optimum is
+    # locatable, and let EarlyStoppingCallback (added below) end the run once
+    # val loss stops improving — num_train_epochs is then only a cap. Smoke
+    # runs have no val split, so eval and early stopping are disabled.
+    has_val = val_ds is not None
+    eval_strategy = training_cfg.get("eval_strategy", "steps") if has_val else "no"
+    do_eval = eval_strategy != "no"
+    eval_steps = None
+    if do_eval:
+        eff_batch = (training_cfg.get("per_device_train_batch_size", 4)
+                     * training_cfg.get("gradient_accumulation_steps", 4))
+        eval_steps = eval_save_steps(n_train, eff_batch,
+                                     training_cfg.get("evals_per_epoch", 3))
+
     sft_kwargs = dict(
         output_dir=str(ckpt_dir),
         num_train_epochs=epochs,
@@ -573,9 +647,9 @@ def run_training_task(
         max_grad_norm=training_cfg.get("max_grad_norm", 1.0),
         bf16=training_cfg.get("bf16", True),
         seed=training_cfg.get("seed", 42),
-        save_strategy=training_cfg.get("save_strategy", "epoch"),
-        eval_strategy=training_cfg.get("eval_strategy", "epoch" if val_ds is not None else "no"),
-        load_best_model_at_end=training_cfg.get("load_best_model_at_end", False),
+        save_strategy=eval_strategy if do_eval else training_cfg.get("save_strategy", "epoch"),
+        eval_strategy=eval_strategy,
+        load_best_model_at_end=do_eval and training_cfg.get("load_best_model_at_end", False),
         metric_for_best_model=training_cfg.get("metric_for_best_model", "eval_loss"),
         greater_is_better=training_cfg.get("greater_is_better", False),
         logging_steps=training_cfg.get("logging_steps", 10),
@@ -585,6 +659,11 @@ def run_training_task(
         dataset_text_field="text",
         packing=False,
     )
+    if do_eval:
+        # Save in lockstep with eval so load_best_model_at_end can restore the
+        # lowest-eval-loss checkpoint (HF requires save_steps % eval_steps == 0).
+        sft_kwargs["eval_steps"] = eval_steps
+        sft_kwargs["save_steps"] = eval_steps
     sft_kwargs.update(hw_cfg.sft_extra)
     # Pass warmup_ratio directly so Trainer computes steps from the real num_training_steps.
     # Fall back to an explicit warmup_steps only when ratio is absent.
@@ -596,24 +675,36 @@ def run_training_task(
     warmup_disp = (f"warmup_ratio={sft_kwargs['warmup_ratio']}"
                    if "warmup_ratio" in sft_kwargs
                    else f"warmup_steps={sft_kwargs.get('warmup_steps', 0)}")
+    eval_disp = (f" eval_every={eval_steps}st patience={training_cfg.get('early_stopping_patience', 3)}"
+                 if do_eval else " eval=off")
     echo(
-        f"SFTConfig: epochs={sft_kwargs['num_train_epochs']}"
+        f"SFTConfig: max_epochs={sft_kwargs['num_train_epochs']}"
         f" batch={sft_kwargs['per_device_train_batch_size']}"
         f" accum={sft_kwargs['gradient_accumulation_steps']}"
         f" lr={sft_kwargs['learning_rate']:.2e}"
-        f" {warmup_disp}"
+        f" sched={sft_kwargs['lr_scheduler_type']}"
+        f" {warmup_disp}{eval_disp}"
     )
     sft_config = SFTConfig(**sft_kwargs)
 
     echo("Building trainer...")
-    callback = _CheckpointCallback()
+    callback = _CheckpointCallback(echo, model_cfg.model_short, task_id, input_hash, smoke=smoke_test)
+    callbacks = [callback]
+    if do_eval:
+        # transformers' built-in early stopping: end the run once eval_loss has
+        # not improved for `patience` consecutive evals. patience > 0 so a
+        # single noisy uptick does not stop training prematurely.
+        callbacks.append(EarlyStoppingCallback(
+            early_stopping_patience=training_cfg.get("early_stopping_patience", 3),
+            early_stopping_threshold=training_cfg.get("early_stopping_threshold", 0.0),
+        ))
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     trainer = SFTTrainer(
         model=model, tokenizer=tokenizer, train_dataset=train_ds,
         eval_dataset=val_ds,
         args=sft_config,
-        callbacks=[callback],
+        callbacks=callbacks,
     )
 
     # Completion-only loss: mask prompt tokens to -100 so gradients flow from
@@ -636,6 +727,19 @@ def run_training_task(
         resume_from_checkpoint=str(resume_ckpt) if resume_ckpt else None
     )
     elapsed_min = (time.time() - t0) / 60
+    # num_train_epochs is a cap: record whether early stopping ended the run
+    # short of it, and how many epochs actually ran. isinstance guards keep the
+    # mocked-trainer unit tests JSON-serializable.
+    _ms = getattr(trainer.state, "max_steps", 0)
+    _gs = getattr(trainer.state, "global_step", 0)
+    _ep = getattr(trainer.state, "epoch", 0.0)
+    max_steps = int(_ms) if isinstance(_ms, (int, float)) else 0
+    global_step = int(_gs) if isinstance(_gs, (int, float)) else 0
+    epochs_completed = round(float(_ep), 2) if isinstance(_ep, (int, float)) else 0.0
+    early_stopped = bool(do_eval and max_steps and global_step < max_steps)
+    if early_stopped:
+        echo(f"Early stopping fired: {epochs_completed}/{epochs} epochs run "
+             f"({global_step}/{max_steps} steps)")
     gpu_hours = round(elapsed_min / 60, 4)
     training_cost = 0.0 if smoke_test else gpu_hours * GPU_HOURLY
     peak_gpu_mem_mb = round(torch.cuda.max_memory_allocated() / 1024**2) if torch.cuda.is_available() else None
@@ -680,6 +784,9 @@ def run_training_task(
         )},
         **({"warmup_ratio": sft_kwargs["warmup_ratio"]} if "warmup_ratio" in sft_kwargs
            else {"warmup_steps": sft_kwargs.get("warmup_steps", 0)}),
+        **({"eval_steps": eval_steps,
+            "early_stopping_patience": training_cfg.get("early_stopping_patience", 3)}
+           if do_eval else {}),
     }
 
     meta = {
@@ -690,6 +797,8 @@ def run_training_task(
         "n_train": n_train,
         "n_val": val_n,
         "epochs": epochs,
+        "epochs_completed": epochs_completed,
+        "early_stopped": early_stopped,
         "seq_len": hw_cfg.seq_len,
         "load_dtype": load_dtype_str,
         "compute_dtype": compute_dtype_str,
@@ -719,7 +828,8 @@ def run_training_task(
         "train_loss": train_loss,
         "training_time_min": round(elapsed_min, 1),
         "training_cost": round(training_cost, 4),
-    })
+        "input_hash": input_hash,
+    }, smoke=smoke_test)
 
     loss_display = eval_loss if eval_loss is not None else train_loss
     mem_str = f", peak_mem={peak_gpu_mem_mb}MB" if peak_gpu_mem_mb is not None else ""
@@ -777,9 +887,9 @@ def train_one(
     n_train = count_jsonl(data_path)
     hw_cfg = ConfigFactory.build(model_cfg, task_cfg, smoke_test)
 
-    adapter_dir = adapter_path(REPO_ROOT, model_cfg.model_short, task_id, CONDITION)
-    log_dir = training_meta_path(REPO_ROOT, "local", model_cfg.model_short, task_id, CONDITION).parent
-    ckpt_dir = checkpoint_dir(model_cfg.model_short, task_id, CONDITION)
+    adapter_dir = adapter_path(REPO_ROOT, model_cfg.model_short, task_id, CONDITION, smoke=smoke_test)
+    log_dir = training_meta_path(REPO_ROOT, "local", model_cfg.model_short, task_id, CONDITION, smoke=smoke_test).parent
+    ckpt_dir = checkpoint_dir(model_cfg.model_short, task_id, CONDITION, smoke=smoke_test)
     adapter_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -809,21 +919,27 @@ def train_one(
     })
     meta_path = log_dir / "metadata.json"
 
-    prior_state = load_train_state(model_cfg.model_short, task_id, CONDITION)
-    if prior_state and prior_state.get("status") == "complete":
-        if not inputs_changed(input_hash, meta_path):
-            echo("SKIP: already complete")
-            _log.info("training skip", model=model_cfg.model_short, task=task_id, condition=CONDITION,
-                      event="stage_skip")
-            if meta_path.exists():
-                with open(meta_path) as f:
-                    return json.load(f)
-            return {}
-        # Inputs changed: the prior run completed, so its checkpoints are a
-        # superseded model, not a crash to recover. Resuming the finished
-        # checkpoint would leave 0 steps to run and silently no-op the retrain.
+    prior_state = load_train_state(model_cfg.model_short, task_id, CONDITION, smoke=smoke_test)
+    # train_state.input_hash is the source of truth for "what produced these
+    # checkpoints". Compare against the current input_hash *before* resume — if
+    # they differ (or no hash was recorded — legacy state), discard the
+    # checkpoints and retrain. Otherwise a finished checkpoint can silently
+    # no-op a retrain whose inputs in fact changed.
+    decision = _resume_decision(prior_state, input_hash)
+    if decision == "skip":
+        echo("SKIP: already complete")
+        _log.info("training skip", model=model_cfg.model_short, task=task_id, condition=CONDITION,
+                  event="stage_skip")
+        if meta_path.exists():
+            with open(meta_path) as f:
+                return json.load(f)
+        return {}
+    if decision == "stale":
         n_cleared = _discard_stale_checkpoints(ckpt_dir)
-        echo("RETRAIN: inputs changed"
+        reason = ("no input_hash on prior state"
+                  if prior_state and not prior_state.get("input_hash")
+                  else "inputs changed")
+        echo(f"RETRAIN: {reason}"
              + (f" — discarded {n_cleared} stale checkpoint(s)" if n_cleared else ""))
 
     if dry_run:
@@ -838,14 +954,15 @@ def train_one(
         atomic_write_json(meta, log_dir / "metadata.json")
         return meta
 
-    resume_ckpt = find_hf_resume_checkpoint(model_cfg.model_short, task_id, CONDITION)
+    resume_ckpt = find_hf_resume_checkpoint(model_cfg.model_short, task_id, CONDITION, smoke=smoke_test)
     if resume_ckpt:
         echo(f"Resuming from checkpoint: {resume_ckpt.name}")
     save_train_state(model_cfg.model_short, task_id, CONDITION, {
         "status": "in_progress",
         "epoch": 0,
         "global_step": 0,
-    })
+        "input_hash": input_hash,
+    }, smoke=smoke_test)
 
     with training_log(ckpt_dir):
         meta = run_training_task(
@@ -870,8 +987,10 @@ def train_one(
               peak_gpu_mem_mb=meta.get("peak_gpu_mem_mb"), avg_gpu_util_pct=meta.get("avg_gpu_util_pct"),
               eval_loss=meta.get("eval_loss"), n_train=meta.get("n_train"))
 
-    if auto_upload:
+    if auto_upload and not smoke_test:
         _upload_adapter(model_cfg.model_short, task_id, CONDITION, ctx=ctx)
+    elif auto_upload and smoke_test:
+        _echo(ctx, "Skipping auto-upload: smoke runs must not push adapters to HF.")
 
     return meta
 
@@ -917,8 +1036,8 @@ def main(model: Optional[str], task: str, cap: Optional[int], auto_upload: bool,
             ctx = f"{mid}/{tid}"
 
             src_name = "smoke_train.jsonl" if smoke_test else "train.jsonl"
-            src = _resolve_prepared(tid, src_name)
-            if src is None:
+            src = prepared_path(REPO_ROOT, tid, smoke=smoke_test) / src_name
+            if not src.exists():
                 click.echo(f"  [{ctx}] SKIP: {src_name} not found", err=True)
                 if not dry_run:
                     failures.append((f"{mid}/{tid}", "data file missing"))

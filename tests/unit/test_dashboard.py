@@ -493,6 +493,31 @@ def test_merge_results_handles_corrupt_existing(tmp_path):
     assert merged == fresh
 
 
+def test_merge_results_preserves_existing_only_keys(tmp_path):
+    """A (model, task, condition) tuple present in existing but absent from
+    fresh stays verbatim — a partial-task pipeline run must not silently delete
+    the rest of the dashboard."""
+    import json
+    existing = {"results": [
+        {"model_id": "m1", "task_id": "fpb",    "condition": "zero-shot", "metric_value": 0.7},
+        {"model_id": "m1", "task_id": "ledgar", "condition": "zero-shot", "metric_value": 0.5},
+    ]}
+    out = tmp_path / "results.json"
+    out.write_text(json.dumps(existing))
+
+    fresh = [{"model_id": "m1", "task_id": "fpb", "condition": "zero-shot", "metric_value": 0.8}]
+    merged = merge_results(fresh, out)
+
+    keys = {(r["model_id"], r["task_id"], r["condition"]) for r in merged}
+    assert keys == {("m1", "fpb", "zero-shot"), ("m1", "ledgar", "zero-shot")}
+
+    fpb = next(r for r in merged if r["task_id"] == "fpb")
+    assert fpb["metric_value"] == 0.8  # fresh wins for the recomputed section
+
+    ledgar = next(r for r in merged if r["task_id"] == "ledgar")
+    assert ledgar["metric_value"] == 0.5  # existing preserved for the untouched section
+
+
 # ── _cohens_dz and _effect_label ─────────────────────────────────────────────
 
 def test_cohens_dz_too_few_returns_none():

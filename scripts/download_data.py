@@ -18,16 +18,9 @@ from checkpoint_utils import atomic_write_json
 
 load_dotenv(Path(__file__).parent.parent / ".env", override=True)
 
-# Expected minimum row counts for sanity checks (split: min_count)
-EXPECTED_COUNTS: dict[str, dict[str, int]] = {
-    "banking77": {"train": 8000,  "test": 2000},
-    "cuad":      {"train": 10000, "test": 1000},
-    "ledgar":    {"train": 50000, "test": 5000},
-    "fpb":       {"train": 3000},
-    "medmcqa":   {"train": 100000, "test": 4000},
-}
-
 from pipeline.config import get_tasks
+from pipeline.data_quality import EXPECTED_COUNTS
+from pipeline.paths import raw_path
 
 REPO_ROOT = Path(__file__).parent.parent
 
@@ -99,7 +92,7 @@ def download_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> N
 
     from datasets import DatasetDict, DownloadMode  # lazy import
     from huggingface_hub import HfApi
-    out_dir = REPO_ROOT / "data" / "raw" / cfg.task_id
+    out_dir = raw_path(REPO_ROOT, cfg.task_id, smoke=smoke_test)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     hf_token = os.environ.get("HF_TOKEN") or None

@@ -30,10 +30,14 @@ torchinductor_root/
 data/
 results/
 checkpoints/
-dashboard-data/results.json
+# dashboard-data/results.json is git-tracked: it's the published benchmark
+# view, merged per (model, task, condition) — see generate_dashboard_data.py.
 runs/
 !runs/.gitkeep
 *.log
+
+# Analysis artifacts (script-generated plots from results/ — regenerable)
+plots/
 
 # Local-only docs
 docs/

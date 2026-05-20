@@ -165,6 +165,28 @@ python scripts/sync_artifacts.py --what all
 python scripts/sync_artifacts.py --what adapters --direction down
 ```
 
+## Smoke mode
+
+`--smoke-test` runs a tiny end-to-end pipeline (12-row dataset, 1-epoch
+training) against a small stand-in model. **All smoke outputs live under a
+parallel `smoke/` namespace** so they cannot clobber real benchmark data:
+
+- `data/smoke/raw/` — tiny raw downloads
+- `data/smoke/prepared/` — smoke-prepared JSONL
+- `checkpoints/smoke/` — smoke training checkpoints
+- `results/smoke/` — predictions, summaries, classified errors, training
+  metadata, adapters
+- `dashboard-data/smoke/` — smoke dashboard render
+
+Read-only paths (configs in `configs/`, prompts in `prompts/`) are shared
+between smoke and real runs. The `--smoke-test` flag is plumbed through every
+stage by `scripts/run.py` and is also accepted at each stage script directly.
+Auto-upload to HuggingFace (`train_local.py --auto-upload`) is disabled for
+smoke runs. `prepare_datasets.py` validates raw row counts against
+`EXPECTED_COUNTS` (in `pipeline/data_quality.py`) on non-smoke runs and fails
+loudly if the raw artifact looks truncated (e.g. left over from a stale smoke
+download under an older layout).
+
 ## Limitations
 
 - **Hyperparameters are not exhaustively tuned.** LoRA rank, learning rate,

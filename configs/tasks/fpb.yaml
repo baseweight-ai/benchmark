@@ -21,6 +21,10 @@ train_sampling:
   stratify_by: label
   per_group_cap: 200
   seed: 42
+# Held-out validation split (val.jsonl): 300 examples, carved before
+# train_sampling from the raw deduped pool — 100 per class, balanced like the
+# training set, and disjoint from the full 600-row (200/class) training set.
+val_size: 300
 test_sampling:
   strategy: stratified
   stratify_by: label
