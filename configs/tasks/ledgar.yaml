@@ -14,10 +14,17 @@ metric_label: "Macro F1"
 metric_granularity: per_class_macro
 max_output_tokens: 32
 lm_eval_task_id: ledgar
+# Stratified with a floor: ledgar's 100 classes follow a steep power law
+# (23-3167 rows per class in raw train; the test set is similarly imbalanced).
+# Train/test now share the natural prior. min_per_group=30 ensures rare
+# clause types still get enough supervision for macro-F1 — when the pool only
+# holds 23, the floor degrades gracefully to "all available". total_cap=8000
+# uses ~2.7× more data than the previous `per_group_cap=30` (3000 rows).
 train_sampling:
-  strategy: balanced
+  strategy: stratified
   stratify_by: label
-  per_group_cap: 30
+  total_cap: 8000
+  min_per_group: 30
   seed: 42
 test_sampling:
   strategy: stratified
@@ -34,3 +41,9 @@ epochs_by_size:
   small: 10
   medium: 5
   large: 3
+
+# early_stopping_patience=1: compute-saving lesson from the FPB sweep —
+# overfit-then-stop runs reach the same final model under load_best at ~50%
+# less wall time. Free option value when the task happens not to overfit.
+training_overrides:
+  early_stopping_patience: 1

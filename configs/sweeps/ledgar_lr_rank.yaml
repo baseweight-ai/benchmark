@@ -1,0 +1,26 @@
+# ledgar hyperparameter sweep — find best (learning_rate, lora_rank) on
+# the new stratified+8000 train pool. Six trials, ranked by held-out val
+# eval_loss. Same template as configs/sweeps/fpb_lr_rank.yaml.
+#
+# Run:
+#   python scripts/prepare_datasets.py --task ledgar   # if ledgar.yaml changed
+#   python scripts/run_sweep.py --config configs/sweeps/ledgar_lr_rank.yaml
+#
+# Axis choices
+#   lr: 3 points spanning {2e-5, 5e-5, 1e-4}, mirroring FPB. With 100 classes
+#       and 8000 rows the picture may shift — the sweep tells us empirically.
+#   lora_rank: 4 and 8 — both below the qwen3-8b default of 16, expected to
+#       help with the steep power-law tail (rare classes get only ~23-30 rows
+#       and a large adapter would memorise them rather than generalise).
+#   alpha: pinned to model default (32) by the sweep; promoted post-sweep with
+#       alpha = 2 × rank.
+name: ledgar_lr_rank
+model: qwen3-8b
+task: ledgar
+smoke_test: false
+
+search: grid
+
+params:
+  learning_rate: [2.0e-5, 5.0e-5, 1.0e-4]
+  lora_rank: [4, 8]

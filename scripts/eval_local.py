@@ -308,6 +308,52 @@ async def wait_for_vllm(proc: subprocess.Popen, timeout: int = VLLM_HEALTH_TIMEO
     return False
 
 
+def _eval_fingerprint(
+    model_cfg: ModelConfig,
+    task_id: str,
+    condition: str,
+    task_cfg: TaskConfig,
+    eval_seed: int,
+    concurrency: int,
+    *,
+    smoke_test: bool = False,
+    test_rows: Optional[list[dict]] = None,
+    prompt_sha: Optional[str] = None,
+    few_shot_hash: Optional[str] = None,
+) -> str:
+    """Fingerprint a prediction artifact for skip-if-unchanged.
+
+    Centralised so the pre-filter (avoids vLLM startup when nothing is stale)
+    and `run_eval` (avoids resuming a partial file produced by a different
+    adapter) compute the same hash and agree on when to invalidate. Optional
+    args let `run_eval` pass already-loaded values to skip re-reading them.
+    """
+    if test_rows is None:
+        test_rows = load_test_rows(task_id, smoke_test, eval_seed)
+    if prompt_sha is None:
+        prompt_sha = _read_prompt_sha(prepared_path(REPO_ROOT, task_id, smoke=smoke_test))
+    if few_shot_hash is None:
+        few_shot = get_few_shot(task_id, model_cfg.model_short, smoke_test)
+        few_shot_hash = _rows_hash(few_shot) if few_shot else None
+    return dict_hash({
+        "code": code_closure_hash(Path(__file__)),
+        "test_rows": _rows_hash(test_rows),
+        "prompt_sha": prompt_sha,
+        "few_shot_hash": few_shot_hash,
+        "label_set": load_label_set(task_id),
+        "condition": condition,
+        "eval_seed": eval_seed,
+        "concurrency": concurrency,
+        "model": model_cfg.model_id,
+        "adapter": (tree_hash(adapter_path(REPO_ROOT, model_cfg.model_short, task_id, "lora", smoke=smoke_test))
+                    if condition == "lora" else None),
+        "max_output_tokens": task_cfg.max_output_tokens,
+        "task_type": task_cfg.task_type,
+        "answer_mode": task_cfg.answer_mode,
+        "enable_thinking": model_cfg.enable_thinking,
+    })
+
+
 async def run_eval(
     model_cfg: ModelConfig,
     task_id: str,
@@ -353,23 +399,11 @@ async def run_eval(
     # Skip-if-unchanged: reuse the prediction file only when its fingerprint
     # still matches. A stale file — changed test data, adapter, prompt, eval
     # code, or generation config — is discarded and regenerated.
-    fingerprint = dict_hash({
-        "code": code_closure_hash(Path(__file__)),
-        "test_rows": _rows_hash(test_rows),
-        "prompt_sha": prompt_sha,
-        "few_shot_hash": few_shot_hash,
-        "label_set": load_label_set(task_id),
-        "condition": condition,
-        "eval_seed": eval_seed,
-        "concurrency": concurrency,
-        "model": model_cfg.model_id,
-        "adapter": (tree_hash(adapter_path(REPO_ROOT, model_cfg.model_short, task_id, "lora", smoke=smoke_test))
-                    if condition == "lora" else None),
-        "max_output_tokens": task_cfg.max_output_tokens,
-        "task_type": task_cfg.task_type,
-        "answer_mode": task_cfg.answer_mode,
-        "enable_thinking": model_cfg.enable_thinking,
-    })
+    fingerprint = _eval_fingerprint(
+        model_cfg, task_id, condition, task_cfg, eval_seed, concurrency,
+        smoke_test=smoke_test, test_rows=test_rows, prompt_sha=prompt_sha,
+        few_shot_hash=few_shot_hash,
+    )
     pp = partial_path(out_path)
     if reuse_is_valid(out_path, pp, fingerprint):
         click.echo(f"  SKIP [{model_cfg.model_short}/{task_id}/{condition}]: up-to-date")
@@ -594,9 +628,17 @@ def main(model: Optional[str], task: str, condition: str, eval_seed: int,
                     continue  # already reported above
                 model_name = f"adapter_{tid}" if cond == "lora" else model_cfg.model_id
                 for conc in concurrencies:
-                    if not dry_run and _pred_path(model_cfg.model_short, tid, _cond_key_for(cond, conc), smoke=smoke_test).exists():
-                        click.echo(f"  SKIP [{mid}/{tid}/{_cond_key_for(cond, conc)}]: already complete")
-                        continue
+                    # Skip-if-unchanged at the pre-filter: also fingerprint-aware,
+                    # not just file-exists. A LoRA prediction file produced by a
+                    # previous adapter must NOT short-circuit a re-eval against a
+                    # freshly-trained adapter — `reuse_is_valid` deletes the stale
+                    # file when fingerprints mismatch so run_eval regenerates it.
+                    out = _pred_path(model_cfg.model_short, tid, _cond_key_for(cond, conc), smoke=smoke_test)
+                    if not dry_run:
+                        fp = _eval_fingerprint(model_cfg, tid, cond, task_cfg, eval_seed, conc, smoke_test=smoke_test)
+                        if reuse_is_valid(out, partial_path(out), fp):
+                            click.echo(f"  SKIP [{mid}/{tid}/{_cond_key_for(cond, conc)}]: up-to-date")
+                            continue
                     pending.append((tid, cond, task_cfg, model_name, conc))
 
         if dry_run:

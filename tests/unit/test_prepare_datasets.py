@@ -255,6 +255,44 @@ def test_stratified_sample_min_per_group():
     assert counts["B"] >= 2
 
 
+def test_stratified_sample_min_per_group_can_exceed_total_cap():
+    """Documents an asymmetry in sample(): min_per_group*n_groups can exceed
+    total_cap, in which case the floor wins and the cap is silently overshot
+    (see prepare_datasets.py val-carve clamp for the production safeguard).
+
+    Three groups × min_per_group=300 = 900 rows, even with total_cap=300.
+    """
+    rows = [{"label": "A", "id": f"A{i}"} for i in range(1000)]
+    rows += [{"label": "B", "id": f"B{i}"} for i in range(1000)]
+    rows += [{"label": "C", "id": f"C{i}"} for i in range(1000)]
+    result = sample(rows, strategy="stratified", stratify_by="label",
+                    total_cap=300, min_per_group=300, seed=42)
+    assert len(result) == 900
+
+
+def test_val_carve_clamps_inherited_min_per_group():
+    """The val-carve path in process_task inherits the train_sampling config
+    (e.g. min_per_group=300 for the FPB train pool) and only overrides
+    total_cap with val_size. Without clamping min_per_group to val_size /
+    n_groups, the floor inflates val to floor*n_groups rows — 900 from a
+    val_size=300 budget for FPB's 3 classes. This test pins the clamp by
+    replaying the same arithmetic prepare_datasets.process_task uses.
+    """
+    rows = [{"label": L, "id": f"{L}{i}"}
+            for L in ["A", "B", "C"] for i in range(500)]
+    val_size, n_groups = 300, 3
+    train_min_per_group = 300
+
+    floor_cap = max(1, val_size // n_groups)         # 100
+    clamped = min(train_min_per_group, floor_cap)    # 100, not 300
+
+    result = sample(rows, strategy="stratified", stratify_by="label",
+                    total_cap=val_size, min_per_group=clamped, seed=42)
+    assert len(result) == val_size
+    counts = Counter(r["label"] for r in result)
+    assert all(counts[k] > 0 for k in ["A", "B", "C"])
+
+
 # ── sample — balanced ──────────────────────────────────────────────────────────
 
 def test_balanced_sample_per_group_cap():

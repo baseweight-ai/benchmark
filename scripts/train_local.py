@@ -104,6 +104,10 @@ class TaskConfig(BaseModel):
     # built. Use for task-specific stability tweaks (e.g. lower LR on tiny
     # datasets where the default overfits).
     training_overrides: Optional[dict] = None
+    # Per-task overrides merged into model_cfg.lora before the LoRA adapter is
+    # attached. Use for task-specific capacity tweaks (e.g. lower rank on tiny
+    # datasets prone to overfitting). Mirrors training_overrides semantics.
+    lora_overrides: Optional[dict] = None
 
 
 def load_model_config(model_id: str) -> ModelConfig:
@@ -318,6 +322,16 @@ def train_one(
     echo = lambda msg: _echo(ctx, msg)
     task_id = task_cfg.task_id
     n_train = count_jsonl(data_path)
+
+    # Merge task_cfg.lora_overrides into model_cfg.lora once, here, so every
+    # downstream consumer (ConfigFactory, the Trainer adapter, the input hash)
+    # sees the same effective LoRA config. Task-level overrides take priority
+    # over model-level defaults; absent overrides leave model_cfg unchanged.
+    if task_cfg.lora_overrides:
+        effective_lora = {**model_cfg.lora, **task_cfg.lora_overrides}
+        model_cfg = model_cfg.model_copy(update={"lora": effective_lora})
+        echo(f"Task LoRA overrides applied: {task_cfg.lora_overrides}")
+
     hw_cfg = ConfigFactory.build(model_cfg, task_cfg, smoke_test)
 
     adapter_dir = adapter_path(REPO_ROOT, model_cfg.model_short, task_id, CONDITION, smoke=smoke_test)

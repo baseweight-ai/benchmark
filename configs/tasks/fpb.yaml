@@ -7,23 +7,33 @@ num_classes: 3
 metric_id: macro_f1
 metric_label: "Macro F1"
 # Macro-F1 equally weights each sentiment class regardless of support.
-# Justified for FPB because (a) training is balanced (200/200/200 after
-# sampling), so the model is taught to handle each class equally, and
-# (b) the minority "negative" class (~11% of real-world distribution) is
-# the most consequential signal for financial sentiment — a missed
-# negative is a missed alert. Use weighted_f1 instead if reporting
-# real-world-prevalence-weighted performance is the priority.
+# Justified for FPB because (a) the minority "negative" class (~12% of the
+# natural distribution) is the most consequential signal for financial
+# sentiment — a missed negative is a missed alert — and (b) the stratified
+# train pool floors negative at min_per_group so the model still gets enough
+# negative supervision for class-equal performance, even though the train mix
+# now follows the natural prior rather than 33/33/33. Use weighted_f1 instead
+# if reporting real-world-prevalence-weighted performance is the priority.
 metric_granularity: per_class_macro
 max_output_tokens: 32
 lm_eval_task_id: null
+# Stratified sampling: train distribution matches the natural sentiment prior
+# (~12 / 59 / 28 for neg/neut/pos), the same shape as the stratified test set.
+# min_per_group floors the minority "negative" class so macro-F1 isn't
+# starved of supervision (natural prior at total_cap=2000 would give neg
+# ~240; the floor lifts it to 300 by trimming neutral). total_cap=2000 lifts
+# the train pool from 600 (balanced 200/class) → ~2000, exploiting the
+# ~4120 raw rows available after the 85/15 split.
 train_sampling:
-  strategy: balanced
+  strategy: stratified
   stratify_by: label
-  per_group_cap: 200
+  total_cap: 2000
+  min_per_group: 300
   seed: 42
 # Held-out validation split (val.jsonl): 300 examples, carved before
-# train_sampling from the raw deduped pool — 100 per class, balanced like the
-# training set, and disjoint from the full 600-row (200/class) training set.
+# train_sampling from the raw deduped pool. Inherits train_sampling's
+# stratified strategy so val tracks the same natural-prior distribution as
+# the test set — eval_loss on val is then a faithful proxy for test macro-F1.
 val_size: 300
 test_sampling:
   strategy: stratified
@@ -44,10 +54,29 @@ epochs_by_size:
   medium: 5
   large: 3
 
-# Tiny dataset (~600 rows after balanced sampling) — conservative LR and high
-# weight_decay keep the LoRA adapter close to zero so the effective model
-# stays close to pretrained (catastrophic-forgetting mitigation).
+# Small dataset (~2000 rows after stratified sampling) — LR sits below the
+# qwen3-8b default of 2e-4 and weight_decay is raised so the LoRA adapter
+# can't memorise the train set and forget pretrained knowledge. The exact LR
+# (1e-4) was selected by the configs/sweeps/fpb_lr_rank.yaml sweep over
+# {2e-5, 5e-5, 1e-4} × rank {4, 8}; it minimised val eval_loss (0.0400) by
+# ~20% vs the runner-up at this train budget — see results/sweeps/fpb_lr_rank/
+# summary.json. The earlier value (2e-5) was tuned for a ~600-row balanced
+# pool and is now too conservative.
+# early_stopping_patience=1 (vs the global default of 3): val loss bottoms
+# fast (~epoch 1) then climbs (clear overfit signature). Tighter patience
+# stops at the next worsening eval rather than burning 3 more evals before
+# load_best restores the optimum — same final model, ~25% less compute.
 training_overrides:
-  learning_rate: 2.0e-5
+  learning_rate: 1.0e-4
   weight_decay: 0.1
   warmup_ratio: 0.1
+  early_stopping_patience: 1
+
+# Lower-rank adapter (rank 8 vs the model default 16). With only ~2000 train
+# rows on a 3-class task, rank 16 has more capacity than the data can usefully
+# fill — the baseline run shows eval_loss bottoming at epoch ~1 then climbing
+# (overfit). Halving rank tightens the parameter budget; alpha is halved in
+# step to preserve the alpha/r ratio (rslora's effective scale is alpha/√r).
+lora_overrides:
+  rank: 8
+  alpha: 16

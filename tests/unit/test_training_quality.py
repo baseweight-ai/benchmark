@@ -214,14 +214,43 @@ def test_no_params_returns_single_base_trial():
 def test_apply_params_routes_lora_keys():
     from run_sweep import _apply_params
     import train_local
-    base = train_local.load_model_config("qwen2.5-0.5b")
-    result = _apply_params(base, {"lora_rank": 16, "learning_rate": 5e-4}, "test-sw00")
-    assert result.lora["rank"] == 16
-    assert result.training["learning_rate"] == 5e-4
-    assert result.model_short == "test-sw00"
-    # Base model unchanged
-    assert base.lora["rank"] == 4
-    assert base.model_short == "qwen2.5-0.5b"
+    base_model = train_local.load_model_config("qwen2.5-0.5b")
+    base_task = train_local.TaskConfig(task_id="t")
+    model_cfg, task_cfg = _apply_params(
+        base_model, base_task, {"lora_rank": 16, "learning_rate": 5e-4}, "test-sw00"
+    )
+    # Sweep params land in task overrides — same mechanism as fpb's
+    # lora_overrides — so train_one's merge precedence (sweep > task > model)
+    # is uniform regardless of where the override came from.
+    assert task_cfg.lora_overrides == {"rank": 16}
+    assert task_cfg.training_overrides == {"learning_rate": 5e-4}
+    assert model_cfg.model_short == "test-sw00"
+    # Base model and base task unchanged
+    assert base_model.lora["rank"] == 4
+    assert base_model.model_short == "qwen2.5-0.5b"
+    assert base_task.lora_overrides is None
+    assert base_task.training_overrides is None
+
+
+def test_apply_params_layers_onto_existing_task_overrides():
+    """Sweep params merge with the task's own overrides; the sweep value wins
+    when keys collide. This is what lets `fpb` carry alpha=16 in its task
+    config while the sweep varies `rank` independently."""
+    from run_sweep import _apply_params
+    import train_local
+    base_model = train_local.load_model_config("qwen2.5-0.5b")
+    base_task = train_local.TaskConfig(
+        task_id="t",
+        lora_overrides={"rank": 8, "alpha": 16},
+        training_overrides={"learning_rate": 2e-5, "weight_decay": 0.1},
+    )
+    _, task_cfg = _apply_params(
+        base_model, base_task, {"lora_rank": 4, "learning_rate": 5e-5}, "test-sw01"
+    )
+    # Sweep's lora_rank=4 overrides task's rank=8; alpha=16 persists.
+    assert task_cfg.lora_overrides == {"rank": 4, "alpha": 16}
+    # Sweep's learning_rate overrides task's; weight_decay persists.
+    assert task_cfg.training_overrides == {"learning_rate": 5e-5, "weight_decay": 0.1}
 
 
 # ── _verify_completion_masking ─────────────────────────────────────────────────

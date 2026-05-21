@@ -1,0 +1,47 @@
+# FPB hyperparameter sweep — find best (learning_rate, lora_rank) under the
+# new stratified+2000 train pool. Six trials, ranked by held-out val
+# eval_loss.
+#
+# Run:
+#   python scripts/prepare_datasets.py --task fpb   # only if fpb.yaml changed
+#   python scripts/run_sweep.py --config configs/sweeps/fpb_lr_rank.yaml
+#
+# Why these axes
+#   lr: the global qwen3-8b default is 2e-4; fpb's task override is 2e-5
+#       (chosen for the tiny ~600-row balanced pool). With ~3.3× more data
+#       and lower-capacity adapters, the LR-noise tradeoff shifts — sweep
+#       2e-5, 5e-5, 1e-4 to find the new sweet spot.
+#   lora_rank: the model default is 16; the baseline run shows overfit at
+#       rank=16 (eval loss bottoms at epoch ~1 then climbs). Try 4 and 8.
+#
+# Why sampling is NOT a sweep axis
+#   The user's checklist names "sampling" as a third axis, but sweeping it
+#   would require running a different prepared dataset per trial (the train
+#   sampling shape is fixed by prepare_datasets, upstream of training). We
+#   instead make stratified+2000 the new default (configs/tasks/fpb.yaml)
+#   and validate it by comparing the best sweep trial to the existing
+#   rank=16/balanced=200 baseline (macro_f1 = 0.7986 ± 0.0208). If the new
+#   sampling is net-negative, the sweep winner will fall short of that bar.
+#
+# Why alpha is not swept
+#   fpb.yaml's lora_overrides pin alpha=16 (paired to rank=8). Sweep params
+#   only override rank; alpha=16 persists through `_apply_params`'s
+#   merge-with-task-overrides path, so every trial uses alpha=16 regardless
+#   of rank. This biases rank=4 toward a hotter effective update magnitude
+#   (alpha/√r = 8 vs the model default's 8 at rank=16, alpha=32) — a known
+#   confound; the sweep is exploratory, not a clean ablation of rank alone.
+#
+# Ranking
+#   run_sweep.py sorts trials by eval_loss on the held-out val split
+#   (300 stratified rows). The best trial's adapter is the candidate for
+#   promotion to fpb's production LoRA condition.
+name: fpb_lr_rank
+model: qwen3-8b
+task: fpb
+smoke_test: false
+
+search: grid
+
+params:
+  learning_rate: [2.0e-5, 5.0e-5, 1.0e-4]
+  lora_rank: [4, 8]

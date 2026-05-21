@@ -1,0 +1,32 @@
+# banking77 hyperparameter sweep — find best (learning_rate, lora_rank) on
+# the new stratified+5000 train pool. Six trials, ranked by held-out val
+# eval_loss. Same template as configs/sweeps/fpb_lr_rank.yaml; each task gets
+# its own sweep because the (data-size × num-classes × prompt-length) shape
+# differs enough that the FPB winner (lr=1e-4, rank=8) is not transferable.
+#
+# Run:
+#   python scripts/prepare_datasets.py --task banking77   # if banking77.yaml changed
+#   python scripts/run_sweep.py --config configs/sweeps/banking77_lr_rank.yaml
+#
+# Axis choices
+#   lr: 3 points spanning the FPB winner (1e-4) up an order of magnitude;
+#       77 classes + 5000 rows + larger prompts (1024 seq_len) may want
+#       different magnitudes than FPB's 3-class setup.
+#   lora_rank: 4 and 8 — both below the qwen3-8b default of 16. The default
+#       isn't included because the FPB baseline showed rank=16 overfit on a
+#       similar data-to-classes ratio; here we expect the same and want to
+#       see if rank=4 or 8 is the sweet spot.
+#   alpha: pinned to the model default (32) by the sweep. The chosen
+#       lora_overrides.alpha is then promoted post-sweep paired to the winning
+#       rank (alpha = 2 × rank to keep alpha/r consistent with the model
+#       baseline's alpha/r = 2).
+name: banking77_lr_rank
+model: qwen3-8b
+task: banking77
+smoke_test: false
+
+search: grid
+
+params:
+  learning_rate: [2.0e-5, 5.0e-5, 1.0e-4]
+  lora_rank: [4, 8]

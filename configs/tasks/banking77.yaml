@@ -15,10 +15,18 @@ metric_label: "Weighted F1"
 metric_granularity: per_class_weighted
 max_output_tokens: 32
 lm_eval_task_id: banking77
+# Stratified with a floor: banking77's train pool is nearly balanced
+# (35-187 per class, 77 classes). Test ships balanced (40/class), so the
+# headline reason to switch from `balanced/30` is NOT distribution alignment
+# (it was roughly aligned already) but rather data volume. The previous
+# `per_group_cap=30` discarded 60-80% of available rows on most classes.
+# total_cap=5000 with min_per_group=35 (= the smallest available class) uses
+# ~2× more data and still guarantees every class gets at least 35 rows.
 train_sampling:
-  strategy: balanced
+  strategy: stratified
   stratify_by: label
-  per_group_cap: 30
+  total_cap: 5000
+  min_per_group: 35
   seed: 42
 test_sampling:
   strategy: stratified
@@ -36,3 +44,12 @@ epochs_by_size:
   medium: 5
   large: 3
 max_seq_length: 1024
+
+# early_stopping_patience=1: same compute-saving lesson the FPB sweep
+# documented — when the val-loss curve clearly overfits (bottoms then climbs),
+# stopping at the next worsening eval gives the same final model
+# (load_best_model_at_end restores the optimum) at ~50% less wall time. If
+# this task happens NOT to overfit within the epoch cap, patience setting is
+# moot, so this is free option value.
+training_overrides:
+  early_stopping_patience: 1

@@ -700,11 +700,21 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
         ts = cfg.train_sampling
         val_kwargs = ts.model_dump()
         val_kwargs["seed"] = cfg.val_seed   # val split's own seed (independent, reproducible)
+        n_groups = len({r.get(ts.stratify_by) for r in train_rows}) or 1
         if ts.strategy == "balanced":
-            n_groups = len({r.get(ts.stratify_by) for r in train_rows}) or 1
             val_kwargs["per_group_cap"] = max(1, cfg.val_size // n_groups)
         else:
             val_kwargs["total_cap"] = cfg.val_size
+        # Clamp min_per_group so the floor can't exceed an even split of the
+        # val budget. A train_sampling config that floors the minority class at
+        # (say) 300 to give the model enough negative supervision is the right
+        # call for a ~2000-row train pool, but inheriting that floor verbatim
+        # for a ~300-row val makes the floor exceed val_size/n_groups and
+        # silently inflates val to floor*n_groups (e.g. 900 rows from a
+        # val_size=300 budget). The clamp keeps the val honest to val_size.
+        floor_cap = max(1, cfg.val_size // n_groups)
+        if val_kwargs.get("min_per_group", 1) > floor_cap:
+            val_kwargs["min_per_group"] = floor_cap
         val_rows = sample(train_rows, **val_kwargs)
         # Partition by object identity: sample() returns the same dict objects,
         # so id() removes exactly the rows drawn — train and val stay disjoint.

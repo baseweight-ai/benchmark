@@ -403,6 +403,40 @@ def test_run_eval_skips_existing(tmp_path, monkeypatch):
     assert out.read_text() == '{"id":"existing"}\n'
 
 
+def test_eval_fingerprint_changes_when_adapter_changes(tmp_path, monkeypatch):
+    """Regression: a LoRA adapter rewrite must change the prediction fingerprint
+    so the pre-filter invalidates stale predictions and re-evaluates against the
+    new adapter. Without this, retraining a LoRA leaves the old predictions in
+    place and downstream metrics silently report the old run's accuracy.
+    """
+    from eval_local import _eval_fingerprint
+
+    monkeypatch.setattr(eval_local, "REPO_ROOT", tmp_path)
+    _write_test_data(tmp_path, n=3)
+
+    # Stub the prompt sidecar so the fingerprint has a stable prompt_sha.
+    (tmp_path / "data" / "prepared" / "fpb" / "prompt_sha.txt").write_text("dummy_sha\n")
+
+    adapter_dir = tmp_path / "results" / "adapters" / "local" / "qwen2.5-0.5b" / "fpb" / "lora"
+    adapter_dir.mkdir(parents=True, exist_ok=True)
+    (adapter_dir / "adapter_model.safetensors").write_bytes(b"adapter_v1_weights")
+    fp1 = _eval_fingerprint(_model_cfg(), "fpb", "lora", _task_cfg(), eval_seed=0, concurrency=4)
+
+    # Rewrite the adapter (simulates a retrain) — fingerprint must shift.
+    (adapter_dir / "adapter_model.safetensors").write_bytes(b"adapter_v2_weights_DIFFERENT")
+    fp2 = _eval_fingerprint(_model_cfg(), "fpb", "lora", _task_cfg(), eval_seed=0, concurrency=4)
+    assert fp1 != fp2, "fingerprint must invalidate when the LoRA adapter changes"
+
+    # The non-lora condition does NOT incorporate the adapter, so its
+    # fingerprint stays stable across the same adapter rewrite.
+    fp_zs = _eval_fingerprint(_model_cfg(), "fpb", "zero-shot", _task_cfg(),
+                              eval_seed=0, concurrency=4)
+    (adapter_dir / "adapter_model.safetensors").write_bytes(b"adapter_v3_weights_DIFFERENT_AGAIN")
+    fp_zs_again = _eval_fingerprint(_model_cfg(), "fpb", "zero-shot", _task_cfg(),
+                                    eval_seed=0, concurrency=4)
+    assert fp_zs == fp_zs_again, "zero-shot fingerprint must not depend on the lora adapter"
+
+
 def test_run_eval_dry_run_all_tasks(tmp_path, monkeypatch):
     """dry-run succeeds for every registered task (catches missing/broken task configs)."""
     # Load real configs before redirecting REPO_ROOT to tmp_path

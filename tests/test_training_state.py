@@ -352,14 +352,17 @@ def test_task_config_training_overrides_roundtrip(overrides, expected):
 
 @pytest.mark.unit
 def test_fpb_yaml_specifies_anti_overfit_overrides():
-    """FPB (~600 train rows) keeps reduced LR + raised weight_decay so the
-    LoRA adapter can't memorise the train set and forget pretrained knowledge.
+    """FPB (~2000 train rows after stratified sampling) keeps LR below the
+    qwen3-8b default of 2e-4 and weight_decay raised so the LoRA adapter
+    can't memorise the train set and forget pretrained knowledge. The exact
+    LR was chosen by the configs/sweeps/fpb_lr_rank.yaml sweep; the bound
+    here is a guardrail against accidentally regressing to the model default.
     Thresholded (not equality) so values can be tuned without churning tests.
     """
     import train_local as train
     cfg = train.load_task_config("fpb")
     assert cfg.training_overrides is not None
-    assert cfg.training_overrides.get("learning_rate", 2e-4) <= 4e-5
+    assert cfg.training_overrides.get("learning_rate", 2e-4) <= 1.5e-4
     assert cfg.training_overrides.get("weight_decay", 0.01) >= 0.05
 
 
@@ -391,3 +394,88 @@ def test_training_overrides_change_invalidates_cache(tmp_path):
     base = hash_for(None)
     tweaked = hash_for({"learning_rate": 5e-5})
     assert base != tweaked
+
+
+# ── TaskConfig lora_overrides ─────────────────────────────────────────────────
+
+@pytest.mark.unit
+@pytest.mark.parametrize("overrides,expected", [
+    ({"rank": 8}, {"rank": 8}),
+    ({"rank": 4, "alpha": 8}, {"rank": 4, "alpha": 8}),
+    (None, None),
+])
+def test_task_config_lora_overrides_roundtrip(overrides, expected):
+    from train_local import TaskConfig
+    cfg = TaskConfig(task_id="x", lora_overrides=overrides)
+    assert cfg.lora_overrides == expected
+
+
+@pytest.mark.unit
+def test_lora_overrides_merge_replaces_model_defaults():
+    """lora_overrides keys overwrite model_cfg.lora; unspecified keys persist."""
+    model_lora = {"rank": 16, "alpha": 32, "dropout": 0.05, "use_rslora": True}
+    overrides = {"rank": 8, "alpha": 16}
+    merged = {**model_lora, **overrides}
+    assert merged == {"rank": 8, "alpha": 16, "dropout": 0.05, "use_rslora": True}
+
+
+@pytest.mark.unit
+def test_lora_overrides_change_invalidates_cache(tmp_path):
+    """Tweaking lora_overrides must change input_hash — otherwise a cached
+    run with rank=16 silently skips a retrain that wanted rank=8."""
+    from pipeline.cache import training_inputs_hash
+
+    data_path = tmp_path / "train.jsonl"
+    data_path.write_text('{"messages":[]}\n')
+    model_lora = {"rank": 16, "alpha": 32}
+
+    def hash_for(overrides: dict | None) -> str:
+        merged = dict(model_lora)
+        if overrides:
+            merged.update(overrides)
+        return training_inputs_hash(data_path, {"lora": merged})
+
+    base = hash_for(None)
+    tweaked = hash_for({"rank": 8})
+    assert base != tweaked
+
+
+@pytest.mark.unit
+def test_train_one_applies_lora_overrides_to_hw_cfg(monkeypatch, tmp_path):
+    """train_one merges lora_overrides into model_cfg.lora before ConfigFactory
+    builds hw_cfg, so the resolved lora_rank/alpha reflect the override."""
+    import train_local as train
+
+    data_path = tmp_path / "train.jsonl"
+    data_path.write_text('{"messages":[]}\n')
+
+    # Redirect all path helpers under train_one's namespace into tmp_path so
+    # the test never writes to the repo's checkpoints/ or results/ dirs.
+    monkeypatch.setattr(train, "adapter_path", lambda *a, **kw: tmp_path / "adapter")
+    monkeypatch.setattr(train, "training_meta_path",
+                        lambda *a, **kw: tmp_path / "training" / "metadata.json")
+    monkeypatch.setattr(train, "checkpoint_dir", lambda *a, **kw: tmp_path / "ckpt")
+
+    model_cfg = train.ModelConfig(
+        model_id="m", model_short="m",
+        lora={"rank": 16, "alpha": 32, "dropout": 0.05},
+        training={"learning_rate": 2e-4},
+    )
+    task_cfg = train.TaskConfig(task_id="t", lora_overrides={"rank": 4, "alpha": 8})
+
+    captured: dict = {}
+
+    def fake_build(mcfg, tcfg, smoke):
+        captured["lora"] = dict(mcfg.lora)
+        # Return a real HardwareConfig so train_one doesn't crash before dry-run exits.
+        return train.HardwareConfig(
+            device="cpu", load_dtype=None, load_in_4bit=False, use_grad_ckpt=False,
+            lora_rank=mcfg.lora.get("rank", 16), lora_alpha=mcfg.lora.get("alpha", 32),
+            seq_len=512,
+        )
+
+    monkeypatch.setattr(train.ConfigFactory, "build", staticmethod(fake_build))
+    train.train_one(model_cfg, task_cfg, data_path, dry_run=True, smoke_test=False)
+    assert captured["lora"]["rank"] == 4
+    assert captured["lora"]["alpha"] == 8
+    assert captured["lora"]["dropout"] == 0.05  # unspecified key persists
