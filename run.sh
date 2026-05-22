@@ -211,6 +211,34 @@ fi
 # Deferred when --setup will create/recreate it.
 # ---------------------------------------------------------------------------
 CONDA_ENV_PREFIX="${REPO_ROOT}/.conda-envs/baseweight-benchmark"
+
+# Source the env's activate.d/*.sh hooks (HF_HOME, VLLM_CACHE_ROOT, TRITON_CACHE_DIR,
+# TORCHINDUCTOR_CACHE_DIR, PIP_CACHE_DIR — all redirect caches off the small /root
+# overlay onto the /workspace volume). We invoke ${CONDA_ENV_PREFIX}/bin/python
+# directly rather than `conda activate`, so without this the hooks never fire and
+# every subprocess defaults HF_HOME to /root/.cache/huggingface, filling the 20 GB
+# overlay after one model download (observed: vLLM fails mid-eval with ENOSPC).
+# The hooks key off CONDA_PREFIX (normally set by `conda activate`). Set it ONLY
+# for the duration of sourcing, then restore the caller's value exactly: the
+# --clean/--setup path keys its `conda deactivate` on CONDA_PREFIX, so leaving it
+# pointed at this env (when the caller had a different env, or none, active) would
+# mis-trigger that branch. The cache vars the hooks export don't depend on
+# CONDA_PREFIX after sourcing, so restoring it is safe.
+if [[ -d "${CONDA_ENV_PREFIX}/etc/conda/activate.d" ]]; then
+    _had_conda_prefix="${CONDA_PREFIX+set}"          # "set" if defined (even empty), else ""
+    _saved_conda_prefix="${CONDA_PREFIX:-}"
+    CONDA_PREFIX="${CONDA_ENV_PREFIX}"
+    for _hook in "${CONDA_ENV_PREFIX}/etc/conda/activate.d/"*.sh; do
+        [[ -f "$_hook" ]] && source "$_hook"
+    done
+    if [[ -n "$_had_conda_prefix" ]]; then
+        CONDA_PREFIX="$_saved_conda_prefix"
+    else
+        unset CONDA_PREFIX
+    fi
+    unset _hook _had_conda_prefix _saved_conda_prefix
+fi
+
 _resolve_python() {
     if [[ ! -x "${CONDA_ENV_PREFIX}/bin/python" ]]; then
         echo "Error: conda env not found at ${CONDA_ENV_PREFIX}. Run: ${REPO_ROOT}/start.sh" >&2

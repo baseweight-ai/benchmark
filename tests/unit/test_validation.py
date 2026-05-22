@@ -225,6 +225,19 @@ class TestCheckContamination:
         hits = check_contamination(train, test)
         assert len(hits) == 2
 
+    def test_covers_test_full_pool(self):
+        """REGRESSION: a train row overlapping the test_full pool (not the
+        sampled canonical test) must be caught. prepare_datasets passes
+        `fmt_test + fmt_test_full`; multi-seed eval resamples from test_full, so
+        an overlap there contaminates seeds 1+ even when seed-0 is clean.
+        """
+        train = [self._train("only in the multiseed pool")]
+        canonical_test = [self._test("some seed-0 prompt")]      # no overlap here
+        test_full = [self._test("only in the multiseed pool")]   # overlap lives here
+        # Mirrors the call site: union of canonical test and the full pool.
+        assert check_contamination(train, canonical_test) == []          # old behavior missed it
+        assert len(check_contamination(train, canonical_test + test_full)) == 1  # new behavior catches it
+
 
 # ── reject_test_path ───────────────────────────────────────────────────────────
 

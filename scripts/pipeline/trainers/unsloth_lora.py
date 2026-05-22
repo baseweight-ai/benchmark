@@ -211,6 +211,17 @@ class UnslothLoRATrainer(Trainer):
             output_dir=str(spec.ckpt_dir),
             num_train_epochs=spec.epochs,
             per_device_train_batch_size=training_cfg.get("per_device_train_batch_size", 4),
+            # Eval batch must never exceed the train batch: eval is forward-only, so
+            # if a train step (forward+backward) fits at batch B, eval fits at B too.
+            # HF's default (8) is independent of train batch and silently OOMs on
+            # long-sequence tasks — it materializes logits of batch×seq×vocab during
+            # the eval-loss cross_entropy (e.g. CUAD seq=2560 OOM'd at the first eval
+            # even after the train batch was halved). Default eval batch to the train
+            # batch unless explicitly overridden.
+            per_device_eval_batch_size=training_cfg.get(
+                "per_device_eval_batch_size",
+                training_cfg.get("per_device_train_batch_size", 4),
+            ),
             gradient_accumulation_steps=training_cfg.get("gradient_accumulation_steps", 4),
             learning_rate=float(training_cfg.get("learning_rate", 2e-4)),
             lr_scheduler_type=training_cfg.get("lr_scheduler_type", "cosine"),

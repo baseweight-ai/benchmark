@@ -52,4 +52,9 @@ max_seq_length: 1024
 # this task happens NOT to overfit within the epoch cap, patience setting is
 # moot, so this is free option value.
 training_overrides:
+  learning_rate: 5.0e-5
   early_stopping_patience: 1
+
+lora_overrides:
+  rank: 4
+  alpha: 8

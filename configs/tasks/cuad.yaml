@@ -75,3 +75,30 @@ max_seq_length: 2560
 context_max_tokens: 750
 context_stride_tokens: 600          # window step — 150-word overlap between windows
 max_chunks: 12                      # cap on windows emitted per test contract
+
+# HPs TRANSFERRED (not swept) from banking77, adjusted for the extraction task
+# type. lr=5e-5 is banking77's swept winner; extraction's training dynamics are
+# unknown in this pipeline, so sweep retroactively only if the final result
+# beats GPT by <5 pts. early_stopping_patience=2 (NOT 1 like the classification
+# tasks): extraction loss has a different noise profile and we have no
+# banking77-equivalent val-curve prior to justify patience=1; 2 still cuts ~33%
+# off the default (=3) while keeping one noise-confirmation eval.
+training_overrides:
+  learning_rate: 5.0e-5
+  early_stopping_patience: 2
+  # seq_len=2560 (vs banking77's 1024) makes per-batch memory ~2.5× on a 24 GB
+  # 3090. Micro-batch 2 (with accum 8 to hold EFFECTIVE batch = 16, identical to
+  # the other tasks so the transferred LR stays valid) gives the training step
+  # ~2× headroom for the rare near-cap rows. The eval batch tracks the train
+  # batch automatically (see unsloth_lora.py) — without that, HF's default eval
+  # batch of 8 OOM'd at the first eval even though the train steps fit.
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 8
+
+# rank=8 (vs banking77's rank=4): span extraction engages more model capacity
+# than label selection (the model must learn to copy verbatim and to abstain),
+# so it warrants more headroom. alpha=16 keeps the paired alpha/r = 2; with
+# rslora the effective scale is 2*sqrt(8)=5.66 vs rank-4's 4.0 — a gentle bump.
+lora_overrides:
+  rank: 8
+  alpha: 16

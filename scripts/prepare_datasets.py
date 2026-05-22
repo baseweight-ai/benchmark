@@ -401,22 +401,55 @@ def chunk_cuad_train(
     return out
 
 
+# ── Eval-row identity ───────────────────────────────────────────────────────
+# Eval ids must be CONTENT-addressed, not positional. The canonical test sample
+# (test.jsonl) and the multi-seed pool (test_full.jsonl) are written from
+# different row orderings, so a positional id (`{task}_test_{i:04d}`) assigns the
+# same string to different rows across the two files — joining prediction files
+# by id then silently mixes unrelated rows (mismatched ground_truth). Hashing the
+# row's content makes a given row's id identical no matter which pool it lands in.
+
+def eval_row_id(task_id: str, user_prompt: str, precomputed_id: Optional[str] = None) -> str:
+    """Stable eval-row id: a precomputed id (CUAD chunks) or a hash of the prompt."""
+    if precomputed_id:
+        return precomputed_id
+    h = hashlib.sha1(user_prompt.encode("utf-8")).hexdigest()[:12]
+    return f"{task_id}_test_{h}"
+
+
+def cuad_question_hash(clause_type: str, full_context: str) -> str:
+    """Stable per-question hash for CUAD: (clause_type, full contract), pre-chunking.
+
+    Keyed on `clause_type` + `full_context` — the SAME fields the prompt template
+    renders and that `find_exact_dupes` deduplicates on (prompts/cuad.json formats
+    {context} and {clause_type}). Using the dedup key makes hash-uniqueness follow
+    directly from the upstream exact-dedup, rather than keying on `question` (which
+    the prompt does not use) where two distinct prompts could share a hash.
+    """
+    payload = (str(clause_type) + "\x00" + (full_context or "")).encode("utf-8")
+    return hashlib.sha1(payload).hexdigest()[:12]
+
+
 def chunk_cuad_test(
     rows: list[dict], window: int, stride: int, max_chunks: int
 ) -> list[dict]:
     """Expand each CUAD test question into one row per sliding window.
 
     Each emitted row carries a stable `_eval_id` of the form
-    `cuad_test_{q:04d}_chunk{c:02d}`. classify_errors strips the `_chunkNN`
+    `cuad_test_{qhash}_chunk{c:02d}`. classify_errors strips the `_chunkNN`
     suffix to aggregate the per-window predictions back to one score per
-    question.
+    question. The question hash (see `cuad_question_hash`) is content-derived so
+    a question keeps its id whether it was drawn into the canonical test sample
+    or the test_full multi-seed pool (which are chunked separately).
     """
     out: list[dict] = []
-    for q_idx, r in enumerate(rows):
-        windows = sliding_windows(r.get("context", "") or "", window, stride, max_chunks)
+    for r in rows:
+        full_context = r.get("context", "") or ""
+        q_hash = cuad_question_hash(r.get("clause_type", ""), full_context)
+        windows = sliding_windows(full_context, window, stride, max_chunks)
         for c_idx, w in enumerate(windows):
             out.append({**r, "context": w,
-                        "_eval_id": f"cuad_test_{q_idx:04d}_chunk{c_idx:02d}"})
+                        "_eval_id": f"cuad_test_{q_hash}_chunk{c_idx:02d}"})
     return out
 
 
@@ -674,8 +707,17 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
                    f"{len(test_rows)} windowed prompts (window={cuad_window}w, "
                    f"stride={cuad_stride}w, max {cfg.max_chunks} windows/contract)")
 
-    click.echo(f"  [{cfg.task_id}] Cross-split deduplication ({len(train_rows)} train × {len(test_rows)} test)...")
-    cross_res  = cross_split_near_dupes(raw_train_texts, raw_test_texts, threshold=0.9)
+    # Dedup train against the FULL eval pool (test_full), not only the sampled
+    # test set: multi-seed eval (seeds 1+) resamples from test_full.jsonl, so a
+    # train↔test_full near-duplicate would contaminate those seeds even though
+    # the canonical seed-0 test is clean. test_rows_full is the superset the
+    # sampled test was drawn from; fall back to test_rows when no full pool exists.
+    raw_eval_texts = (
+        [format_user(prompt, r) for r in test_rows_full]
+        if test_rows_full is not None else raw_test_texts
+    )
+    click.echo(f"  [{cfg.task_id}] Cross-split deduplication ({len(train_rows)} train × {len(raw_eval_texts)} eval-pool)...")
+    cross_res  = cross_split_near_dupes(raw_train_texts, raw_eval_texts, threshold=0.9)
     cross_drop = set(cross_res["train_indices_to_filter"])
     if cross_drop:
         train_rows = [r for i, r in enumerate(train_rows) if i not in cross_drop]
@@ -747,9 +789,15 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
         return out
 
     def _eval_row_id(r: dict, i: int) -> str:
-        # Chunked tasks (CUAD) precompute a stable per-window id so chunks of one
-        # question stay linked; everything else uses positional enumeration.
-        return r.get("_eval_id") or f"{cfg.task_id}_test_{i:04d}"
+        # Content-addressed id (see eval_row_id): chunked tasks (CUAD) carry a
+        # precomputed _eval_id; everything else hashes the formatted user prompt.
+        # Compute the prompt lazily — only when no precomputed id exists — so the
+        # ~19k chunked CUAD rows don't re-template a contract window that's then
+        # discarded. `i` is retained for signature stability (no longer positional).
+        precomputed = r.get("_eval_id")
+        if precomputed:
+            return precomputed
+        return eval_row_id(cfg.task_id, format_user(prompt, r))
 
     def fmt_labels(rows: list[dict]) -> list[dict]:
         # format_eval_label, not format_assistant: the label is the gold answer
@@ -776,6 +824,30 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
     fmt_test  = fmt_test_prompts(src_test)
     fmt_labs  = fmt_labels(src_test)
 
+    # Format the full unsampled test pool once: it backs multi-seed resampling
+    # (written below) and must also be covered by the contamination guard.
+    write_full = test_rows_full is not None and len(test_rows_full) > len(src_test)
+    fmt_test_full = fmt_test_prompts(test_rows_full) if write_full else []
+
+    # Eval ids must be unique within each file: classify_errors and the eval
+    # loaders key on id, so a collision would silently merge two distinct eval
+    # items (or drop one when rows are loaded into an id-keyed dict). Content
+    # hashing makes this near-impossible, but fail loudly rather than ship the
+    # corruption — a same-prompt pair that escaped dedup, or a truncated-hash
+    # collision, would otherwise pass unnoticed.
+    def _assert_unique_eval_ids(rows: list[dict], label: str) -> None:
+        ids = [r["id"] for r in rows]
+        if len(ids) != len(set(ids)):
+            from collections import Counter
+            dupes = [i for i, c in Counter(ids).items() if c > 1]
+            raise RuntimeError(
+                f"[{cfg.task_id}] {len(dupes)} duplicate eval id(s) in {label} "
+                f"(e.g. {dupes[:3]}) — eval ids must be unique per file."
+            )
+    _assert_unique_eval_ids(fmt_test, "test")
+    if fmt_test_full:
+        _assert_unique_eval_ids(fmt_test_full, "test_full")
+
     train_and_val = fmt_train + fmt_val
     _, invalid_train = validate_dataset(train_and_val)
     if invalid_train:
@@ -783,9 +855,12 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
         for row in invalid_train[:3]:
             click.echo(f"    {row['validation_error']}", err=True)
 
-    contam_hits = check_contamination(train_and_val, fmt_test)
+    # Guard against train/val overlap with BOTH the canonical test and the
+    # test_full pool. Seeds 1+ resample from test_full, so an overlap there
+    # contaminates those seeds even when seed-0 (the canonical test) is clean.
+    contam_hits = check_contamination(train_and_val, fmt_test + fmt_test_full)
     if contam_hits:
-        click.echo(f"  WARNING [{cfg.task_id}]: {len(contam_hits)} training example(s) overlap test set", err=True)
+        click.echo(f"  WARNING [{cfg.task_id}]: {len(contam_hits)} training example(s) overlap test/test_full set", err=True)
         for hit in contam_hits[:3]:
             click.echo(f"    {hit}", err=True)
         if not smoke_test:
@@ -804,9 +879,9 @@ def process_task(cfg: TaskConfig, dry_run: bool, smoke_test: bool = False) -> No
     write_jsonl(fmt_labs,  out_dir / f"{prefix}test_labels.jsonl")
 
     # Save full unsampled test set when sampling reduced it — enables multi-seed resampling.
-    if test_rows_full is not None and len(test_rows_full) > len(src_test):
-        write_jsonl(fmt_test_prompts(test_rows_full), out_dir / "test_full.jsonl")
-        write_jsonl(fmt_labels(test_rows_full),       out_dir / "test_full_labels.jsonl")
+    if write_full:
+        write_jsonl(fmt_test_full,                out_dir / "test_full.jsonl")
+        write_jsonl(fmt_labels(test_rows_full),   out_dir / "test_full_labels.jsonl")
 
     # ── Quality report: prepared-data stats ───────────────────────────────
     prep_train_texts = [

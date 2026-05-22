@@ -6,6 +6,8 @@ import pytest
 from prepare_datasets import (
     chunk_cuad_test,
     chunk_cuad_train,
+    cuad_question_hash,
+    eval_row_id,
     format_assistant,
     format_eval_label,
     format_gold,
@@ -524,13 +526,122 @@ def test_chunk_cuad_test_one_row_per_window_with_stable_ids():
     ctx = " ".join(str(i) for i in range(100))
     rows = chunk_cuad_test([_cuad_row(ctx, "5 6 7")], window=20, stride=20, max_chunks=10)
     assert len(rows) >= 2
-    assert rows[0]["_eval_id"] == "cuad_test_0000_chunk00"
-    assert rows[1]["_eval_id"] == "cuad_test_0000_chunk01"
+    # All windows of one question share a content hash prefix; chunk suffix counts up.
+    qhash = cuad_question_hash("Governing Law", ctx)
+    assert rows[0]["_eval_id"] == f"cuad_test_{qhash}_chunk00"
+    assert rows[1]["_eval_id"] == f"cuad_test_{qhash}_chunk01"
 
 
 def test_chunk_cuad_test_distinct_questions_get_distinct_ids():
+    # A CUAD eval question is identified by (clause_type, context) — the fields
+    # the prompt renders. Same context, different clause_type → different ids.
     ctx = " ".join(str(i) for i in range(60))
-    rows = chunk_cuad_test([_cuad_row(ctx, "1"), _cuad_row(ctx, "2")],
+    r1 = {**_cuad_row(ctx, "1"), "clause_type": "Governing Law"}
+    r2 = {**_cuad_row(ctx, "2"), "clause_type": "Termination For Convenience"}
+    rows = chunk_cuad_test([r1, r2], window=20, stride=20, max_chunks=10)
+    prefixes = {r["_eval_id"].rsplit("_chunk", 1)[0] for r in rows}
+    assert len(prefixes) == 2  # two distinct question hashes
+
+
+def test_chunk_cuad_test_question_id_is_position_independent():
+    """REGRESSION: the same question gets the same id regardless of its index.
+
+    This is the core bug — test.jsonl and test_full.jsonl chunk the same
+    question at different positions; a positional id collided across the two.
+    """
+    ctx_a = " ".join(str(i) for i in range(60))
+    ctx_b = " ".join(str(i) for i in range(60, 120))
+    qa = {**_cuad_row(ctx_a, "1"), "clause_type": "Governing Law"}
+    qb = {**_cuad_row(ctx_b, "2"), "clause_type": "Audit Rights"}
+
+    # qa at position 0 (mimics canonical test) vs position 1 (mimics test_full)
+    first  = chunk_cuad_test([qa, qb], window=20, stride=20, max_chunks=10)
+    second = chunk_cuad_test([qb, qa], window=20, stride=20, max_chunks=10)
+
+    def ids_for(rows, clause):
+        return [r["_eval_id"] for r in rows if r["clause_type"] == clause]
+
+    assert ids_for(first, "Governing Law") == ids_for(second, "Governing Law")
+    assert ids_for(first, "Audit Rights") == ids_for(second, "Audit Rights")
+
+
+# ── eval_row_id (non-chunked tasks) ──────────────────────────────────────────
+
+def test_eval_row_id_is_content_addressed():
+    """Same prompt → same id; different prompt → different id."""
+    a = eval_row_id("banking77", "How do I unblock my PIN?")
+    b = eval_row_id("banking77", "How do I unblock my PIN?")
+    c = eval_row_id("banking77", "Where can I use my card?")
+    assert a == b           # deterministic
+    assert a != c           # distinguishes rows
+    assert a.startswith("banking77_test_")
+
+
+def test_eval_row_id_position_independent():
+    """REGRESSION: a row's id does not depend on its position in the file.
+
+    The old scheme used `{task}_test_{i:04d}`, so row N of test.jsonl and row N
+    of test_full.jsonl shared an id while being different rows. A content hash
+    means the same prompt yields the same id no matter where it appears.
+    """
+    prompts = ["q-alpha", "q-beta", "q-gamma"]
+    # ids computed from a 'canonical' ordering vs a 'resampled' ordering
+    canonical = {p: eval_row_id("t", p) for p in prompts}
+    resampled = {p: eval_row_id("t", p) for p in reversed(prompts)}
+    assert canonical == resampled
+
+
+def test_eval_row_id_precomputed_wins():
+    """A precomputed id (CUAD chunk) is returned verbatim."""
+    assert eval_row_id("cuad", "ignored prompt", "cuad_test_abc123_chunk00") == "cuad_test_abc123_chunk00"
+
+
+def test_eval_row_id_not_misread_as_chunked():
+    """A non-chunked task's hash id must NOT look like a CUAD chunk id, or
+    classify_errors.is_chunked would wrongly trigger window-aggregation and
+    question_id would strip a chunk suffix that isn't there.
+    """
+    from utils import is_chunked, question_id
+    rid = eval_row_id("banking77", "How do I unblock my PIN?")
+    assert not is_chunked([{"id": rid}])
+    assert question_id(rid) == rid           # nothing stripped
+
+
+def test_cuad_chunk_ids_are_chunked_and_strip_to_one_question():
+    """CUAD chunk ids ARE detected as chunked, and all windows of one question
+    strip to a single question id (so classify aggregates them together)."""
+    from utils import is_chunked, question_id
+    ctx = " ".join(str(i) for i in range(60))
+    rows = chunk_cuad_test([{**_cuad_row(ctx, "5"), "question": "Governing Law"}],
                            window=20, stride=20, max_chunks=10)
-    assert any(r["_eval_id"].startswith("cuad_test_0000_") for r in rows)
-    assert any(r["_eval_id"].startswith("cuad_test_0001_") for r in rows)
+    # Predictions carry the eval id under `id` (promoted from `_eval_id` by
+    # fmt_test_prompts); is_chunked/question_id operate on that field.
+    pred_like = [{"id": r["_eval_id"]} for r in rows]
+    assert is_chunked(pred_like)
+    qids = {question_id(p["id"]) for p in pred_like}
+    assert len(qids) == 1                    # every window → same question id
+    assert "_chunk" not in next(iter(qids))  # suffix fully stripped
+
+
+def test_chunk_cuad_test_ids_unique_across_questions():
+    """No two windows (across distinct questions) collide on _eval_id."""
+    ctxs = [" ".join(str(i) for i in range(k, k + 60)) for k in (0, 60, 120)]
+    clause_types = ("Governing Law", "Audit Rights", "Insurance")
+    rows = chunk_cuad_test(
+        [{**_cuad_row(c, "1"), "clause_type": q} for c, q in zip(ctxs, clause_types)],
+        window=20, stride=20, max_chunks=10,
+    )
+    ids = [r["_eval_id"] for r in rows]
+    assert len(ids) == len(set(ids))         # all unique, no accidental collision
+
+
+def test_chunk_cuad_test_same_clause_same_contract_collapses_to_one_id():
+    """Two rows with identical (clause_type, context) ARE the same eval question
+    (same rendered prompt), so they correctly share an id — and find_exact_dupes
+    removes such a pair upstream, so the in-file uniqueness guard never trips."""
+    ctx = " ".join(str(i) for i in range(60))
+    r1 = {**_cuad_row(ctx, "1"), "clause_type": "Governing Law"}
+    r2 = {**_cuad_row(ctx, "2"), "clause_type": "Governing Law"}  # same clause+ctx
+    rows = chunk_cuad_test([r1, r2], window=20, stride=20, max_chunks=10)
+    prefixes = {r["_eval_id"].rsplit("_chunk", 1)[0] for r in rows}
+    assert len(prefixes) == 1  # one hash — the dedup key, not the row position
