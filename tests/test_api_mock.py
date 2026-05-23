@@ -264,3 +264,110 @@ def test_run_eval_tagged_task_is_unconstrained(tmp_path, monkeypatch):
                                  _task_cfg(answer_mode="tagged"), dry_run=False))
 
     assert received_rf and all(rf is None for rf in received_rf)
+
+
+# ── Batch-API collect: error-file handling & no silent drops ────────────────
+
+from eval_api import collect_eval_batch
+from pipeline.paths import pred_path as _pred_path
+
+
+class _FakeCounts:
+    completed = 1
+    total = 3
+    failed = 2
+
+
+class _FakeBatch:
+    def __init__(self, output_file_id, error_file_id):
+        self.id = "b1"
+        self.status = "completed"
+        self.output_file_id = output_file_id
+        self.error_file_id = error_file_id
+        self.request_counts = _FakeCounts()
+
+
+def _fake_openai_cls(batch, files):
+    class _Content:
+        def __init__(self, text): self.text = text
+
+    class _Batches:
+        def retrieve(self, _bid): return batch
+
+    class _Files:
+        def content(self, fid): return _Content(files[fid])
+
+    class _Client:
+        def __init__(self, **_kw):
+            self.batches = _Batches()
+            self.files = _Files()
+
+    return _Client
+
+
+def _batch_setup(tmp_path, monkeypatch, files, batch):
+    """Mock the cold deps so collect_eval_batch runs hermetically on tmp_path."""
+    monkeypatch.setattr(eval_api, "REPO_ROOT", tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    rows = [{"id": "r1", "label": "positive"},
+            {"id": "r2", "label": "negative"},
+            {"id": "r3", "label": "neutral"}]
+    monkeypatch.setattr(eval_api, "load_task_config", lambda tid: _task_cfg(tid))
+    monkeypatch.setattr(eval_api, "_load_eval_rows", lambda *a: (rows, [], "PSHA", None))
+    monkeypatch.setattr(eval_api, "_request_shape", lambda *a: ("model-x", None, None, None))
+    monkeypatch.setattr(eval_api, "_eval_fingerprint", lambda **kw: "FP")
+    monkeypatch.setattr(eval_api, "build_messages",
+                        lambda row, fs, cond: [{"role": "user", "content": "u-" + row.get("id", "")}])
+    monkeypatch.setattr(eval_api, "count_answer_tokens", lambda text, model: len(text.split()))
+    monkeypatch.setattr("openai.OpenAI", _fake_openai_cls(batch, files), raising=False)
+    sidecar = tmp_path / "sidecar.json"
+    sidecar.write_text(json.dumps({
+        "batch_id": "b1", "model_id": "gpt-x", "task_id": "fpb",
+        "condition": "zero-shot", "cond_key": "zero-shot", "eval_seed": 0,
+        "smoke_test": False, "fingerprint": "FP", "prompt_sha": "PSHA",
+        "few_shot_hash": None,
+    }))
+    return sidecar, _pred_path(tmp_path, "api", "gpt-x", "fpb", "zero-shot")
+
+
+def test_collect_batch_writes_error_rows_for_failures_and_no_shows(tmp_path, monkeypatch):
+    """Failures land in error_file_id, and some requests may be absent from BOTH
+    files; collect must write a row for every pending request (parity with
+    streaming) — never silently drop one or finalize a short file."""
+    out_line = json.dumps({
+        "custom_id": "r1", "error": None,
+        "response": {"status_code": 200, "body": {
+            "choices": [{"message": {"content": "positive"},
+                         "logprobs": {"content": [{"logprob": -0.1}]}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 1,
+                      "completion_tokens_details": {"reasoning_tokens": 0}}}}})
+    err_line = json.dumps({"custom_id": "r2",
+                           "error": {"code": "rate_limit", "message": "slow"},
+                           "response": None})
+    files = {"OUT": out_line + "\n", "ERR": err_line + "\n"}  # r3 in neither file
+    sidecar, out_path = _batch_setup(tmp_path, monkeypatch, files, _FakeBatch("OUT", "ERR"))
+
+    assert collect_eval_batch(sidecar) is True
+
+    rows = {json.loads(l)["id"]: json.loads(l) for l in out_path.read_text().splitlines()}
+    assert set(rows) == {"r1", "r2", "r3"}                     # nothing dropped
+    assert rows["r1"]["output"] == "positive"
+    assert rows["r2"]["output"].startswith("ERROR")            # surfaced from error_file_id
+    assert rows["r3"]["output"].startswith("ERROR: no batch response")
+    assert out_path.with_suffix(".meta.json").exists()         # fingerprint recorded (adopt-safe)
+
+
+def test_collect_batch_all_failed_none_output_file(tmp_path, monkeypatch):
+    """A completed-but-all-failed batch has output_file_id=None; collect must not
+    crash and must still write an ERROR row for every request."""
+    err_lines = "\n".join(
+        json.dumps({"custom_id": rid, "error": {"code": "x", "message": "boom"},
+                    "response": None})
+        for rid in ("r1", "r2", "r3")) + "\n"
+    files = {"ERR": err_lines}
+    sidecar, out_path = _batch_setup(tmp_path, monkeypatch, files, _FakeBatch(None, "ERR"))
+
+    assert collect_eval_batch(sidecar) is True
+    rows = [json.loads(l) for l in out_path.read_text().splitlines()]
+    assert len(rows) == 3
+    assert all(r["output"].startswith("ERROR") for r in rows)
