@@ -477,6 +477,11 @@ def build_result(
 
 
 
+# NOTE: _cohens_dz / _effect_label / _sign_flip_p_value compute CROSS-TASK
+# significance. They are intentionally NOT surfaced in the v1 comparison —
+# with n≤3 shared tasks such statistics are underpowered and misleading, so the
+# dashboard reports per-task seed CIs instead (see _comparison). Retained as
+# tested utilities for a future benchmark with enough tasks to use them.
 def _cohens_dz(deltas: list[float]) -> Optional[float]:
     """Cohen's d_z (paired effect size) with Hedge's small-sample correction.
 
@@ -555,8 +560,14 @@ def _comparison(results: list[dict], fine_family: str, fine_cond: str, base_fami
     """
     best_fine: dict[str, float] = {}
     best_base: dict[str, float] = {}
+    fine_ci: dict[str, dict] = {}   # per-task seed CI for the winning fine row
+    base_ci: dict[str, dict] = {}
     fine_cp1k: dict[str, list[float]] = {}
     base_cp1k: dict[str, list[float]] = {}
+
+    def _ci(r: dict) -> dict:
+        return {"ci_lo": r.get("metric_ci_lo"), "ci_hi": r.get("metric_ci_hi"),
+                "std": r.get("metric_std"), "n_seeds": r.get("n_seeds")}
 
     for r in results:
         if r["metric_value"] is None:
@@ -573,11 +584,13 @@ def _comparison(results: list[dict], fine_family: str, fine_cond: str, base_fami
         if r["family"] == fine_family and r["condition"] == fine_cond:
             if mv > best_fine.get(tid, -1):
                 best_fine[tid] = mv
+                fine_ci[tid] = _ci(r)
             if r.get("cost_per_1k_correct") is not None:
                 fine_cp1k.setdefault(tid, []).append(r["cost_per_1k_correct"])
         if r["family"] == base_family and r["condition"] == base_cond:
             if mv > best_base.get(tid, -1):
                 best_base[tid] = mv
+                base_ci[tid] = _ci(r)
             if r.get("cost_per_1k_correct") is not None:
                 base_cp1k.setdefault(tid, []).append(r["cost_per_1k_correct"])
 
@@ -600,25 +613,27 @@ def _comparison(results: list[dict], fine_family: str, fine_cond: str, base_fami
         m = len(s) // 2
         return s[m] if len(s) % 2 else (s[m - 1] + s[m]) / 2
 
-    p_value = _sign_flip_p_value(acc_deltas) if acc_deltas else None
-    # Cohen's d_z: standardised effect size on per-task accuracy gains.
-    # Complements the sign-flip p-value — p-value answers "is the gain real?",
-    # d_z answers "how large is it relative to cross-task variability?"
-    # Note: with n≤5 tasks, both statistics have wide CIs; interpret directionally.
-    dz = _cohens_dz(acc_deltas) if acc_deltas else None
+    # No cross-task significance test: with n≤3 shared tasks a p-value / d_z is
+    # underpowered and misleading. The meaningful uncertainty is the per-task
+    # seed CI (mean ± multi-seed spread), surfaced per task below.
     return {
         "tasks_won": tasks_won,
         "tasks_total": len(shared_tasks),
         "cost_per_correct_ratio": round(_mean(cp1k_ratios), 1) if cp1k_ratios else None,
         "avg_accuracy_gain_pp": round(_mean(acc_deltas) * 100, 1) if acc_deltas else None,
         "median_accuracy_gain_pp": round(_median(acc_deltas) * 100, 1) if acc_deltas else None,
-        "p_value_gain": p_value,
-        "effect_size_dz": dz,
-        "effect_size_label": _effect_label(dz),
         "per_task": {
             t: {
                 "fine_metric": round(best_fine[t], 4),
+                "fine_ci_lo": fine_ci.get(t, {}).get("ci_lo"),
+                "fine_ci_hi": fine_ci.get(t, {}).get("ci_hi"),
+                "fine_std": fine_ci.get(t, {}).get("std"),
+                "fine_n_seeds": fine_ci.get(t, {}).get("n_seeds"),
                 "base_metric": round(best_base[t], 4),
+                "base_ci_lo": base_ci.get(t, {}).get("ci_lo"),
+                "base_ci_hi": base_ci.get(t, {}).get("ci_hi"),
+                "base_std": base_ci.get(t, {}).get("std"),
+                "base_n_seeds": base_ci.get(t, {}).get("n_seeds"),
                 "accuracy_gain_pp": round((best_fine[t] - best_base[t]) * 100, 1),
             }
             for t in shared_tasks
@@ -725,22 +740,21 @@ def _print_run_report(data: dict) -> None:
             continue
         won, total = c["tasks_won"], c["tasks_total"]
         gain    = c.get("avg_accuracy_gain_pp")
-        dz      = c.get("effect_size_dz")
-        dz_lbl  = c.get("effect_size_label", "")
-        p       = c.get("p_value_gain")
         ratio   = c.get("cost_per_correct_ratio")
 
         gain_str  = f"{gain:+.1f}pp" if gain is not None else "n/a"
-        dz_str    = f"d_z={dz:.2f} ({dz_lbl})" if dz is not None else ""
-        p_str     = f"p={p:.3f}" if p is not None else ""
         ratio_str = f"  cost_ratio={ratio:.1f}x" if ratio is not None else ""
-        stats     = "  ".join(s for s in [dz_str, p_str] if s)
 
-        click.echo(f"  {label:<26} {won}/{total} tasks  {gain_str:<10}  {stats}{ratio_str}")
+        # Per-task seed CIs replace any cross-task p-value (underpowered at n≤3 tasks).
+        click.echo(f"  {label:<26} {won}/{total} tasks  {gain_str:<10}{ratio_str}")
         for tid, t in sorted(c.get("per_task", {}).items()):
             sign = "+" if t["accuracy_gain_pp"] >= 0 else ""
+            flo, fhi = t.get("fine_ci_lo"), t.get("fine_ci_hi")
+            blo, bhi = t.get("base_ci_lo"), t.get("base_ci_hi")
+            fci = f" [{flo:.3f},{fhi:.3f}]" if flo is not None and fhi is not None else ""
+            bci = f" [{blo:.3f},{bhi:.3f}]" if blo is not None and bhi is not None else ""
             click.echo(
-                f"    {tid:<22}  {t['fine_metric']:.3f} vs {t['base_metric']:.3f}"
+                f"    {tid:<22}  {t['fine_metric']:.3f}{fci} vs {t['base_metric']:.3f}{bci}"
                 f"  {sign}{t['accuracy_gain_pp']:.1f}pp"
             )
 

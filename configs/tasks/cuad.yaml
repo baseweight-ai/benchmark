@@ -47,7 +47,7 @@ test_sampling:
   min_per_group: 1
   seed: 42
   balance_by: has_answer       # 50/50 answerable / no-answer questions
-eval_axes: [token_f1, cost, latency]
+eval_axes: [token_f1, cost]
 prompt_file: "prompts/cuad.json"
 skip_conditions: [5-shot]
 epochs_by_size:

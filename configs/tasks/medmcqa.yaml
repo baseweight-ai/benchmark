@@ -39,7 +39,7 @@ test_sampling:
   total_cap: 500
   min_per_group: 1
   seed: 42
-eval_axes: [accuracy, cost, latency, instruction_following]
+eval_axes: [accuracy, cost, instruction_following]
 prompt_file: "prompts/medmcqa.json"
 label_field: cop
 label_type: letter_mapped

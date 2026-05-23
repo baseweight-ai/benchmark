@@ -41,7 +41,7 @@ test_sampling:
   total_cap: 150
   min_per_group: 10
   seed: 42
-eval_axes: [accuracy, cost, latency, instruction_following]
+eval_axes: [accuracy, cost, instruction_following]
 prompt_file: "prompts/fpb.json"
 text_field: sentence
 label_field: label

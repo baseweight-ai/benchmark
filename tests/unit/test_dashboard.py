@@ -659,10 +659,10 @@ def test_export_tables_renders_null_metrics_as_empty(tmp_path):
     assert "None" not in md_text, "Null metrics leaked as 'None' in Markdown"
 
 
-def test_comparison_includes_effect_size(pricing):
+def test_comparison_reports_per_task_cis_not_cross_task_stats(pricing):
+    """v1 surfaces per-task seed CIs, NOT a cross-task p-value / effect size:
+    with n≤3 shared tasks the latter are underpowered and misleading."""
     from generate_dashboard_data import compute_stats
-    # Need n≥3 tasks with varied gains (not identical) for Hedge's g to be defined.
-    # Gains: fpb +0.10, banking77 +0.08, cuad +0.12 → mean 0.10, variance > 0.
     results = [
         _make_result("qwen3-8b", "open-source", "LoRA", 0.85, task_id="fpb"),
         _make_result("qwen3-8b", "open-source", "LoRA", 0.78, task_id="banking77"),
@@ -673,10 +673,15 @@ def test_comparison_includes_effect_size(pricing):
     ]
     stats = compute_stats(results)
     comp = stats["comparisons"]["lora_vs_5shot"]
-    assert "effect_size_dz" in comp
-    assert "effect_size_label" in comp
-    assert comp["effect_size_dz"] is not None
-    assert comp["effect_size_dz"] > 0
+    # Cross-task significance is intentionally NOT reported.
+    assert "effect_size_dz" not in comp
+    assert "effect_size_label" not in comp
+    assert "p_value_gain" not in comp
+    # Per-task seed-CI fields ARE reported.
+    pt = comp["per_task"]["fpb"]
+    for k in ("fine_metric", "fine_ci_lo", "fine_ci_hi", "fine_std",
+              "base_metric", "base_ci_lo", "base_ci_hi", "accuracy_gain_pp"):
+        assert k in pt
 
 
 # ── metric_granularity in build_result ────────────────────────────────────────

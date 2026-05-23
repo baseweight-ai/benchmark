@@ -405,6 +405,15 @@ def aggregate_seed_summaries(summaries: list[dict]) -> dict:
         "total_answer_tokens": sum(s.get("total_answer_tokens", 0) or 0 for s in summaries),
         "total_answer_only_tokens": _sum_optional("total_answer_only_tokens"),
         "total_envelope_overhead_tokens": _sum_optional("total_envelope_overhead_tokens"),
+        # Summed across seeds so the dashboard derives self-hosted cost from
+        # MEASURED throughput (gpu_hourly * wall / n). Summed ONLY when EVERY
+        # seed recorded wall-time: n_predictions sums all seeds, so a partial
+        # wall sum (one seed's .wall.json missing) over the full n would
+        # understate cost. None → dashboard falls back to its flat estimate.
+        "eval_wall_time_s": (
+            sum(s["eval_wall_time_s"] for s in summaries)
+            if all(s.get("eval_wall_time_s") is not None for s in summaries) else None
+        ),
         "error_counts": dict(all_counts),
         "semantic_error_counts": dict(all_semantic_counts),
         "prompt_sha": base.get("prompt_sha"),
