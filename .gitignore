@@ -45,6 +45,9 @@ docs/
 PLAYBOOK.md
 TESTING.md
 
+# Local sync utilities (not meant for sharing)
+scripts/pull_runpod.py
+
 # Agent files (per-dev symlink)
 CLAUDE.md
 .claude/
