@@ -355,6 +355,10 @@ def test_collect_batch_writes_error_rows_for_failures_and_no_shows(tmp_path, mon
     assert rows["r2"]["output"].startswith("ERROR")            # surfaced from error_file_id
     assert rows["r3"]["output"].startswith("ERROR: no batch response")
     assert out_path.with_suffix(".meta.json").exists()         # fingerprint recorded (adopt-safe)
+    # #7: batch has no measurable local wall-time → .wall.json forces None so
+    # classify_errors doesn't derive a bogus value from collect-time timestamps.
+    wall = json.loads(out_path.with_suffix(".wall.json").read_text())
+    assert wall["eval_wall_time_s"] is None
 
 
 def test_collect_batch_all_failed_none_output_file(tmp_path, monkeypatch):

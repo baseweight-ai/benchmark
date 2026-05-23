@@ -16,7 +16,7 @@ import yaml
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
-from checkpoint_utils import append_jsonl, finalize_partial, load_partial_ids, partial_path
+from checkpoint_utils import append_jsonl, atomic_write_json, finalize_partial, load_partial_ids, partial_path
 from utils import build_messages, load_jsonl, load_label_set as _load_label_set, question_id, rows_hash as _rows_hash, read_prompt_sha as _read_prompt_sha, seed_sample_questions
 from pipeline.config import get_model_conditions, get_openai_models, get_reasoning_capable, get_tasks
 from pipeline.log import configure, get_logger
@@ -711,6 +711,12 @@ def collect_eval_batch(sidecar_path: Path) -> bool:
     # path (which never called record_fingerprint at submit) so reuse_is_valid
     # can later invalidate this output when inputs change.
     record_fingerprint(out_path, fingerprint)
+    # Batch has no measurable LOCAL eval wall-time (it ran server-side); write a
+    # .wall.json so classify_errors reports eval_wall_time_s=None rather than
+    # deriving a meaningless value from the collect-time row timestamps — the
+    # sidecar's presence suppresses the timestamp-span fallback.
+    atomic_write_json({"eval_wall_time_s": None, "gpu_model": None},
+                      out_path.with_suffix(".wall.json"))
 
     # Iterate the PENDING ROWS (not the output lines) so every request yields a
     # row — failures and no-shows are written as ERROR rows, never dropped,
