@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-05-23T03:23:52.461354Z",
+  "generated_at": "2026-05-26T00:30:22.535715Z",
   "tasks_won_by_oss": 2,
   "cost_per_correct_ratio": 110.7,
   "avg_accuracy_gain_pp": 5.7,
@@ -403,10 +403,9 @@
       },
       "error_counts": {
         "hallucinated": 531,
-        "not_applicable": 756,
         "format_violation": 30,
         "partial": 84,
-        "correct": 99
+        "correct": 855
       },
       "semantic_error_counts": {
         "factual_error": 531,
@@ -1235,8 +1234,7 @@
         }
       },
       "error_counts": {
-        "not_applicable": 688,
-        "correct": 375,
+        "correct": 1063,
         "hallucinated": 393,
         "partial": 42,
         "format_violation": 2
@@ -1504,9 +1502,8 @@
       },
       "error_counts": {
         "hallucinated": 575,
-        "not_applicable": 777,
         "partial": 62,
-        "correct": 73,
+        "correct": 850,
         "format_violation": 13
       },
       "semantic_error_counts": {

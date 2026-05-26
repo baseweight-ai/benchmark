@@ -292,7 +292,15 @@ def build_result(
     ttft_p95 = summary.get("ttft_p95_ms") if summary else None
     latency_p50_ms = summary.get("latency_p50_ms") if summary else None
     latency_p99_ms = summary.get("latency_p99_ms") if summary else None
-    error_counts = summary.get("error_counts", {}) if summary else {}
+    error_counts = dict(summary.get("error_counts", {})) if summary else {}
+    # not_applicable is a correct abstention: gold and prediction both signal "no
+    # clause present". The classifier keeps it as a distinct fine-grained category
+    # (and already maps it to semantic "correct"), but for the public breakdown it
+    # should count as correct so the correctness rate is not understated. The
+    # fine-grained split stays in the summaries and in the answer_detection_* metrics.
+    _abstentions = error_counts.pop("not_applicable", 0)
+    if _abstentions:
+        error_counts["correct"] = error_counts.get("correct", 0) + _abstentions
     semantic_error_counts = summary.get("semantic_error_counts", {}) if summary else {}
     format_compliance_rate = summary.get("format_compliance_rate") if summary else None
     refusal_rate = summary.get("refusal_rate") if summary else None
