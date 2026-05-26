@@ -14,6 +14,9 @@ metric_label: "Weighted F1"
 # (stratified, total_cap=500), so majority-class performance gets proportional influence.
 metric_granularity: per_class_weighted
 max_output_tokens: 32
+decoding:
+  temperature: 0
+  strategy: greedy
 lm_eval_task_id: banking77
 # Stratified with a floor: banking77's train pool is nearly balanced
 # (35-187 per class, 77 classes). Test ships balanced (40/class), so the

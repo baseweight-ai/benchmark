@@ -1,16 +1,15 @@
 {
-  "generated_at": "2026-05-26T00:30:22.535715Z",
-  "tasks_won_by_oss": 2,
-  "cost_per_correct_ratio": 110.7,
-  "avg_accuracy_gain_pp": 5.7,
+  "generated_at": "2026-05-26T22:53:44.395428Z",
+  "tasks_won_by_oss": 1,
+  "cost_per_correct_ratio": 138.0,
+  "avg_accuracy_gain_pp": 8.9,
   "scope": {
-    "n_tasks": 3,
+    "n_tasks": 2,
     "n_models": 2,
     "n_conditions": 3,
     "task_ids": [
       "banking77",
-      "cuad",
-      "fpb"
+      "cuad"
     ],
     "model_ids": [
       "gpt-5.4-mini",
@@ -24,11 +23,11 @@
   },
   "comparisons": {
     "lora_vs_5shot": {
-      "tasks_won": 2,
-      "tasks_total": 2,
-      "cost_per_correct_ratio": 110.7,
-      "avg_accuracy_gain_pp": 5.7,
-      "median_accuracy_gain_pp": 5.7,
+      "tasks_won": 1,
+      "tasks_total": 1,
+      "cost_per_correct_ratio": 138.0,
+      "avg_accuracy_gain_pp": 8.9,
+      "median_accuracy_gain_pp": 8.9,
       "per_task": {
         "banking77": {
           "fine_metric": 0.876,
@@ -42,28 +41,15 @@
           "base_std": 0.0196,
           "base_n_seeds": 3,
           "accuracy_gain_pp": 8.9
-        },
-        "fpb": {
-          "fine_metric": 0.8631,
-          "fine_ci_lo": 0.846,
-          "fine_ci_hi": 0.89,
-          "fine_std": 0.0192,
-          "fine_n_seeds": 3,
-          "base_metric": 0.8386,
-          "base_ci_lo": 0.8127,
-          "base_ci_hi": 0.875,
-          "base_std": 0.0265,
-          "base_n_seeds": 3,
-          "accuracy_gain_pp": 2.4
         }
       }
     },
     "lora_vs_zero_shot": {
-      "tasks_won": 3,
-      "tasks_total": 3,
-      "cost_per_correct_ratio": 70.7,
-      "avg_accuracy_gain_pp": 8.5,
-      "median_accuracy_gain_pp": 9.8,
+      "tasks_won": 2,
+      "tasks_total": 2,
+      "cost_per_correct_ratio": 75.0,
+      "avg_accuracy_gain_pp": 11.4,
+      "median_accuracy_gain_pp": 11.4,
       "per_task": {
         "banking77": {
           "fine_metric": 0.876,
@@ -90,32 +76,19 @@
           "base_std": 0.0051,
           "base_n_seeds": 3,
           "accuracy_gain_pp": 12.9
-        },
-        "fpb": {
-          "fine_metric": 0.8631,
-          "fine_ci_lo": 0.846,
-          "fine_ci_hi": 0.89,
-          "fine_std": 0.0192,
-          "fine_n_seeds": 3,
-          "base_metric": 0.8369,
-          "base_ci_lo": 0.8034,
-          "base_ci_hi": 0.8747,
-          "base_std": 0.0293,
-          "base_n_seeds": 3,
-          "accuracy_gain_pp": 2.6
         }
       }
     }
   },
   "cost_summary": {
-    "total_training_cost": 1.904,
-    "avg_training_cost": 0.6347,
-    "avg_training_time_min": 77.7,
-    "avg_n_train": 3331,
+    "total_training_cost": 1.7773,
+    "avg_training_cost": 0.8886,
+    "avg_training_time_min": 108.8,
+    "avg_n_train": 3997,
     "avg_cost_per_query_by_condition": {
-      "5-shot": 0.00032001,
-      "Zero-shot": 0.0013527,
-      "LoRA": 0.00010135
+      "5-shot": 0.0004594,
+      "Zero-shot": 0.00196189,
+      "LoRA": 0.00014981
     }
   },
   "dtype_warnings": [],
@@ -126,27 +99,6 @@
       "min_detectable_effect_pp": 6.3,
       "n_test": 500,
       "n_classes": 77
-    },
-    "ledgar": {
-      "random_chance": 0.01,
-      "majority_class_accuracy": 0.058,
-      "min_detectable_effect_pp": 4.4,
-      "n_test": 1000,
-      "n_classes": 100
-    },
-    "fpb": {
-      "random_chance": 0.3333,
-      "majority_class_accuracy": 0.58,
-      "min_detectable_effect_pp": 11.4,
-      "n_test": 150,
-      "n_classes": 3
-    },
-    "medmcqa": {
-      "random_chance": 0.25,
-      "majority_class_accuracy": 0.326,
-      "min_detectable_effect_pp": 6.3,
-      "n_test": 500,
-      "n_classes": 4
     }
   },
   "hardware": {
@@ -160,6 +112,39 @@
     "gpu_hourly_rate_used": 0.46,
     "gpu_hourly_rate_source": "pricing.yaml",
     "gpu_pricing_notes": "RunPod RTX 3090 on-demand, May 2026. ICP deployment cost will differ (e.g. AWS g5.xlarge ~$1.006/hr on-demand, ~$0.30/hr spot for A10G)."
+  },
+  "manifest": {
+    "base_models": {
+      "qwen3-8b": {
+        "base_model_id": "Qwen/Qwen3-8B",
+        "revision": "b968826d9c46dd6066d109eabc6255188de91218",
+        "training_config_sha256": "f6162f51314df73182e4651c28fc8b3c5597900ccc11907a81da010280e6dc70"
+      }
+    },
+    "tasks": {
+      "banking77": {
+        "dataset": "PolyAI/banking77",
+        "dataset_revision": "refs/convert/parquet",
+        "task_config_sha256": "e9183d078bdb4ca07429f9171351f102913555b661a3f1e41b021ce293cd4f12",
+        "prompt_sha256": "21792150fef4ecf95418d9b7b03e2539ac015e5f34862c15eea6265b531106b1"
+      },
+      "cuad": {
+        "dataset": "theatticusproject/cuad-qa",
+        "dataset_revision": "refs/convert/parquet",
+        "task_config_sha256": "76b80e3f75a6ce150ecdbed5adea49ed88274f4fd1138d3f4107e01ce7f71355",
+        "prompt_sha256": "d7f92b2686c9ac6636faeedf497ffc4c69678d24dfb2234229faac1eead3a9d9"
+      }
+    },
+    "adapters": {
+      "qwen3-8b/banking77": {
+        "repo": "baseweight-ai/qwen3-8b-banking77-lora",
+        "adapter_sha256": "f9695823c68c7dca30c99cdb41c85b9376604b60f408e7d20e281e86f9c2a02d"
+      },
+      "qwen3-8b/cuad": {
+        "repo": "baseweight-ai/qwen3-8b-cuad-lora",
+        "adapter_sha256": "4d8dd5b9dd530bd57b0c57e7f65ff863ecf11268ff1403eaae38a1fcaeb3c796"
+      }
+    }
   },
   "results": [
     {
@@ -252,7 +237,14 @@
       "input_cost_per_token": 7.5e-07,
       "output_cost_per_token": 4.5e-06,
       "gpu_hourly_rate": null,
-      "eval_wall_time_s": 507.2
+      "eval_wall_time_s": 507.2,
+      "decoding_params": {
+        "temperature": 0,
+        "strategy": "greedy",
+        "max_output_tokens": 32
+      },
+      "pipeline_commit": null,
+      "training_input_hash": null
     },
     {
       "model_id": "gpt-5.4-mini",
@@ -344,7 +336,14 @@
       "input_cost_per_token": 7.5e-07,
       "output_cost_per_token": 4.5e-06,
       "gpu_hourly_rate": null,
-      "eval_wall_time_s": 382.1
+      "eval_wall_time_s": 382.1,
+      "decoding_params": {
+        "temperature": 0,
+        "strategy": "greedy",
+        "max_output_tokens": 32
+      },
+      "pipeline_commit": null,
+      "training_input_hash": null
     },
     {
       "model_id": "gpt-5.4-mini",
@@ -436,191 +435,14 @@
       "input_cost_per_token": 7.5e-07,
       "output_cost_per_token": 4.5e-06,
       "gpu_hourly_rate": null,
-      "eval_wall_time_s": 4767.6
-    },
-    {
-      "model_id": "gpt-5.4-mini",
-      "display_name": "GPT 5.4 Mini",
-      "family": "frontier",
-      "task_id": "fpb",
-      "condition": "5-shot",
-      "metric_id": "macro_f1",
-      "metric_granularity": "per_class_macro",
-      "metric_value": 0.8386,
-      "metric_std": 0.0265,
-      "metric_cv": 0.0316,
-      "metric_ci_lo": 0.8127,
-      "metric_ci_hi": 0.875,
-      "n_seeds": 3,
-      "n_predictions": 450,
-      "exact_match": 0.86,
-      "macro_f1": 0.8386,
-      "weighted_f1": 0.8612,
-      "hallucination_rate": 0.0,
-      "api_error_rate": 0.0,
-      "answer_detection_f1": null,
-      "precision_at_80_recall": null,
-      "aupr": null,
-      "avg_logprob": null,
-      "p10_logprob": null,
-      "cost_per_query": 0.00035695,
-      "cost_per_1k_requests": 0.3569,
-      "cost_per_1m_queries": 356.95,
-      "cost_per_1k_tokens": 0.000859,
-      "cost_per_1m_input_tokens": 0.75,
-      "cost_per_1m_output_tokens": 4.5,
-      "cost_per_1k_correct": 0.4256,
-      "tco_12mo": 1302.87,
-      "avg_latency_ms": null,
-      "latency_p50_ms": null,
-      "latency_p99_ms": null,
-      "ttft_p50_ms": null,
-      "ttft_p95_ms": null,
-      "throughput_qps": 4.73,
-      "training_cost": null,
-      "training_time_min": null,
-      "gpu_hours": null,
-      "peak_gpu_mem_mb": null,
-      "avg_gpu_util_pct": null,
-      "n_train": null,
-      "axis_scores": {
-        "accuracy": {
-          "value": 0.8386,
-          "higher_is_better": true
-        },
-        "instruction_following": {
-          "value": 1.0,
-          "higher_is_better": true
-        },
-        "cost": {
-          "value": 0.00035695,
-          "higher_is_better": false
-        }
+      "eval_wall_time_s": 4767.6,
+      "decoding_params": {
+        "temperature": 0,
+        "strategy": "greedy",
+        "max_output_tokens": 768
       },
-      "error_counts": {
-        "wrong_class": 63,
-        "correct": 387
-      },
-      "semantic_error_counts": {
-        "factual_error": 63,
-        "correct": 387
-      },
-      "per_class_metrics": null,
-      "format_compliance_rate": null,
-      "refusal_rate": null,
-      "empty_rate": null,
-      "partial_rate": null,
-      "loss_history": null,
-      "hyperparams": null,
-      "training_diagnostics": null,
-      "compute_dtype": null,
-      "gpu_model": null,
-      "total_input_tokens": 181446,
-      "total_output_tokens": 5454,
-      "total_reasoning_tokens": 0,
-      "total_answer_tokens": 5454,
-      "total_answer_only_tokens": null,
-      "total_envelope_overhead_tokens": null,
-      "avg_input_tokens": 403.2,
-      "avg_output_tokens": 12.1,
-      "avg_reasoning_tokens": 0.0,
-      "avg_answer_tokens": 12.1,
-      "input_cost_per_token": 7.5e-07,
-      "output_cost_per_token": 4.5e-06,
-      "gpu_hourly_rate": null,
-      "eval_wall_time_s": 95.1
-    },
-    {
-      "model_id": "gpt-5.4-mini",
-      "display_name": "GPT 5.4 Mini",
-      "family": "frontier",
-      "task_id": "fpb",
-      "condition": "Zero-shot",
-      "metric_id": "macro_f1",
-      "metric_granularity": "per_class_macro",
-      "metric_value": 0.8369,
-      "metric_std": 0.0293,
-      "metric_cv": 0.035,
-      "metric_ci_lo": 0.8034,
-      "metric_ci_hi": 0.8747,
-      "n_seeds": 3,
-      "n_predictions": 450,
-      "exact_match": 0.8533,
-      "macro_f1": 0.8369,
-      "weighted_f1": 0.8535,
-      "hallucination_rate": 0.0,
-      "api_error_rate": 0.0,
-      "answer_detection_f1": null,
-      "precision_at_80_recall": null,
-      "aupr": null,
-      "avg_logprob": null,
-      "p10_logprob": null,
-      "cost_per_query": 0.00026458,
-      "cost_per_1k_requests": 0.2646,
-      "cost_per_1m_queries": 264.58,
-      "cost_per_1k_tokens": 0.000905,
-      "cost_per_1m_input_tokens": 0.75,
-      "cost_per_1m_output_tokens": 4.5,
-      "cost_per_1k_correct": 0.3161,
-      "tco_12mo": 965.72,
-      "avg_latency_ms": null,
-      "latency_p50_ms": null,
-      "latency_p99_ms": null,
-      "ttft_p50_ms": null,
-      "ttft_p95_ms": null,
-      "throughput_qps": 8.05,
-      "training_cost": null,
-      "training_time_min": null,
-      "gpu_hours": null,
-      "peak_gpu_mem_mb": null,
-      "avg_gpu_util_pct": null,
-      "n_train": null,
-      "axis_scores": {
-        "accuracy": {
-          "value": 0.8369,
-          "higher_is_better": true
-        },
-        "instruction_following": {
-          "value": 1.0,
-          "higher_is_better": true
-        },
-        "cost": {
-          "value": 0.00026458,
-          "higher_is_better": false
-        }
-      },
-      "error_counts": {
-        "correct": 384,
-        "wrong_class": 66
-      },
-      "semantic_error_counts": {
-        "correct": 384,
-        "factual_error": 66
-      },
-      "per_class_metrics": null,
-      "format_compliance_rate": null,
-      "refusal_rate": null,
-      "empty_rate": null,
-      "partial_rate": null,
-      "loss_history": null,
-      "hyperparams": null,
-      "training_diagnostics": null,
-      "compute_dtype": null,
-      "gpu_model": null,
-      "total_input_tokens": 126096,
-      "total_output_tokens": 5442,
-      "total_reasoning_tokens": 0,
-      "total_answer_tokens": 5442,
-      "total_answer_only_tokens": null,
-      "total_envelope_overhead_tokens": null,
-      "avg_input_tokens": 280.2,
-      "avg_output_tokens": 12.1,
-      "avg_reasoning_tokens": 0.0,
-      "avg_answer_tokens": 12.1,
-      "input_cost_per_token": 7.5e-07,
-      "output_cost_per_token": 4.5e-06,
-      "gpu_hourly_rate": null,
-      "eval_wall_time_s": 55.9
+      "pipeline_commit": null,
+      "training_input_hash": null
     },
     {
       "model_id": "qwen3-8b",
@@ -712,7 +534,14 @@
       "input_cost_per_token": null,
       "output_cost_per_token": null,
       "gpu_hourly_rate": 0.46,
-      "eval_wall_time_s": 80.7
+      "eval_wall_time_s": 80.7,
+      "decoding_params": {
+        "temperature": 0,
+        "strategy": "greedy",
+        "max_output_tokens": 32
+      },
+      "pipeline_commit": null,
+      "training_input_hash": null
     },
     {
       "model_id": "qwen3-8b",
@@ -1084,7 +913,14 @@
       "input_cost_per_token": null,
       "output_cost_per_token": null,
       "gpu_hourly_rate": 0.46,
-      "eval_wall_time_s": 86.6
+      "eval_wall_time_s": 86.6,
+      "decoding_params": {
+        "temperature": 0,
+        "strategy": "greedy",
+        "max_output_tokens": 32
+      },
+      "pipeline_commit": "d7a9e14",
+      "training_input_hash": "89f9dc88bae867a2"
     },
     {
       "model_id": "qwen3-8b",
@@ -1176,7 +1012,14 @@
       "input_cost_per_token": null,
       "output_cost_per_token": null,
       "gpu_hourly_rate": 0.46,
-      "eval_wall_time_s": 79.5
+      "eval_wall_time_s": 79.5,
+      "decoding_params": {
+        "temperature": 0,
+        "strategy": "greedy",
+        "max_output_tokens": 32
+      },
+      "pipeline_commit": null,
+      "training_input_hash": null
     },
     {
       "model_id": "qwen3-8b",
@@ -1443,7 +1286,14 @@
       "input_cost_per_token": null,
       "output_cost_per_token": null,
       "gpu_hourly_rate": 0.46,
-      "eval_wall_time_s": 3430.8
+      "eval_wall_time_s": 3430.8,
+      "decoding_params": {
+        "temperature": 0,
+        "strategy": "greedy",
+        "max_output_tokens": 768
+      },
+      "pipeline_commit": "d7a9e14",
+      "training_input_hash": "b7f7da68dbcc598b"
     },
     {
       "model_id": "qwen3-8b",
@@ -1535,383 +1385,14 @@
       "input_cost_per_token": null,
       "output_cost_per_token": null,
       "gpu_hourly_rate": 0.46,
-      "eval_wall_time_s": 3070.5
-    },
-    {
-      "model_id": "qwen3-8b",
-      "display_name": "Qwen3-8B",
-      "family": "open-source",
-      "task_id": "fpb",
-      "condition": "5-shot",
-      "metric_id": "macro_f1",
-      "metric_granularity": "per_class_macro",
-      "metric_value": 0.8076,
-      "metric_std": 0.0361,
-      "metric_cv": 0.0447,
-      "metric_ci_lo": 0.7575,
-      "metric_ci_hi": 0.8411,
-      "n_seeds": 3,
-      "n_predictions": 450,
-      "exact_match": 0.8334,
-      "macro_f1": 0.8076,
-      "weighted_f1": 0.8306,
-      "hallucination_rate": 0.0,
-      "api_error_rate": 0.0,
-      "answer_detection_f1": null,
-      "precision_at_80_recall": null,
-      "aupr": null,
-      "avg_logprob": null,
-      "p10_logprob": null,
-      "cost_per_query": 4.29e-06,
-      "cost_per_1k_requests": 0.0043,
-      "cost_per_1m_queries": 4.29,
-      "cost_per_1k_tokens": 1.1e-05,
-      "cost_per_1m_input_tokens": 0.0109,
-      "cost_per_1m_output_tokens": 0.0109,
-      "cost_per_1k_correct": 0.0053,
-      "tco_12mo": 4029.6,
-      "avg_latency_ms": null,
-      "latency_p50_ms": null,
-      "latency_p99_ms": null,
-      "ttft_p50_ms": null,
-      "ttft_p95_ms": null,
-      "throughput_qps": 29.8,
-      "training_cost": null,
-      "training_time_min": null,
-      "gpu_hours": null,
-      "peak_gpu_mem_mb": null,
-      "avg_gpu_util_pct": null,
-      "n_train": null,
-      "axis_scores": {
-        "accuracy": {
-          "value": 0.8076,
-          "higher_is_better": true
-        },
-        "instruction_following": {
-          "value": 1.0,
-          "higher_is_better": true
-        },
-        "cost": {
-          "value": 4.29e-06,
-          "higher_is_better": false
-        }
+      "eval_wall_time_s": 3070.5,
+      "decoding_params": {
+        "temperature": 0,
+        "strategy": "greedy",
+        "max_output_tokens": 768
       },
-      "error_counts": {
-        "wrong_class": 75,
-        "correct": 375
-      },
-      "semantic_error_counts": {
-        "factual_error": 75,
-        "correct": 375
-      },
-      "per_class_metrics": null,
-      "format_compliance_rate": null,
-      "refusal_rate": null,
-      "empty_rate": null,
-      "partial_rate": null,
-      "loss_history": null,
-      "hyperparams": null,
-      "training_diagnostics": null,
-      "compute_dtype": null,
-      "gpu_model": null,
-      "total_input_tokens": 176271,
-      "total_output_tokens": 900,
-      "total_reasoning_tokens": 0,
-      "total_answer_tokens": 900,
-      "total_answer_only_tokens": null,
-      "total_envelope_overhead_tokens": null,
-      "avg_input_tokens": 391.7,
-      "avg_output_tokens": 2.0,
-      "avg_reasoning_tokens": 0.0,
-      "avg_answer_tokens": 2.0,
-      "input_cost_per_token": null,
-      "output_cost_per_token": null,
-      "gpu_hourly_rate": 0.46,
-      "eval_wall_time_s": 15.1
-    },
-    {
-      "model_id": "qwen3-8b",
-      "display_name": "Qwen3-8B",
-      "family": "open-source",
-      "task_id": "fpb",
-      "condition": "LoRA",
-      "metric_id": "macro_f1",
-      "metric_granularity": "per_class_macro",
-      "metric_value": 0.8631,
-      "metric_std": 0.0192,
-      "metric_cv": 0.0223,
-      "metric_ci_lo": 0.846,
-      "metric_ci_hi": 0.89,
-      "n_seeds": 3,
-      "n_predictions": 450,
-      "exact_match": 0.8689,
-      "macro_f1": 0.8631,
-      "weighted_f1": 0.8692,
-      "hallucination_rate": 0.0,
-      "api_error_rate": 0.0,
-      "answer_detection_f1": null,
-      "precision_at_80_recall": null,
-      "aupr": null,
-      "avg_logprob": null,
-      "p10_logprob": null,
-      "cost_per_query": 4.43e-06,
-      "cost_per_1k_requests": 0.0044,
-      "cost_per_1m_queries": 4.43,
-      "cost_per_1k_tokens": 1.7e-05,
-      "cost_per_1m_input_tokens": 0.0173,
-      "cost_per_1m_output_tokens": 0.0173,
-      "cost_per_1k_correct": 0.0051,
-      "tco_12mo": 4029.73,
-      "avg_latency_ms": null,
-      "latency_p50_ms": null,
-      "latency_p99_ms": null,
-      "ttft_p50_ms": null,
-      "ttft_p95_ms": null,
-      "throughput_qps": 28.85,
-      "training_cost": 0.1267,
-      "training_time_min": 15.5,
-      "gpu_hours": 0.2585,
-      "peak_gpu_mem_mb": 10577,
-      "avg_gpu_util_pct": 94,
-      "n_train": 2000,
-      "axis_scores": {
-        "accuracy": {
-          "value": 0.8631,
-          "higher_is_better": true
-        },
-        "instruction_following": {
-          "value": 1.0,
-          "higher_is_better": true
-        },
-        "cost": {
-          "value": 4.43e-06,
-          "higher_is_better": false
-        }
-      },
-      "error_counts": {
-        "correct": 391,
-        "wrong_class": 59
-      },
-      "semantic_error_counts": {
-        "correct": 391,
-        "factual_error": 59
-      },
-      "per_class_metrics": null,
-      "format_compliance_rate": null,
-      "refusal_rate": null,
-      "empty_rate": null,
-      "partial_rate": null,
-      "loss_history": [
-        {
-          "step": 10,
-          "loss": 2.7104,
-          "lr": 2.368421052631579e-05
-        },
-        {
-          "step": 20,
-          "loss": 0.5727,
-          "lr": 5e-05
-        },
-        {
-          "step": 30,
-          "loss": 0.0808,
-          "lr": 7.631578947368422e-05
-        },
-        {
-          "step": 40,
-          "loss": 0.0748,
-          "lr": 0.0001
-        },
-        {
-          "step": 50,
-          "loss": 0.0595,
-          "lr": 0.0001
-        },
-        {
-          "step": 60,
-          "loss": 0.0538,
-          "lr": 0.0001
-        },
-        {
-          "step": 70,
-          "loss": 0.0479,
-          "lr": 0.0001
-        },
-        {
-          "step": 80,
-          "loss": 0.0316,
-          "lr": 0.0001
-        },
-        {
-          "step": 90,
-          "loss": 0.0495,
-          "lr": 0.0001
-        },
-        {
-          "step": 100,
-          "loss": 0.0555,
-          "lr": 0.0001
-        },
-        {
-          "step": 110,
-          "loss": 0.0334,
-          "lr": 0.0001
-        },
-        {
-          "step": 120,
-          "loss": 0.0614,
-          "lr": 0.0001
-        },
-        {
-          "step": 130,
-          "loss": 0.0404,
-          "lr": 0.0001
-        },
-        {
-          "step": 140,
-          "loss": 0.036,
-          "lr": 0.0001
-        },
-        {
-          "step": 150,
-          "loss": 0.0381,
-          "lr": 0.0001
-        },
-        {
-          "step": 160,
-          "loss": 0.0218,
-          "lr": 0.0001
-        }
-      ],
-      "hyperparams": {
-        "lora_rank": 8,
-        "lora_alpha": 16,
-        "learning_rate": 0.0001,
-        "per_device_train_batch_size": 4,
-        "gradient_accumulation_steps": 4,
-        "lr_scheduler_type": "constant_with_warmup",
-        "weight_decay": 0.1,
-        "optim": "adamw_8bit",
-        "warmup_ratio": 0.1,
-        "eval_steps": 41,
-        "early_stopping_patience": 1
-      },
-      "training_diagnostics": {
-        "anomalies": [],
-        "converged": true,
-        "plateaued": false,
-        "diverged": false,
-        "loss_improvement_pct": 99.2,
-        "overfitting_detected": true
-      },
-      "compute_dtype": "bfloat16",
-      "gpu_model": "NVIDIA GeForce RTX 3090",
-      "total_input_tokens": 114621,
-      "total_output_tokens": 900,
-      "total_reasoning_tokens": 0,
-      "total_answer_tokens": 900,
-      "total_answer_only_tokens": null,
-      "total_envelope_overhead_tokens": null,
-      "avg_input_tokens": 254.7,
-      "avg_output_tokens": 2.0,
-      "avg_reasoning_tokens": 0.0,
-      "avg_answer_tokens": 2.0,
-      "input_cost_per_token": null,
-      "output_cost_per_token": null,
-      "gpu_hourly_rate": 0.46,
-      "eval_wall_time_s": 15.600000000000001
-    },
-    {
-      "model_id": "qwen3-8b",
-      "display_name": "Qwen3-8B",
-      "family": "open-source",
-      "task_id": "fpb",
-      "condition": "Zero-shot",
-      "metric_id": "macro_f1",
-      "metric_granularity": "per_class_macro",
-      "metric_value": 0.7625,
-      "metric_std": 0.04,
-      "metric_cv": 0.0525,
-      "metric_ci_lo": 0.7062,
-      "metric_ci_hi": 0.796,
-      "n_seeds": 3,
-      "n_predictions": 450,
-      "exact_match": 0.7956,
-      "macro_f1": 0.7625,
-      "weighted_f1": 0.7813,
-      "hallucination_rate": 0.0,
-      "api_error_rate": 0.0,
-      "answer_detection_f1": null,
-      "precision_at_80_recall": null,
-      "aupr": null,
-      "avg_logprob": null,
-      "p10_logprob": null,
-      "cost_per_query": 4.06e-06,
-      "cost_per_1k_requests": 0.0041,
-      "cost_per_1m_queries": 4.06,
-      "cost_per_1k_tokens": 1.6e-05,
-      "cost_per_1m_input_tokens": 0.0158,
-      "cost_per_1m_output_tokens": 0.0158,
-      "cost_per_1k_correct": 0.0053,
-      "tco_12mo": 4029.6,
-      "avg_latency_ms": null,
-      "latency_p50_ms": null,
-      "latency_p99_ms": null,
-      "ttft_p50_ms": null,
-      "ttft_p95_ms": null,
-      "throughput_qps": 31.47,
-      "training_cost": null,
-      "training_time_min": null,
-      "gpu_hours": null,
-      "peak_gpu_mem_mb": null,
-      "avg_gpu_util_pct": null,
-      "n_train": null,
-      "axis_scores": {
-        "accuracy": {
-          "value": 0.7625,
-          "higher_is_better": true
-        },
-        "instruction_following": {
-          "value": 1.0,
-          "higher_is_better": true
-        },
-        "cost": {
-          "value": 4.06e-06,
-          "higher_is_better": false
-        }
-      },
-      "error_counts": {
-        "correct": 358,
-        "wrong_class": 92
-      },
-      "semantic_error_counts": {
-        "correct": 358,
-        "factual_error": 92
-      },
-      "per_class_metrics": null,
-      "format_compliance_rate": null,
-      "refusal_rate": null,
-      "empty_rate": null,
-      "partial_rate": null,
-      "loss_history": null,
-      "hyperparams": null,
-      "training_diagnostics": null,
-      "compute_dtype": null,
-      "gpu_model": null,
-      "total_input_tokens": 114621,
-      "total_output_tokens": 900,
-      "total_reasoning_tokens": 0,
-      "total_answer_tokens": 900,
-      "total_answer_only_tokens": null,
-      "total_envelope_overhead_tokens": null,
-      "avg_input_tokens": 254.7,
-      "avg_output_tokens": 2.0,
-      "avg_reasoning_tokens": 0.0,
-      "avg_answer_tokens": 2.0,
-      "input_cost_per_token": null,
-      "output_cost_per_token": null,
-      "gpu_hourly_rate": 0.46,
-      "eval_wall_time_s": 14.3
+      "pipeline_commit": null,
+      "training_input_hash": null
     }
   ]
 }

@@ -19,8 +19,8 @@ load_dotenv(REPO_ROOT / ".env")
 ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa"]
 ALL_MODELS = ["qwen3-8b"]
 
-HF_COLLECTION_SLUG = "baseweight/baseweight-benchmark-adapters"
-HF_ORG = "baseweight"  # update to your HF org/username
+HF_COLLECTION_SLUG = "baseweight-ai/baseweight-benchmark-adapters"
+HF_ORG = "baseweight-ai"  # 'baseweight' was taken on HF; the org handle is baseweight-ai
 
 
 class ModelConfig(BaseModel):

@@ -66,6 +66,9 @@ class ModelConfig(BaseModel):
     enable_thinking: Optional[bool] = None
     vllm_task: str = "auto"
     fallback_model_id: Optional[str] = None
+    # Pinned base-model HF revision; forwarded to vLLM as --revision so eval binds to
+    # the same base checkpoint training used.
+    revision: Optional[str] = None
 
 
 def load_task_config(task_id: str) -> TaskConfig:
@@ -214,6 +217,7 @@ def start_vllm_server(
     vllm_task: str = "auto",
     smoke_test: bool = False,
     max_concurrent: int = 64,
+    revision: Optional[str] = None,
 ) -> subprocess.Popen:
     """Start a vLLM server.
 
@@ -251,6 +255,8 @@ def start_vllm_server(
         # batch. Lower client concurrency just under-utilises this ceiling.
         "--max-num-seqs", str(max_concurrent),
     ]
+    if revision:
+        cmd += ["--revision", revision]
     if smoke_test:
         cmd += ["--enforce-eager"]
     if lora_modules:
@@ -667,6 +673,7 @@ def main(model: Optional[str], task: str, condition: str, eval_seed: int,
             model_cfg.model_id, lora_modules, seq_len,
             model_cfg.vllm_task, smoke_test,
             max_concurrent=max(max(concurrencies) * 2, 8),
+            revision=model_cfg.revision,
         )
         try:
             ready = asyncio.run(wait_for_vllm(proc, timeout=_vllm_health_timeout(smoke_test)))

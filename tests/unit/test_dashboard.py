@@ -245,10 +245,10 @@ def test_build_dashboard_data_applies_gpu_hourly_rate_override(tmp_path, monkeyp
     (tmp_path / "configs" / "training" / "qwen3-8b.yaml").write_text(
         "model_id: Qwen/Qwen3-8B\nmodel_short: qwen3-8b\n"
     )
-    summary_dir = tmp_path / "results" / "summaries" / "local" / "qwen3-8b" / "fpb"
+    summary_dir = tmp_path / "results" / "summaries" / "local" / "qwen3-8b" / "banking77"
     summary_dir.mkdir(parents=True)
     (summary_dir / "lora.json").write_text(json.dumps({
-        "model": "qwen3-8b", "task_id": "fpb", "condition": "lora",
+        "model": "qwen3-8b", "task_id": "banking77", "condition": "lora",
         "metric_id": "weighted_f1", "metric_value": 0.85,
         "n_predictions": 100, "total_input_tokens": 10_000,
         "total_output_tokens": 1_000, "eval_wall_time_s": 10.0,

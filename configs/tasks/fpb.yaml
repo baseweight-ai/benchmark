@@ -2,6 +2,7 @@ task_id: fpb
 task_name: "Financial Sentiment"
 dataset_path: "warwickai/financial_phrasebank_mirror"
 dataset_config: null
+dataset_revision: "ff5746068c6861a5cb980aa178d80d65161c6376"
 task_type: classification
 num_classes: 3
 metric_id: macro_f1
@@ -16,6 +17,9 @@ metric_label: "Macro F1"
 # if reporting real-world-prevalence-weighted performance is the priority.
 metric_granularity: per_class_macro
 max_output_tokens: 32
+decoding:
+  temperature: 0
+  strategy: greedy
 lm_eval_task_id: null
 # Stratified sampling: train distribution matches the natural sentiment prior
 # (~12 / 59 / 28 for neg/neut/pos), the same shape as the stratified test set.

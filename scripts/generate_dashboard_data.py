@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import os
@@ -25,6 +26,10 @@ litellm.suppress_debug_info = True
 
 REPO_ROOT = Path(__file__).parent.parent
 ALL_TASKS = ["banking77", "cuad", "ledgar", "fpb", "medmcqa"]
+
+# Tasks included in the public dashboard. Pipeline artifacts (adapters, predictions,
+# training results) for excluded tasks are preserved — this only controls dashboard output.
+DASHBOARD_PUBLISHED_TASKS: frozenset[str] = frozenset({"banking77", "cuad"})
 
 # Known API vendor prefixes → canonical capitalisation.
 _VENDOR_CAPS: dict[str, str] = {
@@ -260,6 +265,23 @@ def load_training_meta(source: str, model_short: str, task_id: str, condition: s
         return json.load(f)
 
 
+def _load_task_decoding(task_id: str) -> dict:
+    """Return decoding params from task config (temperature, strategy, max_output_tokens)."""
+    path = REPO_ROOT / "configs" / "tasks" / f"{task_id}.yaml"
+    if not path.exists():
+        return {}
+    cfg = yaml.safe_load(path.read_text()) or {}
+    dec = cfg.get("decoding", {})
+    result = {}
+    if "temperature" in dec:
+        result["temperature"] = dec["temperature"]
+    if "strategy" in dec:
+        result["strategy"] = dec["strategy"]
+    if "max_output_tokens" in cfg:
+        result["max_output_tokens"] = cfg["max_output_tokens"]
+    return result
+
+
 def build_result(
     model_id: str,
     task_id: str,
@@ -317,6 +339,13 @@ def build_result(
     hyperparams = training_meta.get("hyperparams") if training_meta else None
     training_diagnostics = training_meta.get("training_diagnostics") if training_meta else None
     compute_dtype = training_meta.get("compute_dtype") if training_meta else None
+    # Git commit at which the pipeline was pinned when this training run started —
+    # used as a publicly-verifiable protocol commitment on the site.
+    pipeline_commit = training_meta.get("git_sha") if training_meta else None
+    # Content hash of the prepared training inputs (data + task config + prompt) at
+    # training time — lets a replicator who runs prepare_datasets.py verify they
+    # got the same training split.
+    training_input_hash = training_meta.get("input_hash") if training_meta else None
     # Prefer eval-time GPU (where latency was measured); API rows have none.
     gpu_model = None
     if summary and summary.get("gpu_model"):
@@ -324,6 +353,7 @@ def build_result(
     elif training_meta and training_meta.get("gpu_model"):
         gpu_model = training_meta["gpu_model"]
     per_class_metrics = summary.get("per_class_metrics") if summary else None
+    decoding_params = _load_task_decoding(task_id) or None
 
     # Decomposed cost inputs — stored so the site can recalculate or display assumptions.
     n = n_predictions or 1
@@ -481,6 +511,10 @@ def build_result(
         "output_cost_per_token": out_per_tok if out_per_tok else None,
         "gpu_hourly_rate": gpu_hourly_rate,
         "eval_wall_time_s": eval_wall_time_s,
+        # Reproducibility: decoding specification and pipeline provenance
+        "decoding_params": decoding_params,
+        "pipeline_commit": pipeline_commit,
+        "training_input_hash": training_input_hash,
     }
 
 
@@ -1025,6 +1059,59 @@ def _summarise_hardware(results: list[dict]) -> dict:
     }
 
 
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _build_manifest(results: list[dict]) -> dict:
+    """Content manifest for no-code reproduction: pins + sha256 of every input
+    (base model & revision, eval dataset version, prompts, configs) and output
+    (published LoRA adapter weights). Lets a third party confirm they hold the exact
+    artefacts behind each number without access to the training code."""
+    manifest: dict = {"base_models": {}, "tasks": {}, "adapters": {}}
+
+    for mid in sorted({r["model_id"] for r in results if r.get("family") == "open-source"}):
+        cfg_path = REPO_ROOT / "configs" / "training" / f"{mid}.yaml"
+        if not cfg_path.exists():
+            continue
+        cfg = yaml.safe_load(cfg_path.read_text()) or {}
+        manifest["base_models"][mid] = {
+            "base_model_id": cfg.get("model_id"),
+            "revision": cfg.get("revision"),
+            "training_config_sha256": _sha256_file(cfg_path),
+        }
+
+    for tid in sorted({r["task_id"] for r in results}):
+        entry: dict = {}
+        tcfg_path = REPO_ROOT / "configs" / "tasks" / f"{tid}.yaml"
+        if tcfg_path.exists():
+            tcfg = yaml.safe_load(tcfg_path.read_text()) or {}
+            entry["dataset"] = tcfg.get("dataset_path")
+            entry["dataset_revision"] = tcfg.get("dataset_revision")
+            entry["task_config_sha256"] = _sha256_file(tcfg_path)
+        prompt_path = REPO_ROOT / "prompts" / f"{tid}.json"
+        if prompt_path.exists():
+            entry["prompt_sha256"] = _sha256_file(prompt_path)
+        manifest["tasks"][tid] = entry
+
+    for r in results:
+        if r.get("family") != "open-source" or "lora" not in str(r.get("condition", "")).lower():
+            continue
+        adir = REPO_ROOT / "results" / "adapters" / "local" / r["model_id"] / r["task_id"] / "lora"
+        weights = sorted(adir.glob("adapter_model.*"))
+        if weights:
+            manifest["adapters"][f"{r['model_id']}/{r['task_id']}"] = {
+                "repo": f"baseweight-ai/{r['model_id']}-{r['task_id']}-lora",
+                "adapter_sha256": _sha256_file(weights[0]),
+            }
+
+    return manifest
+
+
 def build_dashboard_data(
     daily_volume: int = 10000,
     gpu_hourly_rate_override: Optional[float] = None,
@@ -1054,6 +1141,8 @@ def build_dashboard_data(
 
     results = []
     for source, model_id, task_id, condition in discover_summaries(smoke=smoke):
+        if task_id not in DASHBOARD_PUBLISHED_TASKS:
+            continue
         summary = load_summary(source, model_id, task_id, condition, smoke=smoke)
         training_meta = None
         if condition == "lora":
@@ -1062,7 +1151,7 @@ def build_dashboard_data(
         results.append(result)
 
     stats = compute_stats(results)
-    task_baselines = _load_task_baselines()
+    task_baselines = {k: v for k, v in _load_task_baselines().items() if k in DASHBOARD_PUBLISHED_TASKS}
     hardware = _summarise_hardware(results)
     pricing_provenance = {
         "gpu_hourly_rate_used": pricing.self_hosted.get("gpu_hourly_rate"),
@@ -1078,6 +1167,7 @@ def build_dashboard_data(
         "task_baselines": task_baselines,
         "hardware": hardware,
         "pricing_provenance": pricing_provenance,
+        "manifest": _build_manifest(results),
         "results": results,
     }
 
@@ -1136,6 +1226,9 @@ def main(
         allowed_models = get_smoke_model_ids() if smoke_test else get_prod_model_ids()
         fresh = data["results"]
         merged = merge_results(fresh, out_path, allowed_models=allowed_models)
+        # Drop rows for tasks not in the published set — prevents stale entries (e.g. fpb)
+        # from persisting across merges even when they are no longer produced by the pipeline.
+        merged = [r for r in merged if r.get("task_id") in DASHBOARD_PUBLISHED_TASKS]
         fresh_map = {(r["model_id"], r["task_id"], r["condition"]): r for r in fresh}
         n_preserved = sum(1 for r in merged if fresh_map.get((r["model_id"], r["task_id"], r["condition"])) is not r)
         if n_preserved:
@@ -1143,6 +1236,7 @@ def main(
         data["results"] = merged
         merged_stats = compute_stats(merged)
         data.update(merged_stats)
+        data["manifest"] = _build_manifest(merged)
         for w in merged_stats.get("dtype_warnings", []):
             click.echo(f"  WARNING: {w}", err=True)
 

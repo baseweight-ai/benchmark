@@ -109,17 +109,21 @@ class UnslothLoRATrainer(Trainer):
         echo(f"Config: load_in_4bit={hw_cfg.load_in_4bit} dtype={hw_cfg.load_dtype} grad_ckpt={hw_cfg.use_grad_ckpt}")
         echo(f"SFT overrides: {hw_cfg.sft_extra or '(none)'}")
 
-        def _load_model(mid: str):
-            return FastModel.from_pretrained(
+        def _load_model(mid, revision=None):
+            kwargs = dict(
                 model_name=mid,
                 max_seq_length=hw_cfg.seq_len,
                 load_in_4bit=hw_cfg.load_in_4bit,
                 dtype=hw_cfg.load_dtype,
                 device_map=hw_cfg.device,
             )
+            if revision:
+                kwargs["revision"] = revision
+            return FastModel.from_pretrained(**kwargs)
 
         try:
-            model, tokenizer = _load_model(model_id)
+            # Pin only the primary model; the fallback is a different checkpoint.
+            model, tokenizer = _load_model(model_id, getattr(model_cfg, "revision", None))
         except Exception as exc:
             if model_cfg.fallback_model_id:
                 echo(f"WARNING: {model_id} failed ({exc}). Falling back to {model_cfg.fallback_model_id}")

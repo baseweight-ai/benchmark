@@ -131,6 +131,8 @@ def _stage_dashboard(root: Path, monkeypatch) -> Path:
     """Stage 4: generate dashboard data."""
     from datetime import datetime, timezone
     monkeypatch.setattr(generate_dashboard_data, "REPO_ROOT", root)
+    # Smoke tests use fpb as their task; allow it through the published-tasks filter.
+    monkeypatch.setattr(generate_dashboard_data, "DASHBOARD_PUBLISHED_TASKS", frozenset({"fpb", "banking77", "cuad"}))
     # gpt-5.4-* are hypothetical models absent from litellm's pricing DB; stub
     # the lookup so the smoke test exercises the cost path deterministically
     # rather than depending on a live pricing database.

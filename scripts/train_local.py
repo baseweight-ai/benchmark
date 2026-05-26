@@ -84,6 +84,9 @@ class ModelConfig(BaseModel):
     dtype: str = "bfloat16"
     enable_thinking: Optional[bool] = None
     fallback_model_id: Optional[str] = None
+    # Pinned base-model HF revision (commit SHA or tag). Forwarded to the loader so a
+    # run binds to an exact base checkpoint, and recorded into metadata for provenance.
+    revision: Optional[str] = None
     # Trainer backend identifier (matches a key in pipeline.trainers.TRAINER_REGISTRY).
     # Defaults to the Unsloth fast path; set this in the YAML config to switch
     # backends without touching code.
@@ -298,6 +301,9 @@ def _metadata_from_result(
         "eval_loss": result.eval_loss,
         "train_loss": result.train_loss,
         "model_used": result.model_used,
+        # The pinned base revision actually bound this run, unless we fell back to a
+        # different checkpoint (then the pin no longer applies).
+        "model_revision": None if result.substituted else getattr(model_cfg, "revision", None),
         "substituted": result.substituted,
         "git_sha": _git_sha(),
         "input_hash": input_hash,

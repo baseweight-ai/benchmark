@@ -1,4 +1,10 @@
 model_id: "Qwen/Qwen3-8B"
+# Pinned base revision for reproducibility. This commit (2025-07-26) is the latest
+# for Qwen3-8B and predates every training run here, so it is the exact state each
+# result was produced against. NOTE: loader does not yet pass this to from_pretrained
+# and per-run revision is not captured in training metadata — wire both to make the
+# pin load-bearing and recorded.
+revision: "b968826d9c46dd6066d109eabc6255188de91218"
 model_short: "qwen3-8b"
 max_seq_length: 2048
 load_in_4bit: true

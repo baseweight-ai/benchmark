@@ -32,6 +32,9 @@ metric_granularity: per_example
 # Gold clauses run up to ~480 words (~670 tokens); 768 leaves headroom so even
 # the longest clause is extracted in full rather than truncated mid-span.
 max_output_tokens: 768
+decoding:
+  temperature: 0
+  strategy: greedy
 lm_eval_task_id: null
 train_sampling:
   strategy: stratified
