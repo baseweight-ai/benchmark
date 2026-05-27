@@ -149,7 +149,7 @@
   "results": [
     {
       "model_id": "gpt-5.4-mini",
-      "display_name": "GPT 5.4 Mini",
+      "display_name": "GPT-5.4 Mini",
       "family": "frontier",
       "task_id": "banking77",
       "condition": "5-shot",
@@ -248,7 +248,7 @@
     },
     {
       "model_id": "gpt-5.4-mini",
-      "display_name": "GPT 5.4 Mini",
+      "display_name": "GPT-5.4 Mini",
       "family": "frontier",
       "task_id": "banking77",
       "condition": "Zero-shot",
@@ -347,7 +347,7 @@
     },
     {
       "model_id": "gpt-5.4-mini",
-      "display_name": "GPT 5.4 Mini",
+      "display_name": "GPT-5.4 Mini",
       "family": "frontier",
       "task_id": "cuad",
       "condition": "Zero-shot",

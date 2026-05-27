@@ -39,6 +39,10 @@ _VENDOR_CAPS: dict[str, str] = {
     "o3": "O3",
 }
 
+# Size variants trail as a separate word (e.g. "GPT-5.4 Mini") while the vendor
+# and version hyphenate into one token ("GPT-5.4"), matching OpenAI's house style.
+_API_SIZE_VARIANTS: frozenset[str] = frozenset({"mini", "nano"})
+
 # Suffixes to strip from HF base model names (case-insensitive).
 _INSTRUCT_SUFFIXES = ("-instruct", "-it", "-chat", "-hf")
 
@@ -55,12 +59,17 @@ def _condition_label(condition: str) -> str:
 
 
 def _format_api_display_name(model_id: str) -> str:
-    """'gpt-5.4-mini' → 'GPT 5.4 Mini'."""
+    """'gpt-5.4-mini' → 'GPT-5.4 Mini'."""
+    def cap(p: str) -> str:
+        return _VENDOR_CAPS.get(p.lower(), p.capitalize())
+
     parts = model_id.split("-")
-    out = []
-    for p in parts:
-        out.append(_VENDOR_CAPS.get(p.lower(), p.capitalize()))
-    return " ".join(out)
+    core = [cap(p) for p in parts if p.lower() not in _API_SIZE_VARIANTS]
+    size = [cap(p) for p in parts if p.lower() in _API_SIZE_VARIANTS]
+    name = "-".join(core)
+    if size:
+        name += " " + " ".join(size)
+    return name
 
 
 def _strip_instruct_suffix(name: str) -> str:
