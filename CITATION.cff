@@ -1,11 +1,7 @@
 cff-version: 1.2.0
 message: If you use this benchmark or its results, please cite it as below.
 title: "Baseweight Benchmark: an evaluation harness for comparing fine-tuned open models with frontier APIs"
-abstract: >-
-  An evaluation harness for comparing QLoRA fine-tuned open-weight models
-  against frontier API baselines under training-data-constrained conditions.
-  Task and model configurations are declarative, and each run reports accuracy,
-  latency, cost per query and total cost of ownership alongside raw predictions.
+abstract: "An evaluation harness for comparing QLoRA fine-tuned open-weight models against frontier API baselines under training-data-constrained conditions. Task and model configurations are declarative, and each run reports accuracy, latency, cost per query and total cost of ownership alongside raw predictions."
 type: software
 authors:
   - family-names: Stevens
