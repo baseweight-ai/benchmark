@@ -3,6 +3,7 @@
 A configurable pipeline for comparing QLoRA fine-tuned open-source models against frontier API models on various tasks. Measures accuracy, latency, cost per query, and 12-month TCO under training-data-constrained conditions (zero-shot, 5-shot, and LoRA fine-tuned on 500 or full examples).
 
 **Results:** [baseweight.co/benchmark](https://baseweight.co/benchmark)
+
 **Methodology:** [baseweight.co/methodology](https://baseweight.co/methodology)
 
 ## What this benchmarks
@@ -76,8 +77,8 @@ command.
 ## Quick start
 
 ```bash
-git clone https://github.com/baseweight/baseweight-benchmark.git
-cd baseweight-benchmark
+git clone https://github.com/baseweight-ai/benchmark.git
+cd benchmark
 ./start.sh                    # installs miniconda + creates the conda env in-repo
 cp .env.example .env          # add OPENAI_API_KEY, GOOGLE_API_KEY, HF_TOKEN
 conda activate ./.conda-envs/baseweight-benchmark
