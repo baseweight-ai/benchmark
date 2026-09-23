@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: If you use this benchmark or its results, please cite it as below.
+title: "Baseweight Benchmark: fine-tuned open models versus frontier APIs on narrow, high-volume tasks"
+abstract: >-
+  A configurable pipeline comparing QLoRA fine-tuned open-weight models against
+  frontier API baselines under training-data-constrained conditions. Reports
+  accuracy, latency, cost per query and total cost of ownership, alongside raw
+  predictions.
+type: software
+authors:
+  - family-names: Stevens
+    given-names: Philip Charles
+    affiliation: Baseweight
+    email: hello@baseweight.co
+repository-code: https://github.com/baseweight-ai/benchmark
+url: https://baseweight.co/benchmark
+license: MIT
+keywords:
+  - llm-evaluation
+  - benchmark
+  - fine-tuning
+  - qlora
+  - cost-analysis
